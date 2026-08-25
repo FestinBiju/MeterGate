@@ -3,6 +3,8 @@
 import { useEffect, useId, useRef, useState } from "react";
 import type { FormEvent } from "react";
 
+import { QuotePolicyEvaluator } from "@/components/quote-policy-evaluator";
+
 type JsonPrimitive = boolean | null | number | string;
 type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 
@@ -290,7 +292,15 @@ function formatPrice(pricing: QuoteResponse["pricing"]): {
   };
 }
 
-function QuoteDisplay({ quote }: { quote: QuoteResponse }) {
+function QuoteDisplay({
+  policyCreateEndpoint,
+  policyEvaluationEndpoint,
+  quote,
+}: {
+  policyCreateEndpoint: string;
+  policyEvaluationEndpoint: string;
+  quote: QuoteResponse;
+}) {
   const headingRef = useRef<HTMLHeadingElement>(null);
   const [expiredByTime, setExpiredByTime] = useState(
     () => quote.state === "expired" || Date.now() >= Date.parse(quote.expires_at),
@@ -445,6 +455,12 @@ function QuoteDisplay({ quote }: { quote: QuoteResponse }) {
           </dd>
         </div>
       </dl>
+
+      <QuotePolicyEvaluator
+        createEndpoint={policyCreateEndpoint}
+        evaluationEndpoint={policyEvaluationEndpoint}
+        quote={quote}
+      />
     </section>
   );
 }
@@ -452,11 +468,15 @@ function QuoteDisplay({ quote }: { quote: QuoteResponse }) {
 export function ServiceQuoteRequest({
   endpoint,
   inputSchema,
+  policyCreateEndpoint,
+  policyEvaluationEndpoint,
   serviceId,
   serviceName,
 }: {
   endpoint: string;
   inputSchema: Record<string, unknown>;
+  policyCreateEndpoint: string;
+  policyEvaluationEndpoint: string;
   serviceId: string;
   serviceName: string;
 }) {
@@ -637,7 +657,12 @@ export function ServiceQuoteRequest({
           ) : null}
 
           {requestState.kind === "resolved" ? (
-            <QuoteDisplay key={requestState.quote.id} quote={requestState.quote} />
+            <QuoteDisplay
+              key={requestState.quote.id}
+              policyCreateEndpoint={policyCreateEndpoint}
+              policyEvaluationEndpoint={policyEvaluationEndpoint}
+              quote={requestState.quote}
+            />
           ) : null}
         </div>
       ) : null}

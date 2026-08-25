@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     log_level: Literal["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"] = "INFO"
     healthcheck_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
     quote_ttl_seconds: int = Field(default=300, ge=1, le=86_400)
+    policy_max_ttl_seconds: int = Field(default=86_400, ge=1, le=86_400)
     database_url: SecretStr
     redis_url: SecretStr
     cors_allowed_origins: Annotated[list[str], NoDecode] = Field(

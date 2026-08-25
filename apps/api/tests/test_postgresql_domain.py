@@ -1,9 +1,11 @@
 import asyncio
+import json
 import os
 import re
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -20,11 +22,12 @@ from alembic import command
 from app.application import create_app
 from app.core.config import Settings, get_settings
 from app.db.session import Database, make_async_database_url
+from app.domain.ids import new_policy_evaluation_id, new_policy_id
 from app.scripts.seed_dev import seed_development_data
 from app.services.readiness import ReadinessService
 
 API_ROOT = Path(__file__).resolve().parents[1]
-ID_PATTERN = re.compile(r"^(mrc_|qte_|svc_)[0-7][0-9A-HJKMNP-TV-Z]{25}$")
+ID_PATTERN = re.compile(r"^(mrc_|pol_|pye_|qte_|svc_)[0-7][0-9A-HJKMNP-TV-Z]{25}$")
 TEST_SCHEMA_PATTERN = re.compile(r"^metergate_test_[0-9a-f]{32}$")
 
 
@@ -60,10 +63,22 @@ def _alembic_upgrade(connection: Any) -> None:
     command.upgrade(config, "head")
 
 
+def _alembic_check(connection: Any) -> None:
+    config = Config(API_ROOT / "alembic.ini")
+    config.attributes["connection"] = connection
+    command.check(config)
+
+
 def _alembic_downgrade_to_milestone_two(connection: Any) -> None:
     config = Config(API_ROOT / "alembic.ini")
     config.attributes["connection"] = connection
     command.downgrade(config, "20260825_0001")
+
+
+def _alembic_downgrade_to_milestone_three(connection: Any) -> None:
+    config = Config(API_ROOT / "alembic.ini")
+    config.attributes["connection"] = connection
+    command.downgrade(config, "20260825_0002")
 
 
 async def _prepare_isolated_database() -> IsolatedDatabase:
@@ -264,7 +279,14 @@ def test_alembic_upgraded_a_clean_postgresql_schema(
     dialect, tables, checks, named_constraints = asyncio.run(inspect_database())
 
     assert dialect == "postgresql"
-    assert {"alembic_version", "merchants", "quotes", "services"} <= tables
+    assert {
+        "alembic_version",
+        "buyer_policies",
+        "merchants",
+        "policy_evaluations",
+        "quotes",
+        "services",
+    } <= tables
     assert {
         "ck_services_service_base_price_nonnegative",
         "ck_services_service_input_schema_object",
@@ -376,6 +398,459 @@ def test_quote_migration_downgrades_and_reupgrades_in_disposable_postgresql_sche
             await _drop_isolated_schema(isolated.database_url, isolated.schema)
 
     asyncio.run(exercise_cycle())
+
+
+def test_policy_migration_has_postgresql_integrity_guards(
+    isolated_database: IsolatedDatabase,
+) -> None:
+    async def inspect_policy_tables() -> dict[str, Any]:
+        async with isolated_database.database.engine.connect() as connection:
+
+            def inspect_connection(sync_connection: Any) -> dict[str, Any]:
+                inspector = inspect(sync_connection)
+                return {
+                    "policy_columns": {
+                        column["name"]: str(column["type"])
+                        for column in inspector.get_columns("buyer_policies")
+                    },
+                    "policy_checks": {
+                        item["name"] for item in inspector.get_check_constraints("buyer_policies")
+                    },
+                    "policy_indexes": {
+                        item["name"] for item in inspector.get_indexes("buyer_policies")
+                    },
+                    "policy_unique": {
+                        item["name"] for item in inspector.get_unique_constraints("buyer_policies")
+                    },
+                    "evaluation_columns": {
+                        column["name"]: str(column["type"])
+                        for column in inspector.get_columns("policy_evaluations")
+                    },
+                    "evaluation_checks": {
+                        item["name"]
+                        for item in inspector.get_check_constraints("policy_evaluations")
+                    },
+                    "evaluation_foreign_keys": {
+                        item["referred_table"]: item["options"].get("ondelete")
+                        for item in inspector.get_foreign_keys("policy_evaluations")
+                    },
+                    "evaluation_indexes": {
+                        item["name"] for item in inspector.get_indexes("policy_evaluations")
+                    },
+                }
+
+            inspected = await connection.run_sync(inspect_connection)
+            trigger_rows = await connection.execute(
+                text(
+                    """
+                    SELECT event_object_table, trigger_name
+                    FROM information_schema.triggers
+                    WHERE event_object_schema = current_schema()
+                      AND event_object_table IN ('buyer_policies', 'policy_evaluations')
+                    """
+                )
+            )
+            inspected["triggers"] = set(trigger_rows.tuples().all())
+            return inspected
+
+    schema = asyncio.run(inspect_policy_tables())
+
+    assert schema["policy_columns"] == {
+        "id": "VARCHAR(30)",
+        "subject_ref": "VARCHAR(200)",
+        "maximum_amount": "BIGINT",
+        "allowed_currencies": "JSONB",
+        "allowed_merchant_ids": "JSONB",
+        "allowed_service_ids": "JSONB",
+        "allowed_service_types": "JSONB",
+        "allowed_purchase_types": "JSONB",
+        "issued_at": "TIMESTAMP",
+        "expires_at": "TIMESTAMP",
+        "policy_version": "VARCHAR(16)",
+        "policy_hash": "VARCHAR(71)",
+        "created_at": "TIMESTAMP",
+    }
+    assert {
+        "ck_buyer_policies_policy_allowed_currencies_valid_allowlist",
+        "ck_buyer_policies_policy_allowed_merchant_ids_valid_allowlist",
+        "ck_buyer_policies_policy_allowed_purchase_types_valid_allowlist",
+        "ck_buyer_policies_policy_allowed_service_ids_valid_allowlist",
+        "ck_buyer_policies_policy_allowed_service_types_valid_allowlist",
+        "ck_buyer_policies_policy_expiry_after_issue",
+        "ck_buyer_policies_policy_hash_format",
+        "ck_buyer_policies_policy_maximum_amount_safe_integer_range",
+        "ck_buyer_policies_policy_subject_ref_normalized_nonblank",
+        "ck_buyer_policies_policy_version",
+    } <= schema["policy_checks"]
+    assert schema["policy_unique"] == {"uq_buyer_policies_policy_hash"}
+    assert {
+        "ix_buyer_policies_expires_at",
+        "ix_buyer_policies_subject_issued_at",
+    } <= schema["policy_indexes"]
+
+    assert schema["evaluation_columns"] == {
+        "id": "VARCHAR(30)",
+        "policy_id": "VARCHAR(30)",
+        "quote_id": "VARCHAR(30)",
+        "policy_hash": "VARCHAR(71)",
+        "quote_hash": "VARCHAR(71)",
+        "decision": "VARCHAR(5)",
+        "checks": "JSONB",
+        "evaluated_at": "TIMESTAMP",
+        "evaluation_version": "VARCHAR(16)",
+        "created_at": "TIMESTAMP",
+    }
+    assert {
+        "ck_policy_evaluations_checks_nonempty_object_array",
+        "ck_policy_evaluations_policy_evaluation_decision",
+        "ck_policy_evaluations_policy_evaluation_policy_hash_format",
+        "ck_policy_evaluations_policy_evaluation_quote_hash_format",
+        "ck_policy_evaluations_policy_evaluation_version",
+    } <= schema["evaluation_checks"]
+    assert schema["evaluation_foreign_keys"] == {
+        "buyer_policies": "RESTRICT",
+        "quotes": "RESTRICT",
+    }
+    assert {
+        "ix_policy_evaluations_decision_evaluated_at",
+        "ix_policy_evaluations_policy_evaluated_at",
+        "ix_policy_evaluations_quote_evaluated_at",
+    } <= schema["evaluation_indexes"]
+    assert schema["triggers"] == {
+        ("buyer_policies", "trg_buyer_policies_immutable"),
+        ("buyer_policies", "trg_buyer_policies_validate_allowlists"),
+        ("policy_evaluations", "trg_policy_evaluations_immutable"),
+    }
+
+    async def check_model_drift() -> None:
+        async with isolated_database.database.engine.connect() as connection:
+            await connection.run_sync(_alembic_check)
+
+    asyncio.run(check_model_drift())
+
+
+def test_policy_migration_downgrades_to_milestone_three_and_reupgrades() -> None:
+    async def exercise_cycle() -> None:
+        isolated = await _prepare_isolated_database()
+        try:
+            async with isolated.database.engine.connect() as connection:
+                await connection.run_sync(_alembic_downgrade_to_milestone_three)
+
+                def milestone_three_tables(sync_connection: Any) -> set[str]:
+                    return set(inspect(sync_connection).get_table_names())
+
+                assert await connection.run_sync(milestone_three_tables) == {
+                    "alembic_version",
+                    "merchants",
+                    "quotes",
+                    "services",
+                }
+                mutation_function = await connection.scalar(
+                    text(
+                        """
+                        SELECT count(*)
+                        FROM pg_proc
+                        JOIN pg_namespace ON pg_namespace.oid = pg_proc.pronamespace
+                        WHERE pg_namespace.nspname = current_schema()
+                          AND pg_proc.proname = 'metergate_reject_policy_record_mutation'
+                        """
+                    )
+                )
+                assert mutation_function == 0
+
+                await connection.run_sync(_alembic_upgrade)
+                upgraded_tables = await connection.run_sync(milestone_three_tables)
+                assert {"buyer_policies", "policy_evaluations"} <= upgraded_tables
+        finally:
+            await isolated.database.dispose()
+            await _drop_isolated_schema(isolated.database_url, isolated.schema)
+
+    asyncio.run(exercise_cycle())
+
+
+def test_policy_rows_enforce_json_constraints_foreign_keys_and_immutability(
+    domain_client: TestClient,
+    isolated_database: IsolatedDatabase,
+) -> None:
+    merchant = create_merchant(domain_client, "policy-persistence-merchant")
+    service = create_service(
+        domain_client,
+        merchant["id"],
+        "policy-persistence-service",
+    )
+    quote_response = domain_client.post(
+        "/api/v1/quotes",
+        json={"service_id": service["id"], "input": {"norad_id": 25544}},
+    )
+    assert quote_response.status_code == 201, quote_response.text
+    quote = quote_response.json()
+
+    policy_id = new_policy_id()
+    evaluation_id = new_policy_evaluation_id()
+    policy_hash = f"sha256:{'a' * 64}"
+    issued_at = datetime.now(UTC)
+    expires_at = issued_at + timedelta(minutes=15)
+
+    async def insert_valid_records() -> tuple[bool, list[dict[str, Any]]]:
+        async with isolated_database.database.engine.begin() as connection:
+            await connection.execute(
+                text(
+                    """
+                    INSERT INTO buyer_policies (
+                        id, subject_ref, maximum_amount, allowed_currencies,
+                        allowed_merchant_ids, allowed_service_ids,
+                        allowed_service_types, allowed_purchase_types,
+                        issued_at, expires_at, policy_version, policy_hash
+                    ) VALUES (
+                        :id, :subject_ref, :maximum_amount,
+                        CAST(:allowed_currencies AS jsonb),
+                        CAST(:allowed_merchant_ids AS jsonb),
+                        CAST(:allowed_service_ids AS jsonb),
+                        CAST(:allowed_service_types AS jsonb),
+                        CAST(:allowed_purchase_types AS jsonb),
+                        :issued_at, :expires_at, '1', :policy_hash
+                    )
+                    """
+                ),
+                {
+                    "id": policy_id,
+                    "subject_ref": "dev-user-001",
+                    "maximum_amount": 1_000,
+                    "allowed_currencies": json.dumps(["INR"]),
+                    "allowed_merchant_ids": None,
+                    "allowed_service_ids": json.dumps([service["id"]]),
+                    "allowed_service_types": json.dumps(["report"]),
+                    "allowed_purchase_types": json.dumps(["one_time"]),
+                    "issued_at": issued_at,
+                    "expires_at": expires_at,
+                    "policy_hash": policy_hash,
+                },
+            )
+            checks = [
+                {
+                    "rule": "MAXIMUM_AMOUNT",
+                    "result": "pass",
+                    "reason_code": "ALLOW_POLICY_SATISFIED",
+                }
+            ]
+            await connection.execute(
+                text(
+                    """
+                    INSERT INTO policy_evaluations (
+                        id, policy_id, quote_id, policy_hash, quote_hash,
+                        decision, checks, evaluated_at, evaluation_version
+                    ) VALUES (
+                        :id, :policy_id, :quote_id, :policy_hash, :quote_hash,
+                        'allow', CAST(:checks AS jsonb), :evaluated_at, '1'
+                    )
+                    """
+                ),
+                {
+                    "id": evaluation_id,
+                    "policy_id": policy_id,
+                    "quote_id": quote["id"],
+                    "policy_hash": policy_hash,
+                    "quote_hash": quote["quote_hash"],
+                    "checks": json.dumps(checks),
+                    "evaluated_at": issued_at,
+                },
+            )
+            row = (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT allowed_merchant_ids IS NULL AS unconstrained, checks
+                        FROM buyer_policies
+                        JOIN policy_evaluations
+                          ON policy_evaluations.policy_id = buyer_policies.id
+                        WHERE buyer_policies.id = :policy_id
+                        """
+                    ),
+                    {"policy_id": policy_id},
+                )
+            ).one()
+            return bool(row.unconstrained), row.checks
+
+    unconstrained, persisted_checks = asyncio.run(insert_valid_records())
+    assert unconstrained is True
+    assert persisted_checks[0]["rule"] == "MAXIMUM_AMOUNT"
+
+    async def insert_invalid_policy(
+        *,
+        maximum_amount: int = 1_000,
+        currencies: str = '["INR"]',
+        subject_ref: str = "dev-user-002",
+        expires_at_value: datetime | None = None,
+    ) -> None:
+        async with isolated_database.database.engine.begin() as connection:
+            await connection.execute(
+                text(
+                    """
+                    INSERT INTO buyer_policies (
+                        id, subject_ref, maximum_amount, allowed_currencies,
+                        issued_at, expires_at, policy_version, policy_hash
+                    ) VALUES (
+                        :id, :subject_ref, :maximum_amount,
+                        CAST(:currencies AS jsonb), :issued_at, :expires_at,
+                        '1', :policy_hash
+                    )
+                    """
+                ),
+                {
+                    "id": new_policy_id(),
+                    "subject_ref": subject_ref,
+                    "maximum_amount": maximum_amount,
+                    "currencies": currencies,
+                    "issued_at": issued_at,
+                    "expires_at": expires_at_value or expires_at,
+                    "policy_hash": f"sha256:{uuid.uuid4().hex * 2}",
+                },
+            )
+
+    for invalid_values in (
+        {"currencies": "[]"},
+        {"currencies": '["INR", "INR"]'},
+        {"currencies": json.dumps(["INR"] * 101)},
+        {"currencies": '["inr"]'},
+        {"maximum_amount": -1},
+        {"maximum_amount": 9_007_199_254_740_992},
+        {"subject_ref": " "},
+        {"expires_at_value": issued_at},
+    ):
+        with pytest.raises(DBAPIError):
+            asyncio.run(insert_invalid_policy(**invalid_values))
+
+    async def insert_invalid_evaluation(
+        *,
+        checks: str = '[{"rule":"MAXIMUM_AMOUNT"}]',
+        policy_id_value: str = policy_id,
+    ) -> None:
+        async with isolated_database.database.engine.begin() as connection:
+            await connection.execute(
+                text(
+                    """
+                    INSERT INTO policy_evaluations (
+                        id, policy_id, quote_id, policy_hash, quote_hash,
+                        decision, checks, evaluated_at, evaluation_version
+                    ) VALUES (
+                        :id, :policy_id, :quote_id, :policy_hash, :quote_hash,
+                        'allow', CAST(:checks AS jsonb), :evaluated_at, '1'
+                    )
+                    """
+                ),
+                {
+                    "id": new_policy_evaluation_id(),
+                    "policy_id": policy_id_value,
+                    "quote_id": quote["id"],
+                    "policy_hash": policy_hash,
+                    "quote_hash": quote["quote_hash"],
+                    "checks": checks,
+                    "evaluated_at": issued_at,
+                },
+            )
+
+    for invalid_values in (
+        {"checks": "[]"},
+        {"checks": "[1]"},
+        {"policy_id_value": new_policy_id()},
+    ):
+        with pytest.raises(DBAPIError):
+            asyncio.run(insert_invalid_evaluation(**invalid_values))
+
+    async def mutate(statement: str, identifier: str) -> None:
+        async with isolated_database.database.engine.begin() as connection:
+            await connection.execute(text(statement), {"identifier": identifier})
+
+    mutation_attempts = (
+        (
+            "UPDATE buyer_policies SET maximum_amount = 1 WHERE id = :identifier",
+            policy_id,
+        ),
+        ("DELETE FROM buyer_policies WHERE id = :identifier", policy_id),
+        (
+            "UPDATE policy_evaluations SET decision = 'deny' WHERE id = :identifier",
+            evaluation_id,
+        ),
+        ("DELETE FROM policy_evaluations WHERE id = :identifier", evaluation_id),
+    )
+    for statement, identifier in mutation_attempts:
+        with pytest.raises(DBAPIError):
+            asyncio.run(mutate(statement, identifier))
+
+
+def test_policy_api_persists_allow_and_deny_evaluations(
+    domain_client: TestClient,
+) -> None:
+    merchant = create_merchant(domain_client, "policy-evaluation-merchant")
+    service = create_service(
+        domain_client,
+        merchant["id"],
+        "policy-evaluation-service",
+        base_price=500,
+    )
+    quote_response = domain_client.post(
+        "/api/v1/quotes",
+        json={"service_id": service["id"], "input": {"norad_id": 25544}},
+    )
+    assert quote_response.status_code == 201, quote_response.text
+    quote = quote_response.json()
+
+    common_policy = {
+        "subject_ref": "dev-policy-integration",
+        "allowed_currencies": ["INR"],
+        "allowed_merchant_ids": [merchant["id"]],
+        "allowed_service_ids": [service["id"]],
+        "allowed_service_types": ["report"],
+        "allowed_purchase_types": ["one_time"],
+        "expires_in_seconds": 900,
+    }
+    allow_response = domain_client.post(
+        "/api/v1/policies",
+        json={**common_policy, "maximum_amount": 1_000},
+    )
+    deny_response = domain_client.post(
+        "/api/v1/policies",
+        json={**common_policy, "maximum_amount": 100},
+    )
+    assert allow_response.status_code == 201, allow_response.text
+    assert deny_response.status_code == 201, deny_response.text
+    allow_policy = allow_response.json()
+    deny_policy = deny_response.json()
+    assert ID_PATTERN.fullmatch(allow_policy["id"])
+    assert allow_policy["constraints"]["maximum_amount"] == 1_000
+    assert allow_policy["state"] == "active"
+    assert domain_client.get(f"/api/v1/policies/{allow_policy['id']}").json() == allow_policy
+
+    allow_evaluation_response = domain_client.post(
+        "/api/v1/policy-evaluations",
+        json={"policy_id": allow_policy["id"], "quote_id": quote["id"]},
+    )
+    deny_evaluation_response = domain_client.post(
+        "/api/v1/policy-evaluations",
+        json={"policy_id": deny_policy["id"], "quote_id": quote["id"]},
+    )
+    assert allow_evaluation_response.status_code == 201, allow_evaluation_response.text
+    assert deny_evaluation_response.status_code == 201, deny_evaluation_response.text
+    allow_evaluation = allow_evaluation_response.json()
+    deny_evaluation = deny_evaluation_response.json()
+
+    assert ID_PATTERN.fullmatch(allow_evaluation["id"])
+    assert allow_evaluation["decision"] == "allow"
+    assert allow_evaluation["policy_hash"] == allow_policy["policy_hash"]
+    assert allow_evaluation["quote_hash"] == quote["quote_hash"]
+    assert allow_evaluation["evaluation_version"] == "1"
+    assert allow_evaluation["checks"]
+    assert (
+        domain_client.get(f"/api/v1/policy-evaluations/{allow_evaluation['id']}").json()
+        == allow_evaluation
+    )
+
+    assert deny_evaluation["decision"] == "deny"
+    assert "DENY_AMOUNT_EXCEEDS_LIMIT" in deny_evaluation["reason_codes"]
+    assert any(
+        check["rule"] == "MAXIMUM_AMOUNT" and check["result"] == "fail"
+        for check in deny_evaluation["checks"]
+    )
 
 
 def test_merchant_create_get_update_and_unknown_response(domain_client: TestClient) -> None:

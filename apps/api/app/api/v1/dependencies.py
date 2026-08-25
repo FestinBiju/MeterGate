@@ -8,11 +8,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.db.session import get_session
+from app.repositories.buyer_policies import BuyerPolicyRepository
 from app.repositories.merchants import MerchantRepository
+from app.repositories.policy_evaluations import PolicyEvaluationRepository
 from app.repositories.quotes import QuoteRepository
 from app.repositories.services import ServiceRepository
 from app.services.catalog import CatalogApplicationService
 from app.services.merchants import MerchantApplicationService
+from app.services.policies import BuyerPolicyApplicationService
+from app.services.policy_evaluations import PolicyEvaluationApplicationService
 from app.services.quotes import QuoteApplicationService
 from app.services.services import ServiceApplicationService
 
@@ -61,6 +65,26 @@ def get_quote_application_service(
     )
 
 
+def get_buyer_policy_application_service(
+    session: SessionDependency,
+    settings: SettingsDependency,
+) -> BuyerPolicyApplicationService:
+    return BuyerPolicyApplicationService(
+        BuyerPolicyRepository(session),
+        maximum_ttl=timedelta(seconds=settings.policy_max_ttl_seconds),
+    )
+
+
+def get_policy_evaluation_application_service(
+    session: SessionDependency,
+) -> PolicyEvaluationApplicationService:
+    return PolicyEvaluationApplicationService(
+        BuyerPolicyRepository(session),
+        QuoteRepository(session),
+        PolicyEvaluationRepository(session),
+    )
+
+
 MerchantApplicationDependency = Annotated[
     MerchantApplicationService,
     Depends(get_merchant_application_service),
@@ -76,4 +100,12 @@ CatalogApplicationDependency = Annotated[
 QuoteApplicationDependency = Annotated[
     QuoteApplicationService,
     Depends(get_quote_application_service),
+]
+BuyerPolicyApplicationDependency = Annotated[
+    BuyerPolicyApplicationService,
+    Depends(get_buyer_policy_application_service),
+]
+PolicyEvaluationApplicationDependency = Annotated[
+    PolicyEvaluationApplicationService,
+    Depends(get_policy_evaluation_application_service),
 ]

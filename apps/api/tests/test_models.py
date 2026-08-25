@@ -11,13 +11,15 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     create_engine,
+    text,
 )
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.orm import Session
 
-from app.domain.enums import MerchantStatus, PurchaseType, ServiceStatus
-from app.models import Base, Merchant, Quote, Service
+from app.domain.enums import MerchantStatus, PolicyDecision, PurchaseType, ServiceStatus
+from app.models import Base, BuyerPolicy, Merchant, PolicyEvaluation, Quote, Service
+from app.repositories import BuyerPolicyRepository, PolicyEvaluationRepository
 
 HASH_PREFIX = "sha256:"
 
@@ -41,8 +43,50 @@ def quote_for_test(input_value: Any, *, hash_value: int = 1) -> Quote:
     )
 
 
+def policy_for_test(*, hash_value: int = 201) -> BuyerPolicy:
+    issued_at = datetime(2026, 8, 25, 12, tzinfo=UTC)
+    return BuyerPolicy(
+        subject_ref="dev-user-001",
+        maximum_amount=1_000,
+        allowed_currencies=["INR"],
+        allowed_merchant_ids=None,
+        allowed_service_ids=["svc_00000000000000000000000000"],
+        allowed_service_types=["report"],
+        allowed_purchase_types=["one_time"],
+        issued_at=issued_at,
+        expires_at=issued_at + timedelta(minutes=15),
+        policy_version="1",
+        policy_hash=f"{HASH_PREFIX}{hash_value:064x}",
+    )
+
+
+def evaluation_for_test(*, hash_value: int = 301) -> PolicyEvaluation:
+    return PolicyEvaluation(
+        policy_id="pol_00000000000000000000000000",
+        quote_id="qte_00000000000000000000000000",
+        policy_hash=f"{HASH_PREFIX}{hash_value:064x}",
+        quote_hash=f"{HASH_PREFIX}{hash_value + 1:064x}",
+        decision=PolicyDecision.ALLOW,
+        checks=[
+            {
+                "rule": "MAXIMUM_AMOUNT",
+                "result": "pass",
+                "reason_code": "ALLOW_POLICY_SATISFIED",
+            }
+        ],
+        evaluated_at=datetime(2026, 8, 25, 12, tzinfo=UTC),
+        evaluation_version="1",
+    )
+
+
 def test_models_use_prefixed_string_primary_keys() -> None:
-    for table in (Merchant.__table__, Quote.__table__, Service.__table__):
+    for table in (
+        BuyerPolicy.__table__,
+        Merchant.__table__,
+        PolicyEvaluation.__table__,
+        Quote.__table__,
+        Service.__table__,
+    ):
         id_column = table.c.id
         assert id_column.primary_key is True
         assert isinstance(id_column.type, String)
@@ -97,6 +141,31 @@ def test_quote_money_hash_and_json_columns_use_safe_database_types() -> None:
     assert str(table.c.service_snapshot.type.compile(dialect=postgresql.dialect())) == "JSONB"
 
 
+def test_policy_money_hash_and_json_columns_use_safe_database_types() -> None:
+    policy_table = BuyerPolicy.__table__
+    evaluation_table = PolicyEvaluation.__table__
+
+    assert isinstance(policy_table.c.maximum_amount.type, BigInteger)
+    assert isinstance(policy_table.c.policy_hash.type, String)
+    assert policy_table.c.policy_hash.type.length == 71
+    for column_name in (
+        "allowed_currencies",
+        "allowed_merchant_ids",
+        "allowed_service_ids",
+        "allowed_service_types",
+        "allowed_purchase_types",
+    ):
+        column = policy_table.c[column_name]
+        assert column.nullable is True
+        assert str(column.type.compile(dialect=postgresql.dialect())) == "JSONB"
+        assert str(column.type.compile(dialect=sqlite.dialect())) == "JSON"
+
+    assert str(evaluation_table.c.checks.type.compile(dialect=postgresql.dialect())) == "JSONB"
+    assert str(evaluation_table.c.checks.type.compile(dialect=sqlite.dialect())) == "JSON"
+    assert evaluation_table.c.policy_hash.type.length == 71
+    assert evaluation_table.c.quote_hash.type.length == 71
+
+
 def test_service_foreign_key_restricts_merchant_deletion() -> None:
     foreign_key = next(iter(Service.__table__.c.merchant_id.foreign_keys))
 
@@ -114,6 +183,22 @@ def test_quote_foreign_keys_are_non_cascading() -> None:
     assert foreign_keys == {
         "merchants.id": "RESTRICT",
         "services.id": "RESTRICT",
+    }
+
+
+def test_policy_evaluation_foreign_keys_are_non_cascading() -> None:
+    foreign_keys = {
+        foreign_key.target_fullname: foreign_key.ondelete
+        for column in (
+            PolicyEvaluation.__table__.c.policy_id,
+            PolicyEvaluation.__table__.c.quote_id,
+        )
+        for foreign_key in column.foreign_keys
+    }
+
+    assert foreign_keys == {
+        "buyer_policies.id": "RESTRICT",
+        "quotes.id": "RESTRICT",
     }
 
 
@@ -182,6 +267,67 @@ def test_quote_defines_integrity_constraints_and_indexes() -> None:
     }
 
 
+def test_policy_models_define_integrity_constraints_and_query_indexes() -> None:
+    policy_checks = {
+        constraint.name
+        for constraint in BuyerPolicy.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    evaluation_checks = {
+        constraint.name
+        for constraint in PolicyEvaluation.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    policy_unique = {
+        constraint.name
+        for constraint in BuyerPolicy.__table__.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+
+    assert policy_unique == {"uq_buyer_policies_policy_hash"}
+    assert {
+        "ck_buyer_policies_policy_allowed_currencies_valid_allowlist",
+        "ck_buyer_policies_policy_allowed_merchant_ids_valid_allowlist",
+        "ck_buyer_policies_policy_allowed_purchase_types_valid_allowlist",
+        "ck_buyer_policies_policy_allowed_service_ids_valid_allowlist",
+        "ck_buyer_policies_policy_allowed_service_types_valid_allowlist",
+        "ck_buyer_policies_policy_expiry_after_issue",
+        "ck_buyer_policies_policy_hash_format",
+        "ck_buyer_policies_policy_hash_shape",
+        "ck_buyer_policies_policy_maximum_amount_safe_integer_range",
+        "ck_buyer_policies_policy_version",
+    } <= policy_checks
+    allowlist_constraints = [
+        constraint
+        for constraint in BuyerPolicy.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+        and constraint.name is not None
+        and "valid_allowlist" in constraint.name
+    ]
+    assert len(allowlist_constraints) == 5
+    assert all(
+        "BETWEEN 1 AND 100" in str(constraint.sqltext) for constraint in allowlist_constraints
+    )
+    assert {index.name for index in BuyerPolicy.__table__.indexes} == {
+        "ix_buyer_policies_expires_at",
+        "ix_buyer_policies_subject_issued_at",
+    }
+    assert {
+        "ck_policy_evaluations_checks_nonempty_object_array",
+        "ck_policy_evaluations_policy_evaluation_decision",
+        "ck_policy_evaluations_policy_evaluation_policy_hash_format",
+        "ck_policy_evaluations_policy_evaluation_policy_hash_shape",
+        "ck_policy_evaluations_policy_evaluation_quote_hash_format",
+        "ck_policy_evaluations_policy_evaluation_quote_hash_shape",
+        "ck_policy_evaluations_policy_evaluation_version",
+    } <= evaluation_checks
+    assert {index.name for index in PolicyEvaluation.__table__.indexes} == {
+        "ix_policy_evaluations_decision_evaluated_at",
+        "ix_policy_evaluations_policy_evaluated_at",
+        "ix_policy_evaluations_quote_evaluated_at",
+    }
+
+
 def test_persisted_enum_values_are_lowercase_strings() -> None:
     enum_columns = (
         Merchant.__table__.c.status,
@@ -189,6 +335,7 @@ def test_persisted_enum_values_are_lowercase_strings() -> None:
         Service.__table__.c.service_type,
         Service.__table__.c.purchase_type,
         Quote.__table__.c.purchase_type,
+        PolicyEvaluation.__table__.c.decision,
     )
     for column in enum_columns:
         assert isinstance(column.type, Enum)
@@ -210,6 +357,16 @@ def test_timestamps_are_timezone_aware() -> None:
     assert Quote.__table__.c.issued_at.server_default is None
     assert Quote.__table__.c.expires_at.server_default is None
     assert Quote.__table__.c.created_at.server_default is not None
+
+    for table in (BuyerPolicy.__table__, PolicyEvaluation.__table__):
+        assert "updated_at" not in table.c
+        assert table.c.created_at.type.timezone is True
+        assert table.c.created_at.server_default is not None
+    for column_name in ("issued_at", "expires_at"):
+        assert BuyerPolicy.__table__.c[column_name].type.timezone is True
+        assert BuyerPolicy.__table__.c[column_name].server_default is None
+    assert PolicyEvaluation.__table__.c.evaluated_at.type.timezone is True
+    assert PolicyEvaluation.__table__.c.evaluated_at.server_default is None
 
 
 @pytest.mark.parametrize(
@@ -250,3 +407,60 @@ def test_quote_mapper_rejects_updates_and_deletes() -> None:
             session.commit()
         session.rollback()
     engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("record_factory", "field_name", "new_value", "message"),
+    [
+        (policy_for_test, "maximum_amount", 500, "Buyer policies are immutable"),
+        (evaluation_for_test, "decision", PolicyDecision.DENY, "Policy evaluations are immutable"),
+    ],
+)
+def test_policy_mappers_reject_updates_and_deletes(
+    record_factory: Any,
+    field_name: str,
+    new_value: Any,
+    message: str,
+) -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as session:
+        record = record_factory()
+        session.add(record)
+        session.commit()
+        record_id = record.id
+
+        setattr(record, field_name, new_value)
+        with pytest.raises(InvalidRequestError, match=message):
+            session.commit()
+        session.rollback()
+
+        persisted = session.get(type(record), record_id)
+        assert persisted is not None
+        session.delete(persisted)
+        with pytest.raises(InvalidRequestError, match=message):
+            session.commit()
+        session.rollback()
+    engine.dispose()
+
+
+def test_policy_none_allowlist_is_stored_as_sql_null() -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        policy = policy_for_test()
+        session.add(policy)
+        session.commit()
+
+        is_sql_null = session.scalar(
+            text("SELECT allowed_merchant_ids IS NULL FROM buyer_policies WHERE id = :policy_id"),
+            {"policy_id": policy.id},
+        )
+        assert is_sql_null == 1
+    engine.dispose()
+
+
+def test_policy_repositories_expose_no_mutation_methods() -> None:
+    for repository in (BuyerPolicyRepository, PolicyEvaluationRepository):
+        assert not hasattr(repository, "update")
+        assert not hasattr(repository, "delete")

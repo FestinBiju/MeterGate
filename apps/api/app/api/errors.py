@@ -5,11 +5,12 @@ from fastapi.responses import JSONResponse
 
 from app.domain.exceptions import (
     InvalidStateTransitionError,
+    PolicyTTLExceededError,
     QuoteConflictError,
     QuoteInputValidationError,
-    QuoteIntegrityError,
     ResourceNotFoundError,
     SlugConflictError,
+    StoredIntegrityError,
 )
 
 
@@ -20,7 +21,8 @@ def register_domain_exception_handlers(application: FastAPI) -> None:
     application.add_exception_handler(InvalidStateTransitionError, _transition_handler)
     application.add_exception_handler(QuoteConflictError, _quote_conflict_handler)
     application.add_exception_handler(QuoteInputValidationError, _quote_input_handler)
-    application.add_exception_handler(QuoteIntegrityError, _quote_integrity_handler)
+    application.add_exception_handler(StoredIntegrityError, _stored_integrity_handler)
+    application.add_exception_handler(PolicyTTLExceededError, _policy_ttl_handler)
 
 
 async def _not_found_handler(
@@ -90,12 +92,34 @@ async def _quote_input_handler(
     )
 
 
-async def _quote_integrity_handler(
+async def _stored_integrity_handler(
     request: Request,
     error: Exception,
 ) -> JSONResponse:
-    del request, error
+    del request
+    assert isinstance(error, StoredIntegrityError)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detail": "Stored quote failed integrity verification"},
+        content={"detail": str(error), "reason_code": error.reason_code},
+    )
+
+
+async def _policy_ttl_handler(
+    request: Request,
+    error: Exception,
+) -> JSONResponse:
+    del request
+    assert isinstance(error, PolicyTTLExceededError)
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        content={
+            "detail": [
+                {
+                    "type": "less_than_equal",
+                    "loc": ["body", "expires_in_seconds"],
+                    "msg": "Policy lifetime exceeds the configured maximum",
+                    "ctx": {"le": error.maximum_seconds},
+                }
+            ]
+        },
     )

@@ -4,18 +4,24 @@ import pytest
 
 from app.domain import ids
 
-ID_PATTERN = re.compile(r"^(mrc_|qte_|svc_)[0-7][0-9A-HJKMNP-TV-Z]{25}$")
+ID_PATTERN = re.compile(r"^(mrc_|pol_|pye_|qte_|svc_)[0-7][0-9A-HJKMNP-TV-Z]{25}$")
 
 
 def test_domain_ids_have_expected_prefix_length_and_alphabet() -> None:
     merchant_id = ids.new_merchant_id()
+    policy_id = ids.new_policy_id()
+    policy_evaluation_id = ids.new_policy_evaluation_id()
     quote_id = ids.new_quote_id()
     service_id = ids.new_service_id()
 
     assert len(merchant_id) == 30
+    assert len(policy_id) == 30
+    assert len(policy_evaluation_id) == 30
     assert len(quote_id) == 30
     assert len(service_id) == 30
     assert ID_PATTERN.fullmatch(merchant_id)
+    assert ID_PATTERN.fullmatch(policy_id)
+    assert ID_PATTERN.fullmatch(policy_evaluation_id)
     assert ID_PATTERN.fullmatch(quote_id)
     assert ID_PATTERN.fullmatch(service_id)
 

@@ -69,7 +69,44 @@ class QuoteInputValidationError(DomainError):
         super().__init__("Quote input is invalid")
 
 
-class QuoteIntegrityError(DomainError):
-    def __init__(self, quote_id: str) -> None:
-        self.quote_id = quote_id
-        super().__init__("Stored quote failed integrity verification")
+class StoredIntegrityError(DomainError):
+    """A persisted immutable record cannot cross the trust boundary."""
+
+    def __init__(self, resource: str, resource_id: str, reason_code: str) -> None:
+        self.resource = resource
+        self.resource_id = resource_id
+        self.reason_code = reason_code
+        super().__init__(f"Stored {resource.lower()} failed integrity verification")
+
+
+class QuoteIntegrityError(StoredIntegrityError):
+    def __init__(
+        self,
+        quote_id: str,
+        reason_code: str = "INTEGRITY_QUOTE_HASH_MISMATCH",
+    ) -> None:
+        super().__init__("Quote", quote_id, reason_code)
+
+
+class PolicyIntegrityError(StoredIntegrityError):
+    def __init__(
+        self,
+        policy_id: str,
+        reason_code: str = "INTEGRITY_POLICY_HASH_MISMATCH",
+    ) -> None:
+        super().__init__("Policy", policy_id, reason_code)
+
+
+class PolicyEvaluationIntegrityError(StoredIntegrityError):
+    def __init__(self, evaluation_id: str) -> None:
+        super().__init__(
+            "Policy evaluation",
+            evaluation_id,
+            "INTEGRITY_POLICY_EVALUATION_DATA_INVALID",
+        )
+
+
+class PolicyTTLExceededError(DomainError):
+    def __init__(self, maximum_seconds: int) -> None:
+        self.maximum_seconds = maximum_seconds
+        super().__init__("Requested policy lifetime exceeds the configured maximum")

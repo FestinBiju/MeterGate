@@ -7,7 +7,6 @@ import re
 from collections.abc import Callable
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
-from hmac import compare_digest
 
 from pydantic import ValidationError
 
@@ -25,16 +24,17 @@ from app.domain.exceptions import (
 from app.domain.hashing import (
     MAX_CANONICAL_INTEGER,
     calculate_quote_hash,
-    recompute_quote_integrity,
     sha256_bytes,
 )
 from app.domain.ids import new_quote_id
+from app.domain.integrity import IntegrityStructureError
 from app.domain.json_schema import (
     JSON_SCHEMA_DIALECT,
     JSONSchemaConfigurationError,
     validate_json_instance,
     validate_json_schema_document,
 )
+from app.domain.quote_integrity import verify_quote_integrity
 from app.models import Merchant, Quote, Service
 from app.repositories.quotes import QuoteRepository
 from app.repositories.services import ServiceRepository
@@ -217,21 +217,18 @@ class QuoteApplicationService:
     def _to_response(self, quote: Quote, *, now: datetime) -> QuoteResponse:
         try:
             snapshot = QuoteServiceSnapshot.model_validate(quote.service_snapshot)
-            integrity = recompute_quote_integrity(quote)
-            input_matches = compare_digest(integrity.input_hash, quote.input_hash)
-            quote_matches = compare_digest(integrity.quote_hash, quote.quote_hash)
-        except (CanonicalJSONError, TypeError, ValueError, ValidationError) as error:
-            raise QuoteIntegrityError(quote.id) from error
-
-        if (
-            not input_matches
-            or not quote_matches
-            or not self._snapshot_matches_quote(snapshot, quote)
-        ):
-            raise QuoteIntegrityError(quote.id)
+            verification = verify_quote_integrity(quote)
+        except IntegrityStructureError as error:
+            raise QuoteIntegrityError(quote.id, "INTEGRITY_QUOTE_DATA_INVALID") from error
+        except ValidationError as error:
+            raise QuoteIntegrityError(quote.id, "INTEGRITY_QUOTE_DATA_INVALID") from error
 
         issued_at = self._as_utc(quote.issued_at)
         expires_at = self._as_utc(quote.expires_at)
+        if now < issued_at:
+            raise QuoteIntegrityError(quote.id, "INTEGRITY_QUOTE_DATA_INVALID")
+        if not verification.hash_matches:
+            raise QuoteIntegrityError(quote.id)
         state = "expired" if now >= expires_at else "active"
         return QuoteResponse(
             id=quote.id,
@@ -245,18 +242,6 @@ class QuoteApplicationService:
             expires_at=expires_at,
             state=state,
             quote_hash=quote.quote_hash,
-        )
-
-    @staticmethod
-    def _snapshot_matches_quote(snapshot: QuoteServiceSnapshot, quote: Quote) -> bool:
-        return (
-            snapshot.merchant.id == quote.merchant_id
-            and snapshot.service.id == quote.service_id
-            and snapshot.pricing.amount == quote.amount
-            and snapshot.pricing.currency == quote.currency
-            and snapshot.pricing.purchase_type == quote.purchase_type
-            and snapshot.fulfillment.maximum_seconds == quote.maximum_fulfillment_seconds
-            and snapshot.fulfillment.refund_on_failure == quote.refund_on_fulfillment_failure
         )
 
     def _read_clock(self) -> datetime:

@@ -13,6 +13,7 @@ from app.domain.exceptions import (
     InactiveMerchantError,
     InactiveServiceError,
     QuoteInputValidationError,
+    QuoteIntegrityError,
     ResourceNotFoundError,
     ServiceConfigurationError,
 )
@@ -313,6 +314,13 @@ async def test_quote_creation_is_authoritative_normalized_fresh_and_snapshot_bac
     service.name = "Changed current service"
     service.base_price = 999
     service.maximum_fulfillment_seconds = 90
+    clock.current = first.issued_at - timedelta(microseconds=1)
+    with pytest.raises(QuoteIntegrityError) as future_error:
+        await application.get(first.id)
+    assert future_error.value.reason_code == "INTEGRITY_QUOTE_DATA_INVALID"
+
+    clock.current = first.issued_at
+    assert (await application.get(first.id)).state == "active"
     clock.current = first.expires_at
     historical = await application.get(first.id)
     assert historical.service.name == "Orbital Risk Report"

@@ -267,9 +267,13 @@ function CatalogEmpty() {
 }
 
 function ServiceCard({
+  policyCreateEndpoint,
+  policyEvaluationEndpoint,
   quoteEndpoint,
   service,
 }: {
+  policyCreateEndpoint: string;
+  policyEvaluationEndpoint: string;
   quoteEndpoint: string;
   service: CatalogService;
 }) {
@@ -314,6 +318,8 @@ function ServiceCard({
       <ServiceQuoteRequest
         endpoint={quoteEndpoint}
         inputSchema={service.input_schema}
+        policyCreateEndpoint={policyCreateEndpoint}
+        policyEvaluationEndpoint={policyEvaluationEndpoint}
         serviceId={service.id}
         serviceName={service.name}
       />
@@ -323,9 +329,13 @@ function ServiceCard({
 
 function CatalogResults({
   payload,
+  policyCreateEndpoint,
+  policyEvaluationEndpoint,
   quoteEndpoint,
 }: {
   payload: CatalogPayload;
+  policyCreateEndpoint: string;
+  policyEvaluationEndpoint: string;
   quoteEndpoint: string;
 }) {
   const merchants = payload.merchants.filter(
@@ -371,6 +381,8 @@ function CatalogResults({
             {merchant.services.map((service) => (
               <ServiceCard
                 key={service.id}
+                policyCreateEndpoint={policyCreateEndpoint}
+                policyEvaluationEndpoint={policyEvaluationEndpoint}
                 quoteEndpoint={quoteEndpoint}
                 service={service}
               />
@@ -393,6 +405,10 @@ export function ServiceCatalog() {
   }, [configuredApiUrl]);
   const endpoint = apiOrigin ? `${apiOrigin}/api/v1/catalog` : null;
   const quoteEndpoint = apiOrigin ? `${apiOrigin}/api/v1/quotes` : null;
+  const policyCreateEndpoint = apiOrigin ? `${apiOrigin}/api/v1/policies` : null;
+  const policyEvaluationEndpoint = apiOrigin
+    ? `${apiOrigin}/api/v1/policy-evaluations`
+    : null;
   const [requestNumber, setRequestNumber] = useState(0);
   const [state, setState] = useState<CatalogState>({ kind: "loading" });
 
@@ -471,9 +487,14 @@ export function ServiceCatalog() {
           onRetry={retry}
         />
       ) : null}
-      {displayState.kind === "resolved" && quoteEndpoint ? (
+      {displayState.kind === "resolved" &&
+      quoteEndpoint &&
+      policyCreateEndpoint &&
+      policyEvaluationEndpoint ? (
         <CatalogResults
           payload={displayState.payload}
+          policyCreateEndpoint={policyCreateEndpoint}
+          policyEvaluationEndpoint={policyEvaluationEndpoint}
           quoteEndpoint={quoteEndpoint}
         />
       ) : null}

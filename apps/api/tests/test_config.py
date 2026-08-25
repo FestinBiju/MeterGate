@@ -12,6 +12,7 @@ ENVIRONMENT_VARIABLES = (
     "DATABASE_URL",
     "HEALTHCHECK_TIMEOUT_SECONDS",
     "LOG_LEVEL",
+    "POLICY_MAX_TTL_SECONDS",
     "QUOTE_TTL_SECONDS",
     "REDIS_URL",
     "SERVICE_NAME",
@@ -59,6 +60,7 @@ def test_settings_load_values_from_an_isolated_dotenv_file(
                 "SERVICE_NAME=dotenv-service",
                 "LOG_LEVEL=DEBUG",
                 "HEALTHCHECK_TIMEOUT_SECONDS=4.5",
+                "POLICY_MAX_TTL_SECONDS=7200",
                 "QUOTE_TTL_SECONDS=900",
                 "CORS_ALLOWED_ORIGINS=https://console.example.com,https://admin.example.com",
             )
@@ -76,6 +78,7 @@ def test_settings_load_values_from_an_isolated_dotenv_file(
     assert settings.service_name == "dotenv-service"
     assert settings.log_level == "DEBUG"
     assert settings.healthcheck_timeout_seconds == 4.5
+    assert settings.policy_max_ttl_seconds == 7200
     assert settings.quote_ttl_seconds == 900
     assert settings.cors_allowed_origins == [
         "https://console.example.com",
@@ -95,6 +98,7 @@ def test_operating_system_environment_takes_precedence_over_dotenv(
                 "DATABASE_URL=postgresql://dotenv-user:dotenv-pass@dotenv-db:5432/metergate",
                 "REDIS_URL=redis://dotenv-cache:6379/0",
                 "SERVICE_NAME=dotenv-service",
+                "POLICY_MAX_TTL_SECONDS=3600",
                 "QUOTE_TTL_SECONDS=600",
             )
         ),
@@ -106,6 +110,7 @@ def test_operating_system_environment_takes_precedence_over_dotenv(
     )
     monkeypatch.setenv("REDIS_URL", "rediss://environment-cache:6380/2")
     monkeypatch.setenv("SERVICE_NAME", "environment-service")
+    monkeypatch.setenv("POLICY_MAX_TTL_SECONDS", "1800")
     monkeypatch.setenv("QUOTE_TTL_SECONDS", "120")
 
     settings = Settings(_env_file=dotenv_file)  # type: ignore[call-arg]
@@ -116,6 +121,7 @@ def test_operating_system_environment_takes_precedence_over_dotenv(
     )
     assert settings.redis_url.get_secret_value() == "rediss://environment-cache:6380/2"
     assert settings.service_name == "environment-service"
+    assert settings.policy_max_ttl_seconds == 1800
     assert settings.quote_ttl_seconds == 120
 
 
@@ -128,6 +134,17 @@ def test_quote_ttl_has_a_safe_default_and_validated_bounds() -> None:
         build_settings(quote_ttl_seconds=0)
     with pytest.raises(ValidationError):
         build_settings(quote_ttl_seconds=86_401)
+
+
+def test_policy_max_ttl_has_a_safe_default_and_validated_bounds() -> None:
+    assert build_settings().policy_max_ttl_seconds == 86_400
+    assert build_settings(policy_max_ttl_seconds=1).policy_max_ttl_seconds == 1
+    assert build_settings(policy_max_ttl_seconds=86_400).policy_max_ttl_seconds == 86_400
+
+    with pytest.raises(ValidationError):
+        build_settings(policy_max_ttl_seconds=0)
+    with pytest.raises(ValidationError):
+        build_settings(policy_max_ttl_seconds=86_401)
 
 
 @pytest.mark.parametrize(

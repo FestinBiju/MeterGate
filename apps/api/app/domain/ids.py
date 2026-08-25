@@ -5,9 +5,11 @@ import threading
 import time
 from typing import Literal
 
-IdPrefix = Literal["mrc_", "qte_", "svc_"]
+IdPrefix = Literal["mrc_", "pol_", "pye_", "qte_", "svc_"]
 
 MERCHANT_ID_PREFIX: IdPrefix = "mrc_"
+POLICY_ID_PREFIX: IdPrefix = "pol_"
+POLICY_EVALUATION_ID_PREFIX: IdPrefix = "pye_"
 QUOTE_ID_PREFIX: IdPrefix = "qte_"
 SERVICE_ID_PREFIX: IdPrefix = "svc_"
 
@@ -22,7 +24,13 @@ _last_randomness = -1
 
 def generate_id(prefix: IdPrefix) -> str:
     """Generate a prefixed, monotonic 48-bit time + 80-bit random identifier."""
-    if prefix not in {MERCHANT_ID_PREFIX, QUOTE_ID_PREFIX, SERVICE_ID_PREFIX}:
+    if prefix not in {
+        MERCHANT_ID_PREFIX,
+        POLICY_ID_PREFIX,
+        POLICY_EVALUATION_ID_PREFIX,
+        QUOTE_ID_PREFIX,
+        SERVICE_ID_PREFIX,
+    }:
         raise ValueError("Unsupported MeterGate ID prefix")
 
     timestamp_ms, randomness = _next_payload()
@@ -32,6 +40,14 @@ def generate_id(prefix: IdPrefix) -> str:
 
 def new_merchant_id() -> str:
     return generate_id(MERCHANT_ID_PREFIX)
+
+
+def new_policy_id() -> str:
+    return generate_id(POLICY_ID_PREFIX)
+
+
+def new_policy_evaluation_id() -> str:
+    return generate_id(POLICY_EVALUATION_ID_PREFIX)
 
 
 def new_quote_id() -> str:

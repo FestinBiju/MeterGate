@@ -31,6 +31,7 @@ class QuoteIntegrityFields(Protocol):
     refund_on_fulfillment_failure: bool
     issued_at: datetime
     expires_at: datetime
+    quote_hash: str
 
 
 @dataclass(frozen=True, slots=True)

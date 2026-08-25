@@ -29,3 +29,8 @@ class PurchaseType(StrEnum):
     ONE_TIME = "one_time"
     SUBSCRIPTION = "subscription"
     USAGE_BASED = "usage_based"
+
+
+class PolicyDecision(StrEnum):
+    ALLOW = "allow"
+    DENY = "deny"
