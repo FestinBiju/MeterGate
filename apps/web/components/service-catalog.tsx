@@ -2,6 +2,8 @@
 
 import { useEffect, useMemo, useState } from "react";
 
+import { ServiceQuoteRequest } from "@/components/service-quote-request";
+
 type CatalogPricing = {
   amount: number;
   currency: string;
@@ -50,12 +52,6 @@ type PriceDisplay = {
 const REQUEST_TIMEOUT_MS = 8_000;
 const integerFormatter = new Intl.NumberFormat("en-IN", {
   maximumFractionDigits: 0,
-});
-const inrFormatter = new Intl.NumberFormat("en-IN", {
-  style: "currency",
-  currency: "INR",
-  minimumFractionDigits: 2,
-  maximumFractionDigits: 2,
 });
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -183,8 +179,10 @@ function formatPrice(pricing: CatalogPricing): PriceDisplay {
   const minorUnits = integerFormatter.format(pricing.amount);
 
   if (currency === "INR") {
+    const rupees = Math.trunc(pricing.amount / 100);
+    const paise = pricing.amount % 100;
     return {
-      primary: inrFormatter.format(pricing.amount / 100),
+      primary: `₹${integerFormatter.format(rupees)}.${paise.toString().padStart(2, "0")}`,
       minorUnitContext: `${minorUnits} paise · integer minor units`,
     };
   }
@@ -268,11 +266,17 @@ function CatalogEmpty() {
   );
 }
 
-function ServiceCard({ service }: { service: CatalogService }) {
+function ServiceCard({
+  quoteEndpoint,
+  service,
+}: {
+  quoteEndpoint: string;
+  service: CatalogService;
+}) {
   const price = formatPrice(service.pricing);
 
   return (
-    <article className="flex h-full flex-col rounded-2xl border border-white/[0.08] bg-slate-950/65 p-5 shadow-xl shadow-black/10 transition hover:border-cyan-300/15 sm:p-6">
+    <article className="flex self-start flex-col rounded-2xl border border-white/[0.08] bg-slate-950/65 p-5 shadow-xl shadow-black/10 transition hover:border-cyan-300/15 sm:p-6">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <span className="rounded-full border border-cyan-300/15 bg-cyan-300/[0.06] px-2.5 py-1 text-[11px] font-medium text-cyan-100/80">
           {formatToken(service.service_type)}
@@ -306,11 +310,24 @@ function ServiceCard({ service }: { service: CatalogService }) {
           {formatToken(service.purchase_type)}
         </span>
       </div>
+
+      <ServiceQuoteRequest
+        endpoint={quoteEndpoint}
+        inputSchema={service.input_schema}
+        serviceId={service.id}
+        serviceName={service.name}
+      />
     </article>
   );
 }
 
-function CatalogResults({ payload }: { payload: CatalogPayload }) {
+function CatalogResults({
+  payload,
+  quoteEndpoint,
+}: {
+  payload: CatalogPayload;
+  quoteEndpoint: string;
+}) {
   const merchants = payload.merchants.filter(
     (merchant) => merchant.services.length > 0,
   );
@@ -352,7 +369,11 @@ function CatalogResults({ payload }: { payload: CatalogPayload }) {
 
           <div className="grid gap-4 lg:grid-cols-2">
             {merchant.services.map((service) => (
-              <ServiceCard key={service.id} service={service} />
+              <ServiceCard
+                key={service.id}
+                quoteEndpoint={quoteEndpoint}
+                service={service}
+              />
             ))}
           </div>
         </article>
@@ -363,13 +384,15 @@ function CatalogResults({ payload }: { payload: CatalogPayload }) {
 
 export function ServiceCatalog() {
   const configuredApiUrl = process.env.NEXT_PUBLIC_API_URL?.trim() ?? "";
-  const endpoint = useMemo(() => {
+  const apiOrigin = useMemo(() => {
     if (!configuredApiUrl) {
       return null;
     }
 
-    return `${configuredApiUrl.replace(/\/+$/, "")}/api/v1/catalog`;
+    return configuredApiUrl.replace(/\/+$/, "");
   }, [configuredApiUrl]);
+  const endpoint = apiOrigin ? `${apiOrigin}/api/v1/catalog` : null;
+  const quoteEndpoint = apiOrigin ? `${apiOrigin}/api/v1/quotes` : null;
   const [requestNumber, setRequestNumber] = useState(0);
   const [state, setState] = useState<CatalogState>({ kind: "loading" });
 
@@ -448,8 +471,11 @@ export function ServiceCatalog() {
           onRetry={retry}
         />
       ) : null}
-      {displayState.kind === "resolved" ? (
-        <CatalogResults payload={displayState.payload} />
+      {displayState.kind === "resolved" && quoteEndpoint ? (
+        <CatalogResults
+          payload={displayState.payload}
+          quoteEndpoint={quoteEndpoint}
+        />
       ) : null}
     </section>
   );

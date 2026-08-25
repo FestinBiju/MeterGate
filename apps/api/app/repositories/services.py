@@ -23,6 +23,23 @@ class ServiceRepository:
     async def get(self, service_id: str) -> Service | None:
         return await self._session.get(Service, service_id)
 
+    async def get_with_merchant_for_quote(
+        self,
+        service_id: str,
+    ) -> tuple[Merchant, Service] | None:
+        """Load and share-lock one authoritative offer through quote insertion."""
+        result = await self._session.execute(
+            select(Merchant, Service)
+            .join(Service, Service.merchant_id == Merchant.id)
+            .where(Service.id == service_id)
+            .with_for_update(read=True, of=(Merchant, Service))
+        )
+        row = result.one_or_none()
+        if row is None:
+            return None
+        merchant, service = row
+        return merchant, service
+
     async def get_by_slug(self, merchant_id: str, slug: str) -> Service | None:
         result = await self._session.scalars(
             select(Service).where(

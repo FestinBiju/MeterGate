@@ -30,12 +30,13 @@ The goal is to help merchants become **discoverable, understandable, payable, an
 
 ## Current Milestone
 
-Milestone 2 establishes MeterGate's first durable commerce domain: merchants can register digital services in PostgreSQL, and clients can discover active offerings through a versioned JSON catalog. Payments, quotes, entitlements, and fulfillment execution remain intentionally out of scope.
+Milestone 3 adds MeterGate's immutable Quote Engine to the durable merchant and service catalog. Clients can request a time-limited, server-issued commercial offer for an exact service input. Buyer policy authorization, payments, entitlements, and fulfillment execution remain intentionally out of scope.
 
 ## Domain Model
 
 - A **merchant** has a stable opaque ID, unique URL-safe slug, public profile, lifecycle status, and audit timestamps.
 - A **service** belongs to one merchant and records its type, purchase model, integer minor-unit price, machine-readable input/output schemas, fulfillment expectations, lifecycle status, and audit timestamps.
+- A **quote** binds normalized service input to an immutable snapshot of the merchant-authoritative price, currency, purchase type, and fulfillment terms for a configured lifetime.
 - Merchant slugs are globally unique. Service slugs are unique within their merchant. Public removal is lifecycle-based; there are no hard-delete endpoints.
 
 ## Local Development
@@ -79,3 +80,9 @@ The API liveness endpoint is `http://localhost:8000/health`. The readiness endpo
 ## Catalog API
 
 `GET /api/v1/catalog` returns only active merchants and active services in deterministic order. Prices use integer minor units with an explicit currency, and each service includes its purchase type, JSON input/output schemas, and fulfillment characteristics. `GET /api/v1/catalog/services/{service_id}` returns one publicly discoverable service; inactive or unknown records return `404`.
+
+## Quote Engine
+
+`POST /api/v1/quotes` accepts only a `service_id` and service `input`. MeterGate validates that input with bounded, self-contained Draft 2020-12 JSON Schema rules, loads the active merchant and service, and derives the amount, currency, purchase type, expiry, and fulfillment terms on the server. External schema references and regex keywords are rejected so quote validation cannot perform network resolution or unbounded regular-expression work. The client cannot choose the payable amount or other commercial terms.
+
+Each successful request creates a fresh immutable quote. Its PostgreSQL snapshot remains meaningful after later service edits, and its deterministic SHA-256 fingerprint binds the canonical input and commercial terms. Quote state is derived from the configured `QUOTE_TTL_SECONDS`; expiry never mutates the row. `GET /api/v1/quotes/{quote_id}` returns the original snapshot-backed quote. These endpoints issue offers only—they do not authorize spending, reserve funds, or create a payment.

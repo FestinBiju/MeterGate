@@ -10,7 +10,8 @@ from typing import Any
 import pytest
 from alembic.config import Config
 from fastapi.testclient import TestClient
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import CreateSchema, DropSchema
@@ -23,7 +24,7 @@ from app.scripts.seed_dev import seed_development_data
 from app.services.readiness import ReadinessService
 
 API_ROOT = Path(__file__).resolve().parents[1]
-ID_PATTERN = re.compile(r"^(mrc_|svc_)[0-7][0-9A-HJKMNP-TV-Z]{25}$")
+ID_PATTERN = re.compile(r"^(mrc_|qte_|svc_)[0-7][0-9A-HJKMNP-TV-Z]{25}$")
 TEST_SCHEMA_PATTERN = re.compile(r"^metergate_test_[0-9a-f]{32}$")
 
 
@@ -57,6 +58,12 @@ def _alembic_upgrade(connection: Any) -> None:
     config = Config(API_ROOT / "alembic.ini")
     config.attributes["connection"] = connection
     command.upgrade(config, "head")
+
+
+def _alembic_downgrade_to_milestone_two(connection: Any) -> None:
+    config = Config(API_ROOT / "alembic.ini")
+    config.attributes["connection"] = connection
+    command.downgrade(config, "20260825_0001")
 
 
 async def _prepare_isolated_database() -> IsolatedDatabase:
@@ -167,6 +174,7 @@ def service_payload(
     *,
     status: str = "active",
     base_price: int = 500,
+    input_schema: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "slug": slug,
@@ -177,10 +185,13 @@ def service_payload(
         "purchase_type": "one_time",
         "currency": "INR",
         "base_price": base_price,
-        "input_schema": {
+        "input_schema": input_schema
+        if input_schema is not None
+        else {
             "type": "object",
             "properties": {"norad_id": {"type": "integer"}},
             "required": ["norad_id"],
+            "additionalProperties": False,
         },
         "output_schema": {
             "type": "object",
@@ -210,10 +221,16 @@ def create_service(
     *,
     status: str = "active",
     base_price: int = 500,
+    input_schema: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     response = client.post(
         f"/api/v1/merchants/{merchant_id}/services",
-        json=service_payload(slug, status=status, base_price=base_price),
+        json=service_payload(
+            slug,
+            status=status,
+            base_price=base_price,
+            input_schema=input_schema,
+        ),
     )
     assert response.status_code == 201, response.text
     return response.json()
@@ -247,7 +264,7 @@ def test_alembic_upgraded_a_clean_postgresql_schema(
     dialect, tables, checks, named_constraints = asyncio.run(inspect_database())
 
     assert dialect == "postgresql"
-    assert {"alembic_version", "merchants", "services"} <= tables
+    assert {"alembic_version", "merchants", "quotes", "services"} <= tables
     assert {
         "ck_services_service_base_price_nonnegative",
         "ck_services_service_input_schema_object",
@@ -255,6 +272,110 @@ def test_alembic_upgraded_a_clean_postgresql_schema(
     } <= checks
     assert "uq_services_merchant_id_slug" in named_constraints
     assert "fk_services_merchant_id_merchants" in named_constraints
+
+
+def test_quote_migration_has_postgresql_integrity_guards(
+    isolated_database: IsolatedDatabase,
+) -> None:
+    async def inspect_quotes() -> dict[str, Any]:
+        async with isolated_database.database.engine.connect() as connection:
+
+            def inspect_connection(sync_connection: Any) -> dict[str, Any]:
+                inspector = inspect(sync_connection)
+                return {
+                    "columns": {
+                        column["name"]: str(column["type"])
+                        for column in inspector.get_columns("quotes")
+                    },
+                    "checks": {item["name"] for item in inspector.get_check_constraints("quotes")},
+                    "foreign_keys": {
+                        item["referred_table"]: item["options"].get("ondelete")
+                        for item in inspector.get_foreign_keys("quotes")
+                    },
+                    "indexes": {item["name"] for item in inspector.get_indexes("quotes")},
+                    "unique": {item["name"] for item in inspector.get_unique_constraints("quotes")},
+                }
+
+            inspected = await connection.run_sync(inspect_connection)
+            triggers = await connection.scalars(
+                text(
+                    """
+                    SELECT trigger_name
+                    FROM information_schema.triggers
+                    WHERE event_object_schema = current_schema()
+                      AND event_object_table = 'quotes'
+                    """
+                )
+            )
+            inspected["triggers"] = set(triggers.all())
+            return inspected
+
+    quote_schema = asyncio.run(inspect_quotes())
+
+    assert quote_schema["columns"] == {
+        "id": "VARCHAR(30)",
+        "merchant_id": "VARCHAR(30)",
+        "service_id": "VARCHAR(30)",
+        "input": "JSONB",
+        "input_hash": "VARCHAR(71)",
+        "service_snapshot": "JSONB",
+        "amount": "BIGINT",
+        "currency": "VARCHAR(3)",
+        "purchase_type": "VARCHAR(12)",
+        "maximum_fulfillment_seconds": "INTEGER",
+        "refund_on_fulfillment_failure": "BOOLEAN",
+        "issued_at": "TIMESTAMP",
+        "expires_at": "TIMESTAMP",
+        "created_at": "TIMESTAMP",
+        "quote_hash": "VARCHAR(71)",
+    }
+    assert {
+        "ck_quotes_quote_amount_safe_integer_range",
+        "ck_quotes_quote_expiry_after_issue",
+        "ck_quotes_quote_hash_format",
+        "ck_quotes_quote_input_hash_format",
+        "ck_quotes_quote_service_snapshot_object",
+    } <= quote_schema["checks"]
+    assert quote_schema["foreign_keys"] == {
+        "merchants": "RESTRICT",
+        "services": "RESTRICT",
+    }
+    assert {
+        "ix_quotes_expires_at",
+        "ix_quotes_merchant_issued_at",
+        "ix_quotes_service_issued_at",
+    } <= quote_schema["indexes"]
+    assert "uq_quotes_quote_hash" in quote_schema["unique"]
+    assert quote_schema["triggers"] == {"trg_quotes_immutable"}
+
+
+def test_quote_migration_downgrades_and_reupgrades_in_disposable_postgresql_schema() -> None:
+    async def exercise_cycle() -> None:
+        isolated = await _prepare_isolated_database()
+        try:
+            async with isolated.database.engine.connect() as connection:
+                await connection.run_sync(_alembic_downgrade_to_milestone_two)
+
+                def milestone_two_tables(sync_connection: Any) -> set[str]:
+                    return set(inspect(sync_connection).get_table_names())
+
+                assert await connection.run_sync(milestone_two_tables) == {
+                    "alembic_version",
+                    "merchants",
+                    "services",
+                }
+
+                await connection.run_sync(_alembic_upgrade)
+
+                def milestone_three_tables(sync_connection: Any) -> set[str]:
+                    return set(inspect(sync_connection).get_table_names())
+
+                assert "quotes" in await connection.run_sync(milestone_three_tables)
+        finally:
+            await isolated.database.dispose()
+            await _drop_isolated_schema(isolated.database_url, isolated.schema)
+
+    asyncio.run(exercise_cycle())
 
 
 def test_merchant_create_get_update_and_unknown_response(domain_client: TestClient) -> None:
@@ -353,6 +474,7 @@ def test_service_slug_scope_and_unknown_merchant(domain_client: TestClient) -> N
     [
         ("base_price", -1),
         ("base_price", 5.5),
+        ("base_price", (1 << 53)),
         ("status", "unknown"),
         ("currency", "inr"),
         ("input_schema", []),
@@ -453,6 +575,224 @@ def test_catalog_filters_lifecycle_and_exposes_machine_contract(
         domain_client.get(f"/api/v1/catalog/services/{hidden_merchant_service['id']}").status_code
         == 404
     )
+
+
+def test_quote_creation_is_server_authoritative_fresh_and_lookup_is_immutable(
+    domain_client: TestClient,
+) -> None:
+    merchant = create_merchant(domain_client, "quote-authority-merchant")
+    service = create_service(
+        domain_client,
+        merchant["id"],
+        "quote-authority-service",
+        base_price=725,
+    )
+    request = {"service_id": service["id"], "input": {"norad_id": 25544}}
+
+    first_response = domain_client.post("/api/v1/quotes", json=request)
+    second_response = domain_client.post("/api/v1/quotes", json=request)
+
+    assert first_response.status_code == 201, first_response.text
+    assert second_response.status_code == 201, second_response.text
+    first = first_response.json()
+    second = second_response.json()
+    assert ID_PATTERN.fullmatch(first["id"])
+    assert first["merchant"] == {
+        "id": merchant["id"],
+        "slug": merchant["slug"],
+        "name": merchant["name"],
+    }
+    assert first["service"]["id"] == service["id"]
+    assert first["service"]["name"] == service["name"]
+    assert first["input"] == request["input"]
+    assert first["input_hash"].startswith("sha256:")
+    assert first["pricing"] == {
+        "amount": 725,
+        "currency": "INR",
+        "purchase_type": "one_time",
+    }
+    assert first["fulfillment"] == {
+        "maximum_seconds": 30,
+        "refund_on_failure": True,
+    }
+    assert first["state"] == "active"
+    assert first["quote_hash"].startswith("sha256:")
+    assert second["id"] != first["id"]
+    assert second["quote_hash"] != first["quote_hash"]
+    assert second["input_hash"] == first["input_hash"]
+    assert domain_client.get(f"/api/v1/quotes/{first['id']}").json() == first
+
+    forbidden_terms = domain_client.post(
+        "/api/v1/quotes",
+        json={**request, "amount": 1, "currency": "USD"},
+    )
+    assert forbidden_terms.status_code == 422
+    assert domain_client.patch(f"/api/v1/quotes/{first['id']}", json={}).status_code == 405
+
+
+@pytest.mark.parametrize(
+    "invalid_input",
+    [
+        {},
+        {"norad_id": "ISS"},
+        {"norad_id": 25544, "unexpected": "value"},
+    ],
+)
+def test_quote_input_is_validated_against_the_persisted_schema(
+    domain_client: TestClient,
+    invalid_input: Any,
+) -> None:
+    merchants = domain_client.get("/api/v1/merchants").json()
+    merchant = next(
+        (item for item in merchants if item["slug"] == "quote-validation-merchant"),
+        None,
+    )
+    if merchant is None:
+        merchant = create_merchant(domain_client, "quote-validation-merchant")
+    services = domain_client.get(f"/api/v1/merchants/{merchant['id']}/services").json()
+    service = next(
+        (item for item in services if item["slug"] == "quote-validation-service"),
+        None,
+    )
+    if service is None:
+        service = create_service(
+            domain_client,
+            merchant["id"],
+            "quote-validation-service",
+        )
+
+    response = domain_client.post(
+        "/api/v1/quotes",
+        json={"service_id": service["id"], "input": invalid_input},
+    )
+
+    assert response.status_code == 422
+    body = response.json()
+    assert "Traceback" not in str(body)
+    assert "SELECT " not in str(body)
+
+
+def test_quote_eligibility_distinguishes_unknown_and_inactive_records(
+    domain_client: TestClient,
+) -> None:
+    active_merchant = create_merchant(domain_client, "quote-gating-active-merchant")
+    inactive_merchant = create_merchant(
+        domain_client,
+        "quote-gating-inactive-merchant",
+        status="inactive",
+    )
+    inactive_service = create_service(
+        domain_client,
+        active_merchant["id"],
+        "quote-gating-inactive-service",
+        status="inactive",
+    )
+    inactive_merchant_service = create_service(
+        domain_client,
+        inactive_merchant["id"],
+        "quote-gating-inactive-merchant-service",
+    )
+    request_input = {"norad_id": 25544}
+
+    assert (
+        domain_client.post(
+            "/api/v1/quotes",
+            json={"service_id": "svc_00000000000000000000000000", "input": request_input},
+        ).status_code
+        == 404
+    )
+    assert (
+        domain_client.post(
+            "/api/v1/quotes",
+            json={"service_id": inactive_service["id"], "input": request_input},
+        ).status_code
+        == 409
+    )
+    assert (
+        domain_client.post(
+            "/api/v1/quotes",
+            json={"service_id": inactive_merchant_service["id"], "input": request_input},
+        ).status_code
+        == 409
+    )
+
+
+def test_quote_snapshot_and_row_survive_service_edits_and_database_mutation_attempts(
+    domain_client: TestClient,
+    isolated_database: IsolatedDatabase,
+) -> None:
+    merchant = create_merchant(domain_client, "quote-history-merchant")
+    service = create_service(
+        domain_client,
+        merchant["id"],
+        "quote-history-service",
+        base_price=500,
+    )
+    created_response = domain_client.post(
+        "/api/v1/quotes",
+        json={"service_id": service["id"], "input": {"norad_id": 25544}},
+    )
+    assert created_response.status_code == 201, created_response.text
+    original = created_response.json()
+
+    changed_service = domain_client.patch(
+        f"/api/v1/services/{service['id']}",
+        json={
+            "name": "Changed Service Name",
+            "base_price": 999,
+            "maximum_fulfillment_seconds": 90,
+            "refund_on_fulfillment_failure": False,
+        },
+    )
+    assert changed_service.status_code == 200, changed_service.text
+    assert domain_client.get(f"/api/v1/quotes/{original['id']}").json() == original
+
+    async def attempt_raw_mutation(statement: str) -> None:
+        async with isolated_database.database.engine.begin() as connection:
+            await connection.execute(text(statement), {"quote_id": original["id"]})
+
+    with pytest.raises(DBAPIError):
+        asyncio.run(
+            attempt_raw_mutation("UPDATE quotes SET amount = amount + 1 WHERE id = :quote_id")
+        )
+    with pytest.raises(DBAPIError):
+        asyncio.run(attempt_raw_mutation("DELETE FROM quotes WHERE id = :quote_id"))
+
+    async def attempt_service_delete() -> None:
+        async with isolated_database.database.engine.begin() as connection:
+            await connection.execute(
+                text("DELETE FROM services WHERE id = :service_id"),
+                {"service_id": service["id"]},
+            )
+
+    with pytest.raises(DBAPIError):
+        asyncio.run(attempt_service_delete())
+
+    assert domain_client.get(f"/api/v1/quotes/{original['id']}").json() == original
+    assert domain_client.get(f"/api/v1/services/{service['id']}").status_code == 200
+
+
+def test_quote_input_supports_non_object_json_when_the_service_schema_allows_it(
+    domain_client: TestClient,
+) -> None:
+    merchant = create_merchant(domain_client, "quote-json-value-merchant")
+    service = create_service(
+        domain_client,
+        merchant["id"],
+        "quote-json-value-service",
+        input_schema={"type": "null"},
+    )
+
+    response = domain_client.post(
+        "/api/v1/quotes",
+        json={"service_id": service["id"], "input": None},
+    )
+
+    assert response.status_code == 201, response.text
+    quote = response.json()
+    assert quote["input"] is None
+    assert domain_client.get(f"/api/v1/quotes/{quote['id']}").json()["input"] is None
+    assert domain_client.get("/api/v1/quotes/qte_00000000000000000000000000").status_code == 404
 
 
 def test_development_seed_is_idempotent_and_database_backed(
