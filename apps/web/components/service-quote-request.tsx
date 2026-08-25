@@ -293,10 +293,12 @@ function formatPrice(pricing: QuoteResponse["pricing"]): {
 }
 
 function QuoteDisplay({
+  apiBaseEndpoint,
   policyCreateEndpoint,
   policyEvaluationEndpoint,
   quote,
 }: {
+  apiBaseEndpoint: string;
   policyCreateEndpoint: string;
   policyEvaluationEndpoint: string;
   quote: QuoteResponse;
@@ -457,6 +459,7 @@ function QuoteDisplay({
       </dl>
 
       <QuotePolicyEvaluator
+        apiBaseEndpoint={apiBaseEndpoint}
         createEndpoint={policyCreateEndpoint}
         evaluationEndpoint={policyEvaluationEndpoint}
         quote={quote}
@@ -466,6 +469,7 @@ function QuoteDisplay({
 }
 
 export function ServiceQuoteRequest({
+  apiBaseEndpoint,
   endpoint,
   inputSchema,
   policyCreateEndpoint,
@@ -473,6 +477,7 @@ export function ServiceQuoteRequest({
   serviceId,
   serviceName,
 }: {
+  apiBaseEndpoint: string;
   endpoint: string;
   inputSchema: Record<string, unknown>;
   policyCreateEndpoint: string;
@@ -658,6 +663,7 @@ export function ServiceQuoteRequest({
 
           {requestState.kind === "resolved" ? (
             <QuoteDisplay
+              apiBaseEndpoint={apiBaseEndpoint}
               key={requestState.quote.id}
               policyCreateEndpoint={policyCreateEndpoint}
               policyEvaluationEndpoint={policyEvaluationEndpoint}

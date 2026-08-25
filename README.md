@@ -30,7 +30,7 @@ The goal is to help merchants become **discoverable, understandable, payable, an
 
 ## Current Milestone
 
-Milestone 4 adds immutable buyer policies and deterministic policy evaluations to the durable merchant, service, and quote foundation. A client may define bounded constraints and ask whether one exact server-issued quote satisfies them. Approval, payments, entitlements, and fulfillment execution remain intentionally out of scope.
+Milestone 5 adds trusted human approval to the immutable quote and deterministic policy foundation. A policy `allow` result may now be bound to a real passkey/WebAuthn ceremony and a short-lived, immutable purchase authorization. Payment creation, Razorpay, authorization consumption, entitlements, and fulfillment execution remain intentionally out of scope.
 
 ## Domain Model
 
@@ -39,6 +39,8 @@ Milestone 4 adds immutable buyer policies and deterministic policy evaluations t
 - A **quote** binds normalized service input to an immutable snapshot of the merchant-authoritative price, currency, purchase type, and fulfillment terms for a configured lifetime.
 - A **buyer policy** records immutable, time-limited per-quote constraints such as maximum amount and allowed currencies, merchants, services, service types, and purchase types.
 - A **policy evaluation** is immutable evidence that a specific policy hash was compared with a specific quote hash at a recorded time and produced an `allow` or `deny` decision with ordered reason-coded checks.
+- An **approval identity** binds one application subject reference to a private WebAuthn user handle and one or more registered passkey credentials. It proves control of a registered credential, not a person's legal identity.
+- A **purchase authorization** is immutable, short-lived evidence that a registered passkey confirmed one exact server-derived review. It is not a payment, order, reservation, or record of money spent.
 - Merchant slugs are globally unique. Service slugs are unique within their merchant. Public removal is lifecycle-based; there are no hard-delete endpoints.
 
 ## Local Development
@@ -98,3 +100,35 @@ Allowlist semantics are explicit: `null` is unconstrained, a non-empty array of 
 `POST /api/v1/policy-evaluations` accepts only a policy ID and quote ID. MeterGate reloads both immutable records, rechecks their hashes, and evaluates freshness, the per-quote maximum amount, currency, merchant, service, snapshotted service type, and purchase type in a fixed order. It persists the copied policy and quote hashes, the `allow` or `deny` decision, and all safe independent reason-coded checks. A well-formed hash mismatch is recorded as a fail-closed denial with `INTEGRITY_*` reason codes and no later checks; structurally unreadable integrity material returns a sanitized server error and creates no evaluation. `GET /api/v1/policy-evaluations/{evaluation_id}` replays the versioned engine against the immutable parent records at the stored evaluation time and rejects inconsistent evidence without consulting mutable merchant or service rows.
 
 For example, a ₹5 quote under a policy capped at ₹10 is allowed; a ₹15 quote under that same cap is denied with `DENY_AMOUNT_EXCEEDS_LIMIT`. The maximum is per candidate quote, not cumulative spend. An `allow` result means only that the quote satisfied the policy at evaluation time—it does not approve a purchase, reserve funds, authorize payment, or record money as spent.
+
+## Trusted Approval
+
+Policy `allow` **does not equal** purchase authorization. MeterGate issues an authorization only after an active approval identity whose `subject_ref` matches the policy completes explicit passkey/WebAuthn user verification. There is no plain boolean approval endpoint and no fallback that an AI agent can perform.
+
+The development flow is:
+
+1. Create or load an approval identity for the same subject used by the buyer policy.
+2. Request registration options, complete `navigator.credentials.create()` in the browser, and let the API verify and persist the credential public key. Registration challenges are short-lived and atomically single-use in Redis.
+3. After an integrity-verified, still-fresh `allow` evaluation, request an approval challenge using only the evaluation and identity IDs. The API derives the merchant, service, integer minor-unit amount, currency, purchase type, policy checks, hashes, and expiries from PostgreSQL.
+4. Review the exact server payload bound by its RFC 8785 `review_hash`, then choose **Approve with Passkey**. The browser requires WebAuthn user verification, and the API atomically consumes the challenge, replays all evidence, rechecks quote/policy freshness, recomputes the review, verifies the assertion, and transactionally advances the authenticator counter while inserting `aut_…` evidence.
+5. Retrieve safe audit fields with `GET /api/v1/authorizations/{authorization_id}`. Authorization state is derived from its configured short expiry; no row is mutated when time passes.
+
+Redis contains only ephemeral ceremony state. PostgreSQL remains authoritative for identities, passkey credentials, and authorizations. API responses never expose public-key bytes, raw authenticator signatures, raw challenges, or Redis state. `WEBAUTHN_RP_ID`, `WEBAUTHN_RP_NAME`, `WEBAUTHN_EXPECTED_ORIGINS`, `WEBAUTHN_CHALLENGE_TTL_SECONDS`, and `AUTHORIZATION_TTL_SECONDS` are environment-driven; the supplied localhost defaults are for development only.
+
+Milestone 5 deliberately has no authenticated user-account bootstrap, KYC, recovery, or passkey-management authorization. The identity and passkey-enrollment routes are development setup surfaces: trust begins at enrollment, and knowledge of an `aid_…` is not an ownership proof. A production account layer must protect first enrollment and require an existing trusted factor to add or recover credentials. This milestone proves only control of a credential that MeterGate has registered for the subject.
+
+No payment is created or executed in this milestone. A future payment gate must separately validate and consume an active authorization.
+
+### Manual Windows Hello acceptance
+
+Physical authenticator acceptance cannot be replaced by an automated fake. On a Windows development machine with Chrome or Edge and Windows Hello configured:
+
+1. Run `docker compose up -d --wait` from the repository root.
+2. In `apps/api`, run `uv sync --frozen --dev`, `uv run alembic upgrade head`, `uv run python -m app.scripts.seed_dev`, and `uv run fastapi dev app/main.py`.
+3. In `apps/web`, set `$env:NEXT_PUBLIC_API_URL = "http://localhost:8000"`, run `npm install`, then `npm run dev`.
+4. Open `http://localhost:3000` exactly (the default WebAuthn RP is `localhost`).
+5. Request the ₹5.00 INR OrbitIntel quote, create a `dev-user-001` policy capped at 1000 paise (₹10.00), and evaluate it to `allow`.
+6. Create a `dev-user-001` approval identity, choose **Register Passkey**, and complete the Windows Hello prompt.
+7. Prepare the trusted review, confirm the server-derived terms and review hash, choose **Approve with Passkey**, and complete Windows Hello again.
+8. Confirm the UI shows `AUTHORIZED`, an `aut_…` ID, the exact ₹5.00 terms, an expiry and authorization hash, plus “No payment has been created or executed yet.”
+9. Verify the same safe artifact with `Invoke-RestMethod http://localhost:8000/api/v1/authorizations/<aut_id>` and confirm that no payment or checkout endpoint/state was created.

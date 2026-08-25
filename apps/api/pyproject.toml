@@ -12,6 +12,7 @@ dependencies = [
     "redis>=5,<8",
     "rfc8785>=0.1.4,<0.2",
     "sqlalchemy[asyncio]>=2.0,<3",
+    "webauthn>=3,<4",
 ]
 
 [dependency-groups]

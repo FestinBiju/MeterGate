@@ -13,7 +13,7 @@ import pytest
 from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy import inspect, text
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import CreateSchema, DropSchema
@@ -22,7 +22,13 @@ from alembic import command
 from app.application import create_app
 from app.core.config import Settings, get_settings
 from app.db.session import Database, make_async_database_url
-from app.domain.ids import new_policy_evaluation_id, new_policy_id
+from app.domain.approval_hashing import AUTHORIZATION_VERSION, calculate_authorization_hash
+from app.domain.enums import PurchaseType
+from app.domain.hashing import sha256_bytes
+from app.domain.ids import new_authorization_id, new_policy_evaluation_id, new_policy_id
+from app.models import PasskeyCredential, PurchaseAuthorization
+from app.repositories.authorizations import PurchaseAuthorizationRepository
+from app.repositories.passkey_credentials import PasskeyCredentialRepository
 from app.scripts.seed_dev import seed_development_data
 from app.services.readiness import ReadinessService
 
@@ -79,6 +85,12 @@ def _alembic_downgrade_to_milestone_three(connection: Any) -> None:
     config = Config(API_ROOT / "alembic.ini")
     config.attributes["connection"] = connection
     command.downgrade(config, "20260825_0002")
+
+
+def _alembic_downgrade_to_milestone_four(connection: Any) -> None:
+    config = Config(API_ROOT / "alembic.ini")
+    config.attributes["connection"] = connection
+    command.downgrade(config, "20260825_0003")
 
 
 async def _prepare_isolated_database() -> IsolatedDatabase:
@@ -281,9 +293,12 @@ def test_alembic_upgraded_a_clean_postgresql_schema(
     assert dialect == "postgresql"
     assert {
         "alembic_version",
+        "approval_identities",
         "buyer_policies",
         "merchants",
+        "passkey_credentials",
         "policy_evaluations",
+        "purchase_authorizations",
         "quotes",
         "services",
     } <= tables
@@ -566,6 +581,441 @@ def test_policy_migration_downgrades_to_milestone_three_and_reupgrades() -> None
             await _drop_isolated_schema(isolated.database_url, isolated.schema)
 
     asyncio.run(exercise_cycle())
+
+
+def test_approval_migration_has_postgresql_integrity_guards(
+    isolated_database: IsolatedDatabase,
+) -> None:
+    async def inspect_approval_tables() -> dict[str, Any]:
+        async with isolated_database.database.engine.connect() as connection:
+
+            def inspect_connection(sync_connection: Any) -> dict[str, Any]:
+                inspector = inspect(sync_connection)
+                return {
+                    "identity_columns": {
+                        column["name"]: str(column["type"])
+                        for column in inspector.get_columns("approval_identities")
+                    },
+                    "identity_checks": {
+                        item["name"]
+                        for item in inspector.get_check_constraints("approval_identities")
+                    },
+                    "identity_indexes": {
+                        item["name"] for item in inspector.get_indexes("approval_identities")
+                    },
+                    "identity_unique": {
+                        item["name"]
+                        for item in inspector.get_unique_constraints("approval_identities")
+                    },
+                    "credential_columns": {
+                        column["name"]: str(column["type"])
+                        for column in inspector.get_columns("passkey_credentials")
+                    },
+                    "credential_checks": {
+                        item["name"]
+                        for item in inspector.get_check_constraints("passkey_credentials")
+                    },
+                    "credential_foreign_keys": {
+                        item["referred_table"]: item["options"].get("ondelete")
+                        for item in inspector.get_foreign_keys("passkey_credentials")
+                    },
+                    "credential_indexes": {
+                        item["name"] for item in inspector.get_indexes("passkey_credentials")
+                    },
+                    "credential_unique": {
+                        item["name"]
+                        for item in inspector.get_unique_constraints("passkey_credentials")
+                    },
+                    "authorization_columns": {
+                        column["name"]: str(column["type"])
+                        for column in inspector.get_columns("purchase_authorizations")
+                    },
+                    "authorization_checks": {
+                        item["name"]
+                        for item in inspector.get_check_constraints("purchase_authorizations")
+                    },
+                    "authorization_foreign_keys": {
+                        item["referred_table"]: item["options"].get("ondelete")
+                        for item in inspector.get_foreign_keys("purchase_authorizations")
+                    },
+                    "authorization_indexes": {
+                        item["name"] for item in inspector.get_indexes("purchase_authorizations")
+                    },
+                    "authorization_unique": {
+                        item["name"]
+                        for item in inspector.get_unique_constraints("purchase_authorizations")
+                    },
+                }
+
+            inspected = await connection.run_sync(inspect_connection)
+            trigger_rows = await connection.execute(
+                text(
+                    """
+                    SELECT event_object_table, trigger_name
+                    FROM information_schema.triggers
+                    WHERE event_object_schema = current_schema()
+                      AND event_object_table IN (
+                          'approval_identities',
+                          'passkey_credentials',
+                          'purchase_authorizations'
+                      )
+                    """
+                )
+            )
+            inspected["triggers"] = set(trigger_rows.tuples().all())
+            return inspected
+
+    schema = asyncio.run(inspect_approval_tables())
+
+    assert schema["identity_columns"] == {
+        "id": "VARCHAR(30)",
+        "subject_ref": "VARCHAR(200)",
+        "display_name": "VARCHAR(200)",
+        "webauthn_user_handle": "BYTEA",
+        "status": "VARCHAR(8)",
+        "created_at": "TIMESTAMP",
+        "updated_at": "TIMESTAMP",
+    }
+    assert {
+        "ck_approval_identities_id_format",
+        "ck_approval_identities_status",
+        "ck_approval_identities_subject_ref_valid",
+        "ck_approval_identities_webauthn_user_handle_length",
+    } <= schema["identity_checks"]
+    assert schema["identity_indexes"] >= {"ix_approval_identities_status_created_at"}
+    assert schema["identity_unique"] == {
+        "uq_approval_identities_subject_ref",
+        "uq_approval_identities_webauthn_user_handle",
+    }
+
+    assert schema["credential_columns"] == {
+        "id": "VARCHAR(30)",
+        "approval_identity_id": "VARCHAR(30)",
+        "credential_id": "BYTEA",
+        "public_key": "BYTEA",
+        "sign_count": "BIGINT",
+        "transports": "JSONB",
+        "created_at": "TIMESTAMP",
+        "last_used_at": "TIMESTAMP",
+    }
+    assert {
+        "ck_passkey_credentials_credential_id_length",
+        "ck_passkey_credentials_id_format",
+        "ck_passkey_credentials_public_key_length",
+        "ck_passkey_credentials_sign_count_range",
+        "ck_passkey_credentials_transports_valid",
+    } <= schema["credential_checks"]
+    assert schema["credential_foreign_keys"] == {"approval_identities": "RESTRICT"}
+    assert schema["credential_indexes"] >= {"ix_passkey_credentials_identity_created_at"}
+    assert schema["credential_unique"] == {
+        "uq_passkey_credentials_credential_id",
+        "uq_passkey_credentials_id_approval_identity_id",
+    }
+
+    assert schema["authorization_columns"] == {
+        "id": "VARCHAR(30)",
+        "approval_identity_id": "VARCHAR(30)",
+        "passkey_credential_id": "VARCHAR(30)",
+        "evaluation_id": "VARCHAR(30)",
+        "policy_id": "VARCHAR(30)",
+        "policy_hash": "VARCHAR(71)",
+        "quote_id": "VARCHAR(30)",
+        "quote_hash": "VARCHAR(71)",
+        "merchant_id": "VARCHAR(30)",
+        "service_id": "VARCHAR(30)",
+        "subject_ref": "VARCHAR(200)",
+        "amount": "BIGINT",
+        "currency": "VARCHAR(3)",
+        "purchase_type": "VARCHAR(12)",
+        "review_hash": "VARCHAR(71)",
+        "challenge_hash": "VARCHAR(71)",
+        "authorized_at": "TIMESTAMP",
+        "expires_at": "TIMESTAMP",
+        "authorization_version": "VARCHAR(16)",
+        "authorization_hash": "VARCHAR(71)",
+        "created_at": "TIMESTAMP",
+    }
+    assert {
+        "ck_purchase_authorizations_amount_safe_integer_range",
+        "ck_purchase_authorizations_authorization_hash_format",
+        "ck_purchase_authorizations_challenge_hash_format",
+        "ck_purchase_authorizations_expiry_after_authorization",
+        "ck_purchase_authorizations_id_format",
+        "ck_purchase_authorizations_review_hash_format",
+        "ck_purchase_authorizations_version",
+    } <= schema["authorization_checks"]
+    assert schema["authorization_foreign_keys"] == {
+        "approval_identities": "RESTRICT",
+        "buyer_policies": "RESTRICT",
+        "merchants": "RESTRICT",
+        "passkey_credentials": "RESTRICT",
+        "policy_evaluations": "RESTRICT",
+        "quotes": "RESTRICT",
+        "services": "RESTRICT",
+    }
+    assert schema["authorization_indexes"] >= {
+        "ix_purchase_authorizations_credential_authorized_at",
+        "ix_purchase_authorizations_evaluation_authorized_at",
+        "ix_purchase_authorizations_expires_at",
+        "ix_purchase_authorizations_identity_authorized_at",
+        "ix_purchase_authorizations_policy_authorized_at",
+        "ix_purchase_authorizations_quote_authorized_at",
+    }
+    assert schema["authorization_unique"] == {
+        "uq_purchase_authorizations_authorization_hash",
+        "uq_purchase_authorizations_challenge_hash",
+    }
+    assert schema["triggers"] == {
+        ("approval_identities", "trg_approval_identities_guard_mutation"),
+        ("passkey_credentials", "trg_passkey_credentials_guard_mutation"),
+        ("purchase_authorizations", "trg_purchase_authorizations_immutable"),
+    }
+
+
+def test_approval_migration_downgrades_to_milestone_four_and_reupgrades() -> None:
+    async def exercise_cycle() -> None:
+        isolated = await _prepare_isolated_database()
+        try:
+            async with isolated.database.engine.connect() as connection:
+                await connection.run_sync(_alembic_downgrade_to_milestone_four)
+
+                def milestone_four_tables(sync_connection: Any) -> set[str]:
+                    return set(inspect(sync_connection).get_table_names())
+
+                assert await connection.run_sync(milestone_four_tables) == {
+                    "alembic_version",
+                    "buyer_policies",
+                    "merchants",
+                    "policy_evaluations",
+                    "quotes",
+                    "services",
+                }
+                approval_functions = await connection.scalar(
+                    text(
+                        """
+                        SELECT count(*)
+                        FROM pg_proc
+                        JOIN pg_namespace ON pg_namespace.oid = pg_proc.pronamespace
+                        WHERE pg_namespace.nspname = current_schema()
+                          AND pg_proc.proname IN (
+                              'metergate_guard_approval_identity_mutation',
+                              'metergate_guard_passkey_credential_mutation',
+                              'metergate_reject_purchase_authorization_mutation'
+                          )
+                        """
+                    )
+                )
+                assert approval_functions == 0
+
+                await connection.run_sync(_alembic_upgrade)
+                upgraded_tables = await connection.run_sync(milestone_four_tables)
+                assert {
+                    "approval_identities",
+                    "passkey_credentials",
+                    "purchase_authorizations",
+                } <= upgraded_tables
+                await connection.run_sync(_alembic_check)
+        finally:
+            await isolated.database.dispose()
+            await _drop_isolated_schema(isolated.database_url, isolated.schema)
+
+    asyncio.run(exercise_cycle())
+
+
+def test_approval_records_enforce_atomic_usage_and_database_immutability(
+    domain_client: TestClient,
+    isolated_database: IsolatedDatabase,
+) -> None:
+    subject_ref = "postgresql-approval-user"
+    merchant = create_merchant(domain_client, "approval-persistence-merchant")
+    service = create_service(
+        domain_client,
+        merchant["id"],
+        "approval-persistence-service",
+        base_price=500,
+    )
+    quote_response = domain_client.post(
+        "/api/v1/quotes",
+        json={"service_id": service["id"], "input": {"norad_id": 25544}},
+    )
+    assert quote_response.status_code == 201, quote_response.text
+    quote = quote_response.json()
+    policy_response = domain_client.post(
+        "/api/v1/policies",
+        json={
+            "subject_ref": subject_ref,
+            "maximum_amount": 1_000,
+            "allowed_currencies": ["INR"],
+            "allowed_merchant_ids": [merchant["id"]],
+            "allowed_service_ids": [service["id"]],
+            "allowed_service_types": ["report"],
+            "allowed_purchase_types": ["one_time"],
+            "expires_in_seconds": 900,
+        },
+    )
+    assert policy_response.status_code == 201, policy_response.text
+    policy = policy_response.json()
+    evaluation_response = domain_client.post(
+        "/api/v1/policy-evaluations",
+        json={"policy_id": policy["id"], "quote_id": quote["id"]},
+    )
+    assert evaluation_response.status_code == 201, evaluation_response.text
+    evaluation = evaluation_response.json()
+    assert evaluation["decision"] == "allow"
+    identity_response = domain_client.post(
+        "/api/v1/approval-identities",
+        json={"subject_ref": subject_ref, "display_name": "PostgreSQL Approval User"},
+    )
+    assert identity_response.status_code == 201, identity_response.text
+    identity = identity_response.json()
+
+    raw_credential_id = b"postgresql-approval-credential"
+
+    async def create_credential() -> PasskeyCredential:
+        async with isolated_database.database.session() as session:
+            return await PasskeyCredentialRepository(session).create(
+                PasskeyCredential(
+                    approval_identity_id=identity["id"],
+                    credential_id=raw_credential_id,
+                    public_key=b"postgresql-public-key",
+                    sign_count=0,
+                    transports=["internal"],
+                )
+            )
+
+    credential = asyncio.run(create_credential())
+    authorized_at = datetime.now(UTC)
+    expires_at = authorized_at + timedelta(minutes=2)
+    review_hash = sha256_bytes(b"postgresql-approval-review")
+    challenge_hash = sha256_bytes(b"postgresql-approval-challenge")
+
+    def build_authorization(authorization_id: str) -> PurchaseAuthorization:
+        authorization_hash = calculate_authorization_hash(
+            authorization_id=authorization_id,
+            authorization_version=AUTHORIZATION_VERSION,
+            approval_identity_id=identity["id"],
+            passkey_credential_id=credential.id,
+            subject_ref=subject_ref,
+            evaluation_id=evaluation["id"],
+            policy_id=policy["id"],
+            policy_hash=policy["policy_hash"],
+            quote_id=quote["id"],
+            quote_hash=quote["quote_hash"],
+            merchant_id=merchant["id"],
+            service_id=service["id"],
+            amount=quote["pricing"]["amount"],
+            currency=quote["pricing"]["currency"],
+            purchase_type=PurchaseType(quote["pricing"]["purchase_type"]),
+            review_hash=review_hash,
+            challenge_hash=challenge_hash,
+            authorized_at=authorized_at,
+            expires_at=expires_at,
+        )
+        return PurchaseAuthorization(
+            id=authorization_id,
+            approval_identity_id=identity["id"],
+            passkey_credential_id=credential.id,
+            evaluation_id=evaluation["id"],
+            policy_id=policy["id"],
+            policy_hash=policy["policy_hash"],
+            quote_id=quote["id"],
+            quote_hash=quote["quote_hash"],
+            merchant_id=merchant["id"],
+            service_id=service["id"],
+            subject_ref=subject_ref,
+            amount=quote["pricing"]["amount"],
+            currency=quote["pricing"]["currency"],
+            purchase_type=PurchaseType(quote["pricing"]["purchase_type"]),
+            review_hash=review_hash,
+            challenge_hash=challenge_hash,
+            authorized_at=authorized_at,
+            expires_at=expires_at,
+            authorization_version=AUTHORIZATION_VERSION,
+            authorization_hash=authorization_hash,
+        )
+
+    async def persist_authorization(
+        authorization: PurchaseAuthorization,
+        *,
+        new_sign_count: int,
+    ) -> PurchaseAuthorization:
+        async with isolated_database.database.session() as session:
+            locked = await PasskeyCredentialRepository(session).get_by_credential_id_for_update(
+                raw_credential_id,
+                identity_id=identity["id"],
+            )
+            assert locked is not None
+            return await PurchaseAuthorizationRepository(
+                session
+            ).create_with_locked_credential_update(
+                authorization,
+                credential=locked,
+                new_sign_count=new_sign_count,
+                last_used_at=authorized_at,
+            )
+
+    authorization = asyncio.run(
+        persist_authorization(build_authorization(new_authorization_id()), new_sign_count=1)
+    )
+
+    with pytest.raises(IntegrityError):
+        asyncio.run(
+            persist_authorization(build_authorization(new_authorization_id()), new_sign_count=2)
+        )
+
+    async def stored_usage_state() -> tuple[int, int]:
+        async with isolated_database.database.session() as session:
+            persisted_credential = await PasskeyCredentialRepository(session).get(credential.id)
+            assert persisted_credential is not None
+            authorization_count = await session.scalar(
+                text(
+                    """
+                    SELECT count(*)
+                    FROM purchase_authorizations
+                    WHERE passkey_credential_id = :credential_id
+                    """
+                ),
+                {"credential_id": credential.id},
+            )
+            assert authorization_count is not None
+            return persisted_credential.sign_count, authorization_count
+
+    assert asyncio.run(stored_usage_state()) == (1, 1)
+
+    async def execute(statement: str, identifier: str) -> None:
+        async with isolated_database.database.engine.begin() as connection:
+            await connection.execute(text(statement), {"identifier": identifier})
+
+    asyncio.run(
+        execute(
+            "UPDATE passkey_credentials SET sign_count = 2 WHERE id = :identifier",
+            credential.id,
+        )
+    )
+    with pytest.raises(DBAPIError):
+        asyncio.run(
+            execute(
+                "UPDATE passkey_credentials SET sign_count = 1 WHERE id = :identifier",
+                credential.id,
+            )
+        )
+    with pytest.raises(DBAPIError):
+        asyncio.run(
+            execute(
+                """
+                UPDATE passkey_credentials
+                SET public_key = decode('6368616e676564', 'hex')
+                WHERE id = :identifier
+                """,
+                credential.id,
+            )
+        )
+    for statement in (
+        "UPDATE purchase_authorizations SET amount = 1 WHERE id = :identifier",
+        "DELETE FROM purchase_authorizations WHERE id = :identifier",
+    ):
+        with pytest.raises(DBAPIError):
+            asyncio.run(execute(statement, authorization.id))
 
 
 def test_policy_rows_enforce_json_constraints_foreign_keys_and_immutability(

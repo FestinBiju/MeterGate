@@ -3,6 +3,8 @@
 import { useEffect, useId, useRef, useState } from "react";
 import type { FormEvent } from "react";
 
+import { TrustedApproval } from "@/components/trusted-approval";
+
 type JsonPrimitive = boolean | null | number | string;
 type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 
@@ -621,9 +623,13 @@ function PolicySnapshot({
 }
 
 function EvaluationResult({
+  apiBaseEndpoint,
   evaluation,
+  policy,
 }: {
+  apiBaseEndpoint: string;
   evaluation: PolicyEvaluationResponse;
+  policy: PolicyResponse;
 }) {
   const headingRef = useRef<HTMLHeadingElement>(null);
   const allowed = evaluation.decision === "allow";
@@ -789,6 +795,20 @@ function EvaluationResult({
           </dd>
         </div>
       </dl>
+
+      {allowed ? (
+        <TrustedApproval
+          key={`${evaluation.id}:${policy.subject_ref}`}
+          apiBaseEndpoint={apiBaseEndpoint}
+          evaluationId={evaluation.id}
+          policySubjectRef={policy.subject_ref}
+        />
+      ) : (
+        <p className="mt-4 rounded-xl border border-rose-300/15 bg-rose-300/[0.045] px-3 py-2.5 text-xs leading-5 text-rose-100/80">
+          Denied evaluations cannot request trusted human approval. Create a
+          policy and evaluation that satisfy every required check.
+        </p>
+      )}
     </section>
   );
 }
@@ -819,10 +839,12 @@ function RestrictionCheckbox({
 }
 
 export function QuotePolicyEvaluator({
+  apiBaseEndpoint,
   createEndpoint,
   evaluationEndpoint,
   quote,
 }: {
+  apiBaseEndpoint: string;
   createEndpoint: string;
   evaluationEndpoint: string;
   quote: PolicyQuoteContext;
@@ -1305,8 +1327,13 @@ export function QuotePolicyEvaluator({
             </p>
           ) : null}
 
-          {evaluationState.kind === "resolved" ? (
-            <EvaluationResult evaluation={evaluationState.evaluation} />
+          {evaluationState.kind === "resolved" &&
+          creationState.kind === "resolved" ? (
+            <EvaluationResult
+              apiBaseEndpoint={apiBaseEndpoint}
+              evaluation={evaluationState.evaluation}
+              policy={creationState.policy}
+            />
           ) : null}
 
           {creationState.kind === "resolved" ? (

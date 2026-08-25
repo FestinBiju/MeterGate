@@ -6,19 +6,26 @@ from typing import Annotated
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.cache.approval_challenges import ChallengeStore
 from app.core.config import Settings
 from app.db.session import get_session
+from app.repositories.approval_identities import ApprovalIdentityRepository
+from app.repositories.authorizations import PurchaseAuthorizationRepository
 from app.repositories.buyer_policies import BuyerPolicyRepository
 from app.repositories.merchants import MerchantRepository
+from app.repositories.passkey_credentials import PasskeyCredentialRepository
 from app.repositories.policy_evaluations import PolicyEvaluationRepository
 from app.repositories.quotes import QuoteRepository
 from app.repositories.services import ServiceRepository
+from app.services.approvals import ApprovalApplicationService
 from app.services.catalog import CatalogApplicationService
 from app.services.merchants import MerchantApplicationService
+from app.services.passkeys import PasskeyApplicationService
 from app.services.policies import BuyerPolicyApplicationService
 from app.services.policy_evaluations import PolicyEvaluationApplicationService
 from app.services.quotes import QuoteApplicationService
 from app.services.services import ServiceApplicationService
+from app.services.webauthn import WebAuthnBackend
 
 SessionDependency = Annotated[AsyncSession, Depends(get_session)]
 
@@ -31,6 +38,24 @@ def get_application_settings(request: Request) -> Settings:
 
 
 SettingsDependency = Annotated[Settings, Depends(get_application_settings)]
+
+
+def get_challenge_store(request: Request) -> ChallengeStore:
+    challenge_store = getattr(request.app.state, "challenge_store", None)
+    if not isinstance(challenge_store, ChallengeStore):
+        raise RuntimeError("Approval challenge storage is not configured")
+    return challenge_store
+
+
+def get_webauthn_backend(request: Request) -> WebAuthnBackend:
+    webauthn_backend = getattr(request.app.state, "webauthn_backend", None)
+    if not isinstance(webauthn_backend, WebAuthnBackend):
+        raise RuntimeError("WebAuthn backend is not configured")
+    return webauthn_backend
+
+
+ChallengeStoreDependency = Annotated[ChallengeStore, Depends(get_challenge_store)]
+WebAuthnBackendDependency = Annotated[WebAuthnBackend, Depends(get_webauthn_backend)]
 
 
 def get_merchant_application_service(
@@ -85,6 +110,41 @@ def get_policy_evaluation_application_service(
     )
 
 
+def get_passkey_application_service(
+    session: SessionDependency,
+    settings: SettingsDependency,
+    challenge_store: ChallengeStoreDependency,
+    webauthn_backend: WebAuthnBackendDependency,
+) -> PasskeyApplicationService:
+    return PasskeyApplicationService(
+        ApprovalIdentityRepository(session),
+        PasskeyCredentialRepository(session),
+        challenge_store,
+        webauthn_backend,
+        challenge_ttl=timedelta(seconds=settings.webauthn_challenge_ttl_seconds),
+    )
+
+
+def get_approval_application_service(
+    session: SessionDependency,
+    settings: SettingsDependency,
+    challenge_store: ChallengeStoreDependency,
+    webauthn_backend: WebAuthnBackendDependency,
+) -> ApprovalApplicationService:
+    return ApprovalApplicationService(
+        ApprovalIdentityRepository(session),
+        PasskeyCredentialRepository(session),
+        PurchaseAuthorizationRepository(session),
+        BuyerPolicyRepository(session),
+        QuoteRepository(session),
+        PolicyEvaluationRepository(session),
+        challenge_store,
+        webauthn_backend,
+        challenge_ttl=timedelta(seconds=settings.webauthn_challenge_ttl_seconds),
+        authorization_ttl=timedelta(seconds=settings.authorization_ttl_seconds),
+    )
+
+
 MerchantApplicationDependency = Annotated[
     MerchantApplicationService,
     Depends(get_merchant_application_service),
@@ -108,4 +168,12 @@ BuyerPolicyApplicationDependency = Annotated[
 PolicyEvaluationApplicationDependency = Annotated[
     PolicyEvaluationApplicationService,
     Depends(get_policy_evaluation_application_service),
+]
+PasskeyApplicationDependency = Annotated[
+    PasskeyApplicationService,
+    Depends(get_passkey_application_service),
+]
+ApprovalApplicationDependency = Annotated[
+    ApprovalApplicationService,
+    Depends(get_approval_application_service),
 ]

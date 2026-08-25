@@ -5,9 +5,23 @@ import threading
 import time
 from typing import Literal
 
-IdPrefix = Literal["mrc_", "pol_", "pye_", "qte_", "svc_"]
+IdPrefix = Literal[
+    "aid_",
+    "ach_",
+    "aut_",
+    "mrc_",
+    "pkc_",
+    "pol_",
+    "pye_",
+    "qte_",
+    "svc_",
+]
 
+APPROVAL_IDENTITY_ID_PREFIX: IdPrefix = "aid_"
+APPROVAL_CHALLENGE_ID_PREFIX: IdPrefix = "ach_"
+AUTHORIZATION_ID_PREFIX: IdPrefix = "aut_"
 MERCHANT_ID_PREFIX: IdPrefix = "mrc_"
+PASSKEY_CREDENTIAL_ID_PREFIX: IdPrefix = "pkc_"
 POLICY_ID_PREFIX: IdPrefix = "pol_"
 POLICY_EVALUATION_ID_PREFIX: IdPrefix = "pye_"
 QUOTE_ID_PREFIX: IdPrefix = "qte_"
@@ -25,7 +39,11 @@ _last_randomness = -1
 def generate_id(prefix: IdPrefix) -> str:
     """Generate a prefixed, monotonic 48-bit time + 80-bit random identifier."""
     if prefix not in {
+        APPROVAL_IDENTITY_ID_PREFIX,
+        APPROVAL_CHALLENGE_ID_PREFIX,
+        AUTHORIZATION_ID_PREFIX,
         MERCHANT_ID_PREFIX,
+        PASSKEY_CREDENTIAL_ID_PREFIX,
         POLICY_ID_PREFIX,
         POLICY_EVALUATION_ID_PREFIX,
         QUOTE_ID_PREFIX,
@@ -38,8 +56,24 @@ def generate_id(prefix: IdPrefix) -> str:
     return f"{prefix}{_encode_crockford(payload)}"
 
 
+def new_approval_identity_id() -> str:
+    return generate_id(APPROVAL_IDENTITY_ID_PREFIX)
+
+
+def new_approval_challenge_id() -> str:
+    return generate_id(APPROVAL_CHALLENGE_ID_PREFIX)
+
+
+def new_authorization_id() -> str:
+    return generate_id(AUTHORIZATION_ID_PREFIX)
+
+
 def new_merchant_id() -> str:
     return generate_id(MERCHANT_ID_PREFIX)
+
+
+def new_passkey_credential_id() -> str:
+    return generate_id(PASSKEY_CREDENTIAL_ID_PREFIX)
 
 
 def new_policy_id() -> str:

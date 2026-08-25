@@ -7,6 +7,34 @@ class DomainError(Exception):
     """Base class for expected domain failures."""
 
 
+class ApprovalError(DomainError):
+    """Fail-closed trusted-approval failure with a stable public code."""
+
+    def __init__(self, detail: str, reason_code: str) -> None:
+        self.reason_code = reason_code
+        super().__init__(detail)
+
+
+class ApprovalNotFoundError(ApprovalError):
+    """A trusted-approval resource or ephemeral challenge is unknown."""
+
+
+class ApprovalExpiredError(ApprovalError):
+    """A trusted-approval challenge or bound commerce record expired."""
+
+
+class ApprovalVerificationError(ApprovalError):
+    """A supplied WebAuthn ceremony response could not be verified."""
+
+
+class ApprovalConflictError(ApprovalError):
+    """Trusted approval is incompatible with current authoritative state."""
+
+
+class ApprovalIntegrityError(ApprovalError):
+    """Immutable approval evidence failed its integrity check."""
+
+
 class ResourceNotFoundError(DomainError):
     def __init__(self, resource: str, resource_id: str) -> None:
         self.resource = resource

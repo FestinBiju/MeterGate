@@ -23,7 +23,7 @@ export default function Home() {
 
         <div className="flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-slate-300">
           <span className="size-1.5 rounded-full bg-cyan-300" />
-          Foundation
+          Trusted approval
         </div>
       </header>
 
@@ -31,7 +31,7 @@ export default function Home() {
         <div className="grid gap-14 lg:grid-cols-[minmax(0,1.05fr)_minmax(25rem,0.95fr)] lg:items-center lg:gap-20">
           <section>
             <p className="mb-6 text-xs font-semibold uppercase tracking-[0.24em] text-cyan-300">
-              Developer infrastructure · Foundation
+              Developer infrastructure · Trusted approval
             </p>
             <h1 className="max-w-2xl text-5xl font-semibold tracking-[-0.045em] text-white sm:text-6xl lg:text-7xl">
               MeterGate
@@ -41,8 +41,9 @@ export default function Home() {
               services
             </p>
             <p className="mt-6 max-w-lg text-sm leading-6 text-slate-400 sm:text-base sm:leading-7">
-              The local development foundation is in place. Infrastructure
-              status below is reported directly by the FastAPI readiness endpoint.
+              Server-issued quotes and deterministic policy checks now lead to
+              explicit passkey-backed human approval—without crossing the money
+              boundary.
             </p>
 
             <ul
@@ -68,8 +69,8 @@ export default function Home() {
 
       <footer className="relative border-t border-white/[0.06]">
         <div className="mx-auto flex w-full max-w-6xl flex-col gap-2 px-6 py-6 text-xs text-slate-500 sm:flex-row sm:items-center sm:justify-between lg:px-8">
-          <span>MeterGate foundation</span>
-          <span>No payment capabilities are enabled in this milestone.</span>
+          <span>MeterGate trusted approval</span>
+          <span>No payment has been created or executed in this milestone.</span>
         </div>
       </footer>
     </div>

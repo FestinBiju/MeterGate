@@ -19,9 +19,12 @@ def test_migrations_upgrade_and_downgrade_with_injected_connection() -> None:
         inspector = inspect(connection)
         assert set(inspector.get_table_names()) == {
             "alembic_version",
+            "approval_identities",
             "buyer_policies",
             "merchants",
+            "passkey_credentials",
             "policy_evaluations",
+            "purchase_authorizations",
             "quotes",
             "services",
         }
@@ -121,6 +124,128 @@ def test_migrations_upgrade_and_downgrade_with_injected_connection() -> None:
             "buyer_policies": "RESTRICT",
             "quotes": "RESTRICT",
         }
+
+        identity_columns = {
+            column["name"] for column in inspector.get_columns("approval_identities")
+        }
+        assert identity_columns == {
+            "id",
+            "subject_ref",
+            "display_name",
+            "webauthn_user_handle",
+            "status",
+            "created_at",
+            "updated_at",
+        }
+        assert {index["name"] for index in inspector.get_indexes("approval_identities")} >= {
+            "ix_approval_identities_status_created_at",
+        }
+        assert {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("approval_identities")
+        } == {
+            "uq_approval_identities_subject_ref",
+            "uq_approval_identities_webauthn_user_handle",
+        }
+
+        credential_columns = {
+            column["name"] for column in inspector.get_columns("passkey_credentials")
+        }
+        assert credential_columns == {
+            "id",
+            "approval_identity_id",
+            "credential_id",
+            "public_key",
+            "sign_count",
+            "transports",
+            "created_at",
+            "last_used_at",
+        }
+        assert {index["name"] for index in inspector.get_indexes("passkey_credentials")} >= {
+            "ix_passkey_credentials_identity_created_at",
+        }
+        assert {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("passkey_credentials")
+        } == {
+            "uq_passkey_credentials_credential_id",
+            "uq_passkey_credentials_id_approval_identity_id",
+        }
+        credential_foreign_key = inspector.get_foreign_keys("passkey_credentials")[0]
+        assert credential_foreign_key["referred_table"] == "approval_identities"
+        assert credential_foreign_key["options"]["ondelete"] == "RESTRICT"
+
+        authorization_columns = {
+            column["name"] for column in inspector.get_columns("purchase_authorizations")
+        }
+        assert authorization_columns == {
+            "id",
+            "approval_identity_id",
+            "passkey_credential_id",
+            "evaluation_id",
+            "policy_id",
+            "policy_hash",
+            "quote_id",
+            "quote_hash",
+            "merchant_id",
+            "service_id",
+            "subject_ref",
+            "amount",
+            "currency",
+            "purchase_type",
+            "review_hash",
+            "challenge_hash",
+            "authorized_at",
+            "expires_at",
+            "authorization_version",
+            "authorization_hash",
+            "created_at",
+        }
+        assert {index["name"] for index in inspector.get_indexes("purchase_authorizations")} >= {
+            "ix_purchase_authorizations_credential_authorized_at",
+            "ix_purchase_authorizations_evaluation_authorized_at",
+            "ix_purchase_authorizations_expires_at",
+            "ix_purchase_authorizations_identity_authorized_at",
+            "ix_purchase_authorizations_policy_authorized_at",
+            "ix_purchase_authorizations_quote_authorized_at",
+        }
+        assert {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("purchase_authorizations")
+        } == {
+            "uq_purchase_authorizations_authorization_hash",
+            "uq_purchase_authorizations_challenge_hash",
+        }
+        authorization_foreign_keys = {
+            foreign_key["referred_table"]: foreign_key["options"]["ondelete"]
+            for foreign_key in inspector.get_foreign_keys("purchase_authorizations")
+        }
+        assert authorization_foreign_keys == {
+            "approval_identities": "RESTRICT",
+            "buyer_policies": "RESTRICT",
+            "merchants": "RESTRICT",
+            "passkey_credentials": "RESTRICT",
+            "policy_evaluations": "RESTRICT",
+            "quotes": "RESTRICT",
+            "services": "RESTRICT",
+        }
+
+        command.downgrade(config, "20260825_0003")
+        assert set(inspect(connection).get_table_names()) == {
+            "alembic_version",
+            "buyer_policies",
+            "merchants",
+            "policy_evaluations",
+            "quotes",
+            "services",
+        }
+
+        command.upgrade(config, "head")
+        assert {
+            "approval_identities",
+            "passkey_credentials",
+            "purchase_authorizations",
+        } <= set(inspect(connection).get_table_names())
 
         command.downgrade(config, "20260825_0002")
         assert set(inspect(connection).get_table_names()) == {

@@ -3,6 +3,11 @@
 from enum import StrEnum
 
 
+class ApprovalIdentityStatus(StrEnum):
+    ACTIVE = "active"
+    DISABLED = "disabled"
+
+
 class MerchantStatus(StrEnum):
     ACTIVE = "active"
     INACTIVE = "inactive"

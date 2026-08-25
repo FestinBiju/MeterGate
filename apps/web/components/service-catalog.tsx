@@ -267,11 +267,13 @@ function CatalogEmpty() {
 }
 
 function ServiceCard({
+  apiBaseEndpoint,
   policyCreateEndpoint,
   policyEvaluationEndpoint,
   quoteEndpoint,
   service,
 }: {
+  apiBaseEndpoint: string;
   policyCreateEndpoint: string;
   policyEvaluationEndpoint: string;
   quoteEndpoint: string;
@@ -316,6 +318,7 @@ function ServiceCard({
       </div>
 
       <ServiceQuoteRequest
+        apiBaseEndpoint={apiBaseEndpoint}
         endpoint={quoteEndpoint}
         inputSchema={service.input_schema}
         policyCreateEndpoint={policyCreateEndpoint}
@@ -328,11 +331,13 @@ function ServiceCard({
 }
 
 function CatalogResults({
+  apiBaseEndpoint,
   payload,
   policyCreateEndpoint,
   policyEvaluationEndpoint,
   quoteEndpoint,
 }: {
+  apiBaseEndpoint: string;
   payload: CatalogPayload;
   policyCreateEndpoint: string;
   policyEvaluationEndpoint: string;
@@ -380,6 +385,7 @@ function CatalogResults({
           <div className="grid gap-4 lg:grid-cols-2">
             {merchant.services.map((service) => (
               <ServiceCard
+                apiBaseEndpoint={apiBaseEndpoint}
                 key={service.id}
                 policyCreateEndpoint={policyCreateEndpoint}
                 policyEvaluationEndpoint={policyEvaluationEndpoint}
@@ -404,10 +410,13 @@ export function ServiceCatalog() {
     return configuredApiUrl.replace(/\/+$/, "");
   }, [configuredApiUrl]);
   const endpoint = apiOrigin ? `${apiOrigin}/api/v1/catalog` : null;
-  const quoteEndpoint = apiOrigin ? `${apiOrigin}/api/v1/quotes` : null;
-  const policyCreateEndpoint = apiOrigin ? `${apiOrigin}/api/v1/policies` : null;
-  const policyEvaluationEndpoint = apiOrigin
-    ? `${apiOrigin}/api/v1/policy-evaluations`
+  const apiBaseEndpoint = apiOrigin ? `${apiOrigin}/api/v1` : null;
+  const quoteEndpoint = apiBaseEndpoint ? `${apiBaseEndpoint}/quotes` : null;
+  const policyCreateEndpoint = apiBaseEndpoint
+    ? `${apiBaseEndpoint}/policies`
+    : null;
+  const policyEvaluationEndpoint = apiBaseEndpoint
+    ? `${apiBaseEndpoint}/policy-evaluations`
     : null;
   const [requestNumber, setRequestNumber] = useState(0);
   const [state, setState] = useState<CatalogState>({ kind: "loading" });
@@ -488,10 +497,12 @@ export function ServiceCatalog() {
         />
       ) : null}
       {displayState.kind === "resolved" &&
+      apiBaseEndpoint &&
       quoteEndpoint &&
       policyCreateEndpoint &&
       policyEvaluationEndpoint ? (
         <CatalogResults
+          apiBaseEndpoint={apiBaseEndpoint}
           payload={displayState.payload}
           policyCreateEndpoint={policyCreateEndpoint}
           policyEvaluationEndpoint={policyEvaluationEndpoint}
