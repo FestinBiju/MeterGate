@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from app.domain.enums import PolicyDecision
 from app.domain.exceptions import (
+    AuthenticationForbiddenError,
     PolicyEvaluationIntegrityError,
     PolicyIntegrityError,
     QuoteIntegrityError,
@@ -54,10 +55,16 @@ class PolicyEvaluationApplicationService:
         self._evaluation_repository = evaluation_repository
         self._clock = clock
 
-    async def create(self, payload: PolicyEvaluationCreate) -> PolicyEvaluationResponse:
+    async def create(
+        self,
+        payload: PolicyEvaluationCreate,
+        *,
+        owned_subject_refs: frozenset[str],
+    ) -> PolicyEvaluationResponse:
         policy = await self._policy_repository.get(payload.policy_id)
         if policy is None:
             raise ResourceNotFoundError("Buyer policy", payload.policy_id)
+        self._require_policy_ownership(policy.subject_ref, owned_subject_refs)
         quote = await self._quote_repository.get(payload.quote_id)
         if quote is None:
             raise ResourceNotFoundError("Quote", payload.quote_id)
@@ -95,7 +102,27 @@ class PolicyEvaluationApplicationService:
             expected_evaluated_at=evaluated_at,
         )
 
-    async def get(self, evaluation_id: str) -> PolicyEvaluationResponse:
+    async def get(
+        self,
+        evaluation_id: str,
+        *,
+        owned_subject_refs: frozenset[str],
+    ) -> PolicyEvaluationResponse:
+        return await self._get_verified(
+            evaluation_id,
+            owned_subject_refs=owned_subject_refs,
+        )
+
+    async def get_verified(self, evaluation_id: str) -> PolicyEvaluationResponse:
+        """Replay immutable evidence for a caller that applies its own ownership check."""
+        return await self._get_verified(evaluation_id, owned_subject_refs=None)
+
+    async def _get_verified(
+        self,
+        evaluation_id: str,
+        *,
+        owned_subject_refs: frozenset[str] | None,
+    ) -> PolicyEvaluationResponse:
         evaluation = await self._evaluation_repository.get(evaluation_id)
         if evaluation is None:
             raise ResourceNotFoundError("Policy evaluation", evaluation_id)
@@ -104,6 +131,8 @@ class PolicyEvaluationApplicationService:
         quote = await self._quote_repository.get(evaluation.quote_id)
         if policy is None or quote is None:
             raise PolicyEvaluationIntegrityError(evaluation.id)
+        if owned_subject_refs is not None:
+            self._require_policy_ownership(policy.subject_ref, owned_subject_refs)
         try:
             evaluated_at = self._as_utc(evaluation.evaluated_at)
             result = evaluate_policy(policy, quote, evaluated_at)
@@ -119,6 +148,17 @@ class PolicyEvaluationApplicationService:
             expected_quote_hash=quote.quote_hash,
             expected_evaluated_at=evaluated_at,
         )
+
+    @staticmethod
+    def _require_policy_ownership(
+        subject_ref: str,
+        owned_subject_refs: frozenset[str],
+    ) -> None:
+        if subject_ref not in owned_subject_refs:
+            raise AuthenticationForbiddenError(
+                "The authenticated account does not own this policy evaluation",
+                "AUTH_RESOURCE_OWNERSHIP_MISMATCH",
+            )
 
     @staticmethod
     def _to_response(

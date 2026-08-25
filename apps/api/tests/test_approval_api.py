@@ -2,12 +2,17 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from typing import Any
 
 from fastapi.testclient import TestClient
 
 from app.api.v1.dependencies import (
     get_approval_application_service,
     get_passkey_application_service,
+    require_authenticated_mutation,
+    require_current_account,
+    require_recent_authentication,
 )
 from app.domain.enums import ApprovalIdentityStatus, PurchaseType
 from app.domain.exceptions import (
@@ -22,7 +27,6 @@ from app.schemas.approvals import (
     ApprovalAssertionVerify,
     ApprovalChallengeCreate,
     ApprovalChallengeResponse,
-    ApprovalIdentityCreate,
     ApprovalIdentityResponse,
     ApprovalReview,
     ApprovalReviewParty,
@@ -36,6 +40,7 @@ from app.schemas.approvals import (
 
 NOW = datetime(2026, 8, 25, 12, tzinfo=UTC)
 IDENTITY_ID = "aid_00000000000000000000000001"
+ACCOUNT_ID = "acct_00000000000000000000000001"
 CREDENTIAL_ID = "pkc_00000000000000000000000001"
 CHALLENGE_ID = "ach_00000000000000000000000001"
 AUTHORIZATION_ID = "aut_00000000000000000000000001"
@@ -50,10 +55,22 @@ REVIEW_HASH = f"sha256:{'3' * 64}"
 AUTHORIZATION_HASH = f"sha256:{'4' * 64}"
 
 
+def authenticated_context() -> Any:
+    return SimpleNamespace(
+        account=SimpleNamespace(id=ACCOUNT_ID),
+        approval_identity=SimpleNamespace(id=IDENTITY_ID, subject_ref=ACCOUNT_ID),
+        state=SimpleNamespace(
+            session_id=f"ses_{'s' * 43}",
+            account_session_version=1,
+        ),
+    )
+
+
 def identity_response() -> ApprovalIdentityResponse:
     return ApprovalIdentityResponse(
         id=IDENTITY_ID,
-        subject_ref="dev-user-001",
+        account_id=ACCOUNT_ID,
+        subject_ref=ACCOUNT_ID,
         display_name="Development User",
         status=ApprovalIdentityStatus.ACTIVE,
         credential_count=1,
@@ -104,7 +121,7 @@ def approval_review() -> ApprovalReview:
         policy_hash=POLICY_HASH,
         quote_id=QUOTE_ID,
         quote_hash=QUOTE_HASH,
-        subject_ref="dev-user-001",
+        subject_ref=ACCOUNT_ID,
         approval_identity_id=IDENTITY_ID,
         merchant=ApprovalReviewParty(id=MERCHANT_ID, name="OrbitIntel"),
         service=ApprovalReviewParty(id=SERVICE_ID, name="Orbital Risk Report"),
@@ -135,7 +152,7 @@ def authorization_response() -> PurchaseAuthorizationResponse:
     return PurchaseAuthorizationResponse(
         id=AUTHORIZATION_ID,
         state="active",
-        subject_ref="dev-user-001",
+        subject_ref=ACCOUNT_ID,
         merchant={"id": MERCHANT_ID, "name": "OrbitIntel"},
         service={"id": SERVICE_ID, "name": "Orbital Risk Report"},
         amount=500,
@@ -155,40 +172,49 @@ def authorization_response() -> PurchaseAuthorizationResponse:
 class StubPasskeyService:
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error
-        self.last_identity_payload: ApprovalIdentityCreate | None = None
         self.last_verification: tuple[str, PasskeyRegistrationVerify] | None = None
 
     def _raise(self) -> None:
         if self.error is not None:
             raise self.error
 
-    async def create_identity(
+    async def get_identity(
         self,
-        payload: ApprovalIdentityCreate,
+        identity_id: str,
+        *,
+        account_id: str,
     ) -> ApprovalIdentityResponse:
         self._raise()
-        self.last_identity_payload = payload
-        return identity_response()
-
-    async def get_identity(self, identity_id: str) -> ApprovalIdentityResponse:
-        self._raise()
         assert identity_id == IDENTITY_ID
+        assert account_id == ACCOUNT_ID
         return identity_response()
 
     async def registration_options(
         self,
         identity_id: str,
+        *,
+        account_id: str,
+        session_id: str,
     ) -> PasskeyRegistrationOptionsResponse:
         self._raise()
         assert identity_id == IDENTITY_ID
+        assert account_id == ACCOUNT_ID
+        assert session_id.startswith("ses_")
         return registration_options_response()
 
     async def verify_registration(
         self,
         identity_id: str,
         payload: PasskeyRegistrationVerify,
+        *,
+        account_id: str,
+        account_session_version: int,
+        session_id: str,
     ) -> PasskeyRegistrationResponse:
         self._raise()
+        assert account_id == ACCOUNT_ID
+        assert account_session_version == 1
+        assert session_id.startswith("ses_")
         self.last_verification = identity_id, payload
         return registration_response()
 
@@ -206,8 +232,13 @@ class StubApprovalService:
     async def create_challenge(
         self,
         payload: ApprovalChallengeCreate,
+        *,
+        account_id: str,
+        account_session_version: int,
     ) -> ApprovalChallengeResponse:
         self._raise()
+        assert account_id == ACCOUNT_ID
+        assert account_session_version == 1
         self.last_challenge_payload = payload
         return challenge_response()
 
@@ -215,17 +246,25 @@ class StubApprovalService:
         self,
         challenge_id: str,
         payload: ApprovalAssertionVerify,
+        *,
+        account_id: str,
+        account_session_version: int,
     ) -> PurchaseAuthorizationResponse:
         self._raise()
+        assert account_id == ACCOUNT_ID
+        assert account_session_version == 1
         self.last_assertion = challenge_id, payload
         return authorization_response()
 
     async def get_authorization(
         self,
         authorization_id: str,
+        *,
+        account_id: str,
     ) -> PurchaseAuthorizationResponse:
         self._raise()
         assert authorization_id == AUTHORIZATION_ID
+        assert account_id == ACCOUNT_ID
         return authorization_response()
 
 
@@ -242,6 +281,10 @@ def client_with_approval_services(
     client.app.dependency_overrides[get_approval_application_service] = lambda: (
         approvals or StubApprovalService()
     )
+    current = authenticated_context()
+    client.app.dependency_overrides[require_current_account] = lambda: current
+    client.app.dependency_overrides[require_authenticated_mutation] = lambda: current
+    client.app.dependency_overrides[require_recent_authentication] = lambda: current
     return client
 
 
@@ -265,7 +308,7 @@ def test_approval_routes_expose_only_append_only_methods(
     client = client_with_approval_services(make_client)
     paths = client.get("/openapi.json").json()["paths"]
 
-    assert set(paths["/api/v1/approval-identities"]) == {"post"}
+    assert "/api/v1/approval-identities" not in paths
     assert set(paths["/api/v1/approval-identities/{identity_id}"]) == {"get"}
     assert set(paths["/api/v1/approval-identities/{identity_id}/passkeys/options"]) == {"post"}
     assert set(paths["/api/v1/approval-identities/{identity_id}/passkeys/verify"]) == {"post"}
@@ -282,30 +325,22 @@ def test_identity_and_registration_contracts_are_strict_and_safe(
     passkeys = StubPasskeyService()
     client = client_with_approval_services(make_client, passkeys=passkeys)
 
-    created = client.post(
+    forbidden_creation = client.post(
         "/api/v1/approval-identities",
         json={"subject_ref": "dev-user-001", "display_name": "Development User"},
     )
-    injected = client.post(
-        "/api/v1/approval-identities",
-        json={
-            "subject_ref": "dev-user-001",
-            "display_name": "Development User",
-            "status": "active",
-            "webauthn_user_handle": "secret",
-        },
-    )
+    identity = client.get(f"/api/v1/approval-identities/{IDENTITY_ID}")
     options = client.post(f"/api/v1/approval-identities/{IDENTITY_ID}/passkeys/options")
     verified = client.post(
         f"/api/v1/approval-identities/{IDENTITY_ID}/passkeys/verify",
         json={"challenge_id": CHALLENGE_ID, "credential": credential_json()},
     )
 
-    assert created.status_code == 201
-    assert injected.status_code == 422
+    assert forbidden_creation.status_code in {404, 405}
+    assert identity.status_code == 200
     assert options.status_code == 200
     assert verified.status_code == 201
-    combined = str(created.json()) + str(verified.json())
+    combined = str(identity.json()) + str(verified.json())
     assert "webauthn_user_handle" not in combined
     assert "public_key" not in combined
     assert "credential-id" not in combined
@@ -322,7 +357,6 @@ def test_approval_request_accepts_only_ids_and_response_is_server_derived(
         "/api/v1/approval-challenges",
         json={
             "evaluation_id": EVALUATION_ID,
-            "approval_identity_id": IDENTITY_ID,
         },
     )
     injected = client.post(
@@ -339,7 +373,6 @@ def test_approval_request_accepts_only_ids_and_response_is_server_derived(
     assert created.status_code == 201
     assert approvals.last_challenge_payload == ApprovalChallengeCreate(
         evaluation_id=EVALUATION_ID,
-        approval_identity_id=IDENTITY_ID,
     )
     assert created.json()["review"]["amount"] == 500
     assert created.json()["review_hash"] == REVIEW_HASH

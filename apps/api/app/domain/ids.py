@@ -6,6 +6,7 @@ import time
 from typing import Literal
 
 IdPrefix = Literal[
+    "acct_",
     "aid_",
     "ach_",
     "aut_",
@@ -17,6 +18,7 @@ IdPrefix = Literal[
     "svc_",
 ]
 
+ACCOUNT_ID_PREFIX: IdPrefix = "acct_"
 APPROVAL_IDENTITY_ID_PREFIX: IdPrefix = "aid_"
 APPROVAL_CHALLENGE_ID_PREFIX: IdPrefix = "ach_"
 AUTHORIZATION_ID_PREFIX: IdPrefix = "aut_"
@@ -39,6 +41,7 @@ _last_randomness = -1
 def generate_id(prefix: IdPrefix) -> str:
     """Generate a prefixed, monotonic 48-bit time + 80-bit random identifier."""
     if prefix not in {
+        ACCOUNT_ID_PREFIX,
         APPROVAL_IDENTITY_ID_PREFIX,
         APPROVAL_CHALLENGE_ID_PREFIX,
         AUTHORIZATION_ID_PREFIX,
@@ -54,6 +57,10 @@ def generate_id(prefix: IdPrefix) -> str:
     timestamp_ms, randomness = _next_payload()
     payload = (timestamp_ms << 80) | randomness
     return f"{prefix}{_encode_crockford(payload)}"
+
+
+def new_account_id() -> str:
+    return generate_id(ACCOUNT_ID_PREFIX)
 
 
 def new_approval_identity_id() -> str:

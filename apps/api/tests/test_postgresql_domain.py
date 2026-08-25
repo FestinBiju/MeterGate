@@ -4,6 +4,7 @@ import os
 import re
 import uuid
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,14 +20,27 @@ from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import CreateSchema, DropSchema
 
 from alembic import command
+from app.api.v1.dependencies import (
+    require_authenticated_mutation,
+    require_current_account,
+)
 from app.application import create_app
 from app.core.config import Settings, get_settings
 from app.db.session import Database, make_async_database_url
 from app.domain.approval_hashing import AUTHORIZATION_VERSION, calculate_authorization_hash
-from app.domain.enums import PurchaseType
+from app.domain.enums import AccountStatus, ApprovalIdentityStatus, PurchaseType
 from app.domain.hashing import sha256_bytes
-from app.domain.ids import new_authorization_id, new_policy_evaluation_id, new_policy_id
-from app.models import PasskeyCredential, PurchaseAuthorization
+from app.domain.ids import (
+    new_account_id,
+    new_approval_identity_id,
+    new_authorization_id,
+    new_passkey_credential_id,
+    new_policy_evaluation_id,
+    new_policy_id,
+)
+from app.models import Account, ApprovalIdentity, PasskeyCredential, PurchaseAuthorization
+from app.repositories.accounts import AccountRepository
+from app.repositories.approval_identities import ApprovalIdentityRepository
 from app.repositories.authorizations import PurchaseAuthorizationRepository
 from app.repositories.passkey_credentials import PasskeyCredentialRepository
 from app.scripts.seed_dev import seed_development_data
@@ -46,6 +60,15 @@ class IsolatedDatabase:
     database: Database
     database_url: str
     schema: str
+
+
+@dataclass(frozen=True, slots=True)
+class AuthenticatedAccountContext:
+    account: Account
+    approval_identity: ApprovalIdentity
+
+
+_MISSING_OVERRIDE = object()
 
 
 def _database_url_for_tests() -> str:
@@ -91,6 +114,12 @@ def _alembic_downgrade_to_milestone_four(connection: Any) -> None:
     config = Config(API_ROOT / "alembic.ini")
     config.attributes["connection"] = connection
     command.downgrade(config, "20260825_0003")
+
+
+def _alembic_downgrade_to_trusted_approval(connection: Any) -> None:
+    config = Config(API_ROOT / "alembic.ini")
+    config.attributes["connection"] = connection
+    command.downgrade(config, "20260825_0004")
 
 
 async def _prepare_isolated_database() -> IsolatedDatabase:
@@ -181,6 +210,69 @@ def domain_client(isolated_database: IsolatedDatabase) -> Iterator[TestClient]:
         )
     ) as client:
         yield client
+
+
+async def create_authenticated_account(
+    isolated_database: IsolatedDatabase,
+    *,
+    display_name: str,
+    raw_credential_id: bytes,
+) -> tuple[AuthenticatedAccountContext, PasskeyCredential]:
+    account = Account(
+        id=new_account_id(),
+        display_name=display_name,
+        status=AccountStatus.ACTIVE,
+        session_version=1,
+    )
+    identity = ApprovalIdentity(
+        id=new_approval_identity_id(),
+        account_id=account.id,
+        subject_ref=account.id,
+        display_name=display_name,
+        webauthn_user_handle=uuid.uuid4().bytes + uuid.uuid4().bytes,
+        status=ApprovalIdentityStatus.ACTIVE,
+    )
+    credential = PasskeyCredential(
+        id=new_passkey_credential_id(),
+        approval_identity_id=identity.id,
+        credential_id=raw_credential_id,
+        public_key=b"authenticated-test-public-key",
+        sign_count=0,
+        transports=["internal"],
+    )
+    async with isolated_database.database.session() as session:
+        await AccountRepository(session).create_signup_bundle(
+            account,
+            identity=identity,
+            credential=credential,
+        )
+    return AuthenticatedAccountContext(account, identity), credential
+
+
+@contextmanager
+def authenticated_domain_client(
+    client: TestClient,
+    current: AuthenticatedAccountContext,
+) -> Iterator[TestClient]:
+    overrides = client.app.dependency_overrides
+    dependencies = (require_current_account, require_authenticated_mutation)
+    previous = {
+        dependency: overrides.get(dependency, _MISSING_OVERRIDE) for dependency in dependencies
+    }
+
+    async def resolve_current_account() -> AuthenticatedAccountContext:
+        return current
+
+    for dependency in dependencies:
+        overrides[dependency] = resolve_current_account
+    try:
+        yield client
+    finally:
+        for dependency, override in previous.items():
+            if override is _MISSING_OVERRIDE:
+                overrides.pop(dependency, None)
+            else:
+                overrides[dependency] = override
 
 
 def merchant_payload(
@@ -292,6 +384,7 @@ def test_alembic_upgraded_a_clean_postgresql_schema(
 
     assert dialect == "postgresql"
     assert {
+        "accounts",
         "alembic_version",
         "approval_identities",
         "buyer_policies",
@@ -603,6 +696,10 @@ def test_approval_migration_has_postgresql_integrity_guards(
                     "identity_indexes": {
                         item["name"] for item in inspector.get_indexes("approval_identities")
                     },
+                    "identity_foreign_keys": {
+                        item["referred_table"]: item["options"].get("ondelete")
+                        for item in inspector.get_foreign_keys("approval_identities")
+                    },
                     "identity_unique": {
                         item["name"]
                         for item in inspector.get_unique_constraints("approval_identities")
@@ -655,6 +752,7 @@ def test_approval_migration_has_postgresql_integrity_guards(
                     FROM information_schema.triggers
                     WHERE event_object_schema = current_schema()
                       AND event_object_table IN (
+                          'accounts',
                           'approval_identities',
                           'passkey_credentials',
                           'purchase_authorizations'
@@ -669,6 +767,7 @@ def test_approval_migration_has_postgresql_integrity_guards(
 
     assert schema["identity_columns"] == {
         "id": "VARCHAR(30)",
+        "account_id": "VARCHAR(31)",
         "subject_ref": "VARCHAR(200)",
         "display_name": "VARCHAR(200)",
         "webauthn_user_handle": "BYTEA",
@@ -677,6 +776,8 @@ def test_approval_migration_has_postgresql_integrity_guards(
         "updated_at": "TIMESTAMP",
     }
     assert {
+        "ck_approval_identities_account_id_format",
+        "ck_approval_identities_account_id_length_prefix",
         "ck_approval_identities_id_format",
         "ck_approval_identities_status",
         "ck_approval_identities_subject_ref_valid",
@@ -684,9 +785,11 @@ def test_approval_migration_has_postgresql_integrity_guards(
     } <= schema["identity_checks"]
     assert schema["identity_indexes"] >= {"ix_approval_identities_status_created_at"}
     assert schema["identity_unique"] == {
+        "uq_approval_identities_account_id",
         "uq_approval_identities_subject_ref",
         "uq_approval_identities_webauthn_user_handle",
     }
+    assert schema["identity_foreign_keys"] == {"accounts": "RESTRICT"}
 
     assert schema["credential_columns"] == {
         "id": "VARCHAR(30)",
@@ -766,6 +869,8 @@ def test_approval_migration_has_postgresql_integrity_guards(
         "uq_purchase_authorizations_challenge_hash",
     }
     assert schema["triggers"] == {
+        ("accounts", "trg_accounts_guard_mutation"),
+        ("approval_identities", "trg_approval_identities_canonical_subject"),
         ("approval_identities", "trg_approval_identities_guard_mutation"),
         ("passkey_credentials", "trg_passkey_credentials_guard_mutation"),
         ("purchase_authorizations", "trg_purchase_authorizations_immutable"),
@@ -822,11 +927,800 @@ def test_approval_migration_downgrades_to_milestone_four_and_reupgrades() -> Non
     asyncio.run(exercise_cycle())
 
 
+def test_account_migration_has_postgresql_integrity_guards(
+    isolated_database: IsolatedDatabase,
+) -> None:
+    async def inspect_account_tables() -> dict[str, Any]:
+        async with isolated_database.database.engine.connect() as connection:
+
+            def inspect_connection(sync_connection: Any) -> dict[str, Any]:
+                inspector = inspect(sync_connection)
+                identity_account_column = next(
+                    column
+                    for column in inspector.get_columns("approval_identities")
+                    if column["name"] == "account_id"
+                )
+                return {
+                    "account_columns": {
+                        column["name"]: str(column["type"])
+                        for column in inspector.get_columns("accounts")
+                    },
+                    "account_checks": {
+                        item["name"] for item in inspector.get_check_constraints("accounts")
+                    },
+                    "account_indexes": {item["name"] for item in inspector.get_indexes("accounts")},
+                    "identity_account_nullable": identity_account_column["nullable"],
+                    "identity_foreign_keys": {
+                        item["name"]: (
+                            item["referred_table"],
+                            item["options"].get("ondelete"),
+                        )
+                        for item in inspector.get_foreign_keys("approval_identities")
+                    },
+                    "identity_unique": {
+                        item["name"]
+                        for item in inspector.get_unique_constraints("approval_identities")
+                    },
+                }
+
+            inspected = await connection.run_sync(inspect_connection)
+            trigger_rows = await connection.execute(
+                text(
+                    """
+                    SELECT event_object_table, trigger_name
+                    FROM information_schema.triggers
+                    WHERE event_object_schema = current_schema()
+                      AND event_object_table IN ('accounts', 'approval_identities')
+                    """
+                )
+            )
+            inspected["triggers"] = set(trigger_rows.tuples().all())
+            return inspected
+
+    schema = asyncio.run(inspect_account_tables())
+
+    assert schema["account_columns"] == {
+        "id": "VARCHAR(31)",
+        "display_name": "VARCHAR(200)",
+        "status": "VARCHAR(8)",
+        "session_version": "INTEGER",
+        "created_at": "TIMESTAMP",
+        "updated_at": "TIMESTAMP",
+    }
+    assert {
+        "ck_accounts_display_name_valid",
+        "ck_accounts_id_format",
+        "ck_accounts_id_length_prefix",
+        "ck_accounts_session_version_positive",
+        "ck_accounts_status",
+        "ck_accounts_updated_at_valid",
+    } <= schema["account_checks"]
+    assert schema["account_indexes"] >= {"ix_accounts_status_created_at"}
+    assert schema["identity_account_nullable"] is False
+    assert schema["identity_foreign_keys"] == {
+        "fk_approval_identities_account": ("accounts", "RESTRICT")
+    }
+    assert "uq_approval_identities_account_id" in schema["identity_unique"]
+    assert schema["triggers"] == {
+        ("accounts", "trg_accounts_guard_mutation"),
+        ("approval_identities", "trg_approval_identities_canonical_subject"),
+        ("approval_identities", "trg_approval_identities_guard_mutation"),
+    }
+
+
+def test_account_repository_creates_signup_bundle_atomically(
+    isolated_database: IsolatedDatabase,
+) -> None:
+    raw_credential_id = f"account-signup-{uuid.uuid4().hex}".encode()
+
+    def signup_records() -> tuple[Account, ApprovalIdentity, PasskeyCredential]:
+        account = Account(
+            id=new_account_id(),
+            display_name="Transactional signup",
+            status=AccountStatus.ACTIVE,
+            session_version=1,
+        )
+        identity = ApprovalIdentity(
+            id=new_approval_identity_id(),
+            account_id=account.id,
+            subject_ref=account.id,
+            display_name=account.display_name,
+            webauthn_user_handle=uuid.uuid4().bytes + uuid.uuid4().bytes,
+            status=ApprovalIdentityStatus.ACTIVE,
+        )
+        credential = PasskeyCredential(
+            id=new_passkey_credential_id(),
+            approval_identity_id=identity.id,
+            credential_id=raw_credential_id,
+            public_key=b"verified-signup-public-key",
+            sign_count=0,
+            transports=["internal"],
+        )
+        return account, identity, credential
+
+    async def exercise_repository() -> None:
+        account, identity, credential = signup_records()
+        async with isolated_database.database.session() as session:
+            persisted = await AccountRepository(session).create_signup_bundle(
+                account,
+                identity=identity,
+                credential=credential,
+            )
+            assert persisted.id == account.id
+
+        duplicate_account, duplicate_identity, duplicate_credential = signup_records()
+        with pytest.raises(IntegrityError):
+            async with isolated_database.database.session() as session:
+                await AccountRepository(session).create_signup_bundle(
+                    duplicate_account,
+                    identity=duplicate_identity,
+                    credential=duplicate_credential,
+                )
+
+        async with isolated_database.database.session() as session:
+            assert await session.get(Account, account.id) is not None
+            assert await session.get(ApprovalIdentity, identity.id) is not None
+            assert await session.get(PasskeyCredential, credential.id) is not None
+            assert await session.get(Account, duplicate_account.id) is None
+            assert await session.get(ApprovalIdentity, duplicate_identity.id) is None
+            assert await session.get(PasskeyCredential, duplicate_credential.id) is None
+
+    asyncio.run(exercise_repository())
+
+
+def test_security_row_locks_refresh_preloaded_identity_map_state(
+    isolated_database: IsolatedDatabase,
+) -> None:
+    async def exercise_refresh() -> None:
+        current, credential = await create_authenticated_account(
+            isolated_database,
+            display_name="Lock Refresh Buyer",
+            raw_credential_id=f"lock-refresh-{uuid.uuid4().hex}".encode(),
+        )
+        async with (
+            isolated_database.database.session() as first_session,
+            isolated_database.database.session() as second_session,
+        ):
+            accounts = AccountRepository(first_session)
+            identities = ApprovalIdentityRepository(first_session)
+            credentials = PasskeyCredentialRepository(first_session)
+            assert (await accounts.get(current.account.id)).status == AccountStatus.ACTIVE
+            assert (
+                await identities.get(current.approval_identity.id)
+            ).status == ApprovalIdentityStatus.ACTIVE
+            assert (
+                await credentials.get_by_credential_id(credential.credential_id)
+            ).sign_count == 0
+
+            await second_session.execute(
+                text(
+                    """
+                    UPDATE accounts
+                    SET status = 'disabled',
+                        session_version = session_version + 1,
+                        updated_at = now()
+                    WHERE id = :account_id
+                    """
+                ),
+                {"account_id": current.account.id},
+            )
+            await second_session.execute(
+                text(
+                    """
+                    UPDATE approval_identities
+                    SET status = 'disabled', updated_at = now()
+                    WHERE id = :identity_id
+                    """
+                ),
+                {"identity_id": current.approval_identity.id},
+            )
+            await second_session.execute(
+                text(
+                    """
+                    UPDATE passkey_credentials
+                    SET sign_count = 7, last_used_at = now()
+                    WHERE id = :credential_id
+                    """
+                ),
+                {"credential_id": credential.id},
+            )
+            await second_session.commit()
+
+            locked_account = await accounts.get_for_update(current.account.id)
+            locked_identity = await identities.get_for_update(current.approval_identity.id)
+            locked_credential = await credentials.get_by_credential_id_for_update(
+                credential.credential_id,
+                identity_id=current.approval_identity.id,
+            )
+
+            assert locked_account is not None
+            assert locked_account.status == AccountStatus.DISABLED
+            assert locked_account.session_version == 2
+            assert locked_identity is not None
+            assert locked_identity.status == ApprovalIdentityStatus.DISABLED
+            assert locked_credential is not None
+            assert locked_credential.sign_count == 7
+
+    asyncio.run(exercise_refresh())
+
+
+def test_account_database_guards_reject_unsafe_mutations(
+    isolated_database: IsolatedDatabase,
+) -> None:
+    account_id = new_account_id()
+
+    async def execute(statement: str, parameters: dict[str, Any]) -> None:
+        async with isolated_database.database.engine.begin() as connection:
+            await connection.execute(text(statement), parameters)
+
+    asyncio.run(
+        execute(
+            """
+            INSERT INTO accounts (id, display_name, status, session_version)
+            VALUES (:account_id, 'Guarded account', 'pending', 1)
+            """,
+            {"account_id": account_id},
+        )
+    )
+    with pytest.raises(DBAPIError):
+        asyncio.run(
+            execute(
+                "UPDATE accounts SET status = 'active' WHERE id = :account_id",
+                {"account_id": account_id},
+            )
+        )
+    asyncio.run(
+        execute(
+            """
+            UPDATE accounts
+            SET status = 'active', session_version = 2, updated_at = now()
+            WHERE id = :account_id
+            """,
+            {"account_id": account_id},
+        )
+    )
+    for statement in (
+        "UPDATE accounts SET status = 'pending', session_version = 3 WHERE id = :account_id",
+        "UPDATE accounts SET session_version = 1 WHERE id = :account_id",
+        "DELETE FROM accounts WHERE id = :account_id",
+    ):
+        with pytest.raises(DBAPIError):
+            asyncio.run(execute(statement, {"account_id": account_id}))
+
+    with pytest.raises(DBAPIError):
+        asyncio.run(
+            execute(
+                """
+                INSERT INTO approval_identities (
+                    id,
+                    account_id,
+                    subject_ref,
+                    display_name,
+                    webauthn_user_handle,
+                    status
+                ) VALUES (
+                    :identity_id,
+                    :account_id,
+                    'client-chosen-subject',
+                    'Invalid identity',
+                    :user_handle,
+                    'active'
+                )
+                """,
+                {
+                    "identity_id": new_approval_identity_id(),
+                    "account_id": account_id,
+                    "user_handle": uuid.uuid4().bytes + uuid.uuid4().bytes,
+                },
+            )
+        )
+
+
+def test_account_migration_backfills_and_round_trips_without_rewriting_history() -> None:
+    async def exercise_cycle() -> None:
+        isolated = await _prepare_isolated_database()
+        legacy_rows = (
+            (
+                "aid_00000000000000000000000011",
+                "legacy-active-subject",
+                "Legacy active",
+                b"a" * 32,
+                "active",
+            ),
+            (
+                "aid_00000000000000000000000012",
+                "legacy-pending-subject",
+                "Legacy pending",
+                b"b" * 32,
+                "active",
+            ),
+            (
+                "aid_00000000000000000000000013",
+                "legacy-disabled-subject",
+                "Legacy disabled",
+                b"c" * 32,
+                "disabled",
+            ),
+        )
+        try:
+            async with isolated.database.engine.connect() as connection:
+                await connection.run_sync(_alembic_downgrade_to_trusted_approval)
+                for identity in legacy_rows:
+                    await connection.execute(
+                        text(
+                            """
+                            INSERT INTO approval_identities (
+                                id,
+                                subject_ref,
+                                display_name,
+                                webauthn_user_handle,
+                                status
+                            ) VALUES (
+                                :id,
+                                :subject_ref,
+                                :display_name,
+                                :user_handle,
+                                :status
+                            )
+                            """
+                        ),
+                        {
+                            "id": identity[0],
+                            "subject_ref": identity[1],
+                            "display_name": identity[2],
+                            "user_handle": identity[3],
+                            "status": identity[4],
+                        },
+                    )
+                for credential_id, identity_id in (
+                    ("pkc_00000000000000000000000011", legacy_rows[0][0]),
+                    ("pkc_00000000000000000000000013", legacy_rows[2][0]),
+                ):
+                    await connection.execute(
+                        text(
+                            """
+                            INSERT INTO passkey_credentials (
+                                id,
+                                approval_identity_id,
+                                credential_id,
+                                public_key,
+                                sign_count,
+                                transports
+                            ) VALUES (
+                                :id,
+                                :identity_id,
+                                :credential_id,
+                                :public_key,
+                                0,
+                                NULL
+                            )
+                            """
+                        ),
+                        {
+                            "id": credential_id,
+                            "identity_id": identity_id,
+                            "credential_id": credential_id.encode(),
+                            "public_key": b"legacy-public-key",
+                        },
+                    )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO merchants (id, slug, name, description, status)
+                        VALUES (
+                            'mrc_00000000000000000000000011',
+                            'legacy-account-merchant',
+                            'Legacy account merchant',
+                            'Migration preservation fixture',
+                            'active'
+                        )
+                        """
+                    )
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO services (
+                            id,
+                            merchant_id,
+                            slug,
+                            name,
+                            description,
+                            status,
+                            service_type,
+                            purchase_type,
+                            currency,
+                            base_price,
+                            input_schema,
+                            output_schema,
+                            output_content_type,
+                            maximum_fulfillment_seconds,
+                            refund_on_fulfillment_failure
+                        ) VALUES (
+                            'svc_00000000000000000000000011',
+                            'mrc_00000000000000000000000011',
+                            'legacy-account-service',
+                            'Legacy account service',
+                            'Migration preservation fixture',
+                            'active',
+                            'report',
+                            'one_time',
+                            'INR',
+                            500,
+                            CAST(:input_schema AS jsonb),
+                            CAST(:output_schema AS jsonb),
+                            'application/json',
+                            30,
+                            true
+                        )
+                        """
+                    ),
+                    {
+                        "input_schema": json.dumps({"type": "object"}),
+                        "output_schema": json.dumps({"type": "object"}),
+                    },
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO quotes (
+                            id,
+                            merchant_id,
+                            service_id,
+                            input,
+                            input_hash,
+                            service_snapshot,
+                            amount,
+                            currency,
+                            purchase_type,
+                            maximum_fulfillment_seconds,
+                            refund_on_fulfillment_failure,
+                            issued_at,
+                            expires_at,
+                            quote_hash
+                        ) VALUES (
+                            'qte_00000000000000000000000011',
+                            'mrc_00000000000000000000000011',
+                            'svc_00000000000000000000000011',
+                            CAST(:quote_input AS jsonb),
+                            :input_hash,
+                            CAST(:service_snapshot AS jsonb),
+                            500,
+                            'INR',
+                            'one_time',
+                            30,
+                            true,
+                            :issued_at,
+                            :expires_at,
+                            :quote_hash
+                        )
+                        """
+                    ),
+                    {
+                        "quote_input": json.dumps({"norad_id": 25544}),
+                        "input_hash": f"sha256:{201:064x}",
+                        "service_snapshot": json.dumps({"name": "Legacy account service"}),
+                        "issued_at": datetime(2026, 8, 25, 12, tzinfo=UTC),
+                        "expires_at": datetime(2026, 8, 25, 13, tzinfo=UTC),
+                        "quote_hash": f"sha256:{202:064x}",
+                    },
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO buyer_policies (
+                            id,
+                            subject_ref,
+                            maximum_amount,
+                            allowed_currencies,
+                            allowed_merchant_ids,
+                            allowed_service_ids,
+                            allowed_service_types,
+                            allowed_purchase_types,
+                            issued_at,
+                            expires_at,
+                            policy_version,
+                            policy_hash
+                        ) VALUES (
+                            'pol_00000000000000000000000011',
+                            :subject_ref,
+                            1000,
+                            NULL,
+                            NULL,
+                            NULL,
+                            NULL,
+                            NULL,
+                            :issued_at,
+                            :expires_at,
+                            '1',
+                            :policy_hash
+                        )
+                        """
+                    ),
+                    {
+                        "subject_ref": legacy_rows[0][1],
+                        "issued_at": datetime(2026, 8, 25, 12, tzinfo=UTC),
+                        "expires_at": datetime(2026, 8, 25, 13, tzinfo=UTC),
+                        "policy_hash": f"sha256:{101:064x}",
+                    },
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO policy_evaluations (
+                            id,
+                            policy_id,
+                            quote_id,
+                            policy_hash,
+                            quote_hash,
+                            decision,
+                            checks,
+                            evaluated_at,
+                            evaluation_version
+                        ) VALUES (
+                            'pye_00000000000000000000000011',
+                            'pol_00000000000000000000000011',
+                            'qte_00000000000000000000000011',
+                            :policy_hash,
+                            :quote_hash,
+                            'allow',
+                            CAST(:checks AS jsonb),
+                            :evaluated_at,
+                            '1'
+                        )
+                        """
+                    ),
+                    {
+                        "policy_hash": f"sha256:{101:064x}",
+                        "quote_hash": f"sha256:{202:064x}",
+                        "checks": json.dumps([{"rule": "MIGRATION_FIXTURE"}]),
+                        "evaluated_at": datetime(2026, 8, 25, 12, 5, tzinfo=UTC),
+                    },
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO purchase_authorizations (
+                            id,
+                            approval_identity_id,
+                            passkey_credential_id,
+                            evaluation_id,
+                            policy_id,
+                            policy_hash,
+                            quote_id,
+                            quote_hash,
+                            merchant_id,
+                            service_id,
+                            subject_ref,
+                            amount,
+                            currency,
+                            purchase_type,
+                            review_hash,
+                            challenge_hash,
+                            authorized_at,
+                            expires_at,
+                            authorization_version,
+                            authorization_hash
+                        ) VALUES (
+                            'aut_00000000000000000000000011',
+                            'aid_00000000000000000000000011',
+                            'pkc_00000000000000000000000011',
+                            'pye_00000000000000000000000011',
+                            'pol_00000000000000000000000011',
+                            :policy_hash,
+                            'qte_00000000000000000000000011',
+                            :quote_hash,
+                            'mrc_00000000000000000000000011',
+                            'svc_00000000000000000000000011',
+                            :subject_ref,
+                            500,
+                            'INR',
+                            'one_time',
+                            :review_hash,
+                            :challenge_hash,
+                            :authorized_at,
+                            :expires_at,
+                            '1',
+                            :authorization_hash
+                        )
+                        """
+                    ),
+                    {
+                        "policy_hash": f"sha256:{101:064x}",
+                        "quote_hash": f"sha256:{202:064x}",
+                        "subject_ref": legacy_rows[0][1],
+                        "review_hash": f"sha256:{203:064x}",
+                        "challenge_hash": f"sha256:{204:064x}",
+                        "authorized_at": datetime(2026, 8, 25, 12, 10, tzinfo=UTC),
+                        "expires_at": datetime(2026, 8, 25, 12, 20, tzinfo=UTC),
+                        "authorization_hash": f"sha256:{205:064x}",
+                    },
+                )
+                await connection.commit()
+
+                history_before = (
+                    (
+                        await connection.execute(
+                            text(
+                                """
+                            SELECT id, subject_ref
+                            FROM approval_identities
+                            ORDER BY id
+                            """
+                            )
+                        )
+                    )
+                    .tuples()
+                    .all()
+                )
+                policy_before = (
+                    (
+                        await connection.execute(
+                            text(
+                                """
+                            SELECT id, subject_ref, policy_hash
+                            FROM buyer_policies
+                            WHERE id = 'pol_00000000000000000000000011'
+                            """
+                            )
+                        )
+                    )
+                    .tuples()
+                    .one()
+                )
+                authorization_before = (
+                    (
+                        await connection.execute(
+                            text(
+                                """
+                            SELECT
+                                id,
+                                subject_ref,
+                                policy_hash,
+                                quote_hash,
+                                review_hash,
+                                challenge_hash,
+                                authorization_hash
+                            FROM purchase_authorizations
+                            WHERE id = 'aut_00000000000000000000000011'
+                            """
+                            )
+                        )
+                    )
+                    .tuples()
+                    .one()
+                )
+
+                await connection.run_sync(_alembic_upgrade)
+                backfilled = (
+                    (
+                        await connection.execute(
+                            text(
+                                """
+                            SELECT account.id, account.status, identity.subject_ref
+                            FROM accounts AS account
+                            JOIN approval_identities AS identity
+                              ON identity.account_id = account.id
+                            ORDER BY account.id
+                            """
+                            )
+                        )
+                    )
+                    .tuples()
+                    .all()
+                )
+                assert backfilled == [
+                    (
+                        "acct_00000000000000000000000011",
+                        "active",
+                        "legacy-active-subject",
+                    ),
+                    (
+                        "acct_00000000000000000000000012",
+                        "pending",
+                        "legacy-pending-subject",
+                    ),
+                    (
+                        "acct_00000000000000000000000013",
+                        "disabled",
+                        "legacy-disabled-subject",
+                    ),
+                ]
+                assert (
+                    await connection.execute(
+                        text("SELECT id, subject_ref FROM approval_identities ORDER BY id")
+                    )
+                ).tuples().all() == history_before
+                assert (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT id, subject_ref, policy_hash
+                            FROM buyer_policies
+                            WHERE id = 'pol_00000000000000000000000011'
+                            """
+                        )
+                    )
+                ).tuples().one() == policy_before
+                assert (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT
+                                id,
+                                subject_ref,
+                                policy_hash,
+                                quote_hash,
+                                review_hash,
+                                challenge_hash,
+                                authorization_hash
+                            FROM purchase_authorizations
+                            WHERE id = 'aut_00000000000000000000000011'
+                            """
+                        )
+                    )
+                ).tuples().one() == authorization_before
+
+                await connection.run_sync(_alembic_downgrade_to_trusted_approval)
+
+                def trusted_approval_tables(sync_connection: Any) -> set[str]:
+                    return set(inspect(sync_connection).get_table_names())
+
+                assert "accounts" not in await connection.run_sync(trusted_approval_tables)
+                assert (
+                    await connection.execute(
+                        text("SELECT id, subject_ref FROM approval_identities ORDER BY id")
+                    )
+                ).tuples().all() == history_before
+                assert (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT
+                                id,
+                                subject_ref,
+                                policy_hash,
+                                quote_hash,
+                                review_hash,
+                                challenge_hash,
+                                authorization_hash
+                            FROM purchase_authorizations
+                            WHERE id = 'aut_00000000000000000000000011'
+                            """
+                        )
+                    )
+                ).tuples().one() == authorization_before
+
+                await connection.run_sync(_alembic_upgrade)
+                await connection.run_sync(_alembic_check)
+                rebackfilled_ids = await connection.scalars(
+                    text("SELECT id FROM accounts ORDER BY id")
+                )
+                assert list(rebackfilled_ids.all()) == [
+                    "acct_00000000000000000000000011",
+                    "acct_00000000000000000000000012",
+                    "acct_00000000000000000000000013",
+                ]
+        finally:
+            await isolated.database.dispose()
+            await _drop_isolated_schema(isolated.database_url, isolated.schema)
+
+    asyncio.run(exercise_cycle())
+
+
 def test_approval_records_enforce_atomic_usage_and_database_immutability(
     domain_client: TestClient,
     isolated_database: IsolatedDatabase,
 ) -> None:
-    subject_ref = "postgresql-approval-user"
+    raw_credential_id = b"postgresql-approval-credential"
+    current, credential = asyncio.run(
+        create_authenticated_account(
+            isolated_database,
+            display_name="PostgreSQL Approval User",
+            raw_credential_id=raw_credential_id,
+        )
+    )
+    subject_ref = current.account.id
     merchant = create_merchant(domain_client, "approval-persistence-merchant")
     service = create_service(
         domain_client,
@@ -840,50 +1734,29 @@ def test_approval_records_enforce_atomic_usage_and_database_immutability(
     )
     assert quote_response.status_code == 201, quote_response.text
     quote = quote_response.json()
-    policy_response = domain_client.post(
-        "/api/v1/policies",
-        json={
-            "subject_ref": subject_ref,
-            "maximum_amount": 1_000,
-            "allowed_currencies": ["INR"],
-            "allowed_merchant_ids": [merchant["id"]],
-            "allowed_service_ids": [service["id"]],
-            "allowed_service_types": ["report"],
-            "allowed_purchase_types": ["one_time"],
-            "expires_in_seconds": 900,
-        },
-    )
-    assert policy_response.status_code == 201, policy_response.text
-    policy = policy_response.json()
-    evaluation_response = domain_client.post(
-        "/api/v1/policy-evaluations",
-        json={"policy_id": policy["id"], "quote_id": quote["id"]},
-    )
-    assert evaluation_response.status_code == 201, evaluation_response.text
-    evaluation = evaluation_response.json()
+    with authenticated_domain_client(domain_client, current) as authenticated_client:
+        policy_response = authenticated_client.post(
+            "/api/v1/policies",
+            json={
+                "maximum_amount": 1_000,
+                "allowed_currencies": ["INR"],
+                "allowed_merchant_ids": [merchant["id"]],
+                "allowed_service_ids": [service["id"]],
+                "allowed_service_types": ["report"],
+                "allowed_purchase_types": ["one_time"],
+                "expires_in_seconds": 900,
+            },
+        )
+        assert policy_response.status_code == 201, policy_response.text
+        policy = policy_response.json()
+        assert policy["subject_ref"] == subject_ref
+        evaluation_response = authenticated_client.post(
+            "/api/v1/policy-evaluations",
+            json={"policy_id": policy["id"], "quote_id": quote["id"]},
+        )
+        assert evaluation_response.status_code == 201, evaluation_response.text
+        evaluation = evaluation_response.json()
     assert evaluation["decision"] == "allow"
-    identity_response = domain_client.post(
-        "/api/v1/approval-identities",
-        json={"subject_ref": subject_ref, "display_name": "PostgreSQL Approval User"},
-    )
-    assert identity_response.status_code == 201, identity_response.text
-    identity = identity_response.json()
-
-    raw_credential_id = b"postgresql-approval-credential"
-
-    async def create_credential() -> PasskeyCredential:
-        async with isolated_database.database.session() as session:
-            return await PasskeyCredentialRepository(session).create(
-                PasskeyCredential(
-                    approval_identity_id=identity["id"],
-                    credential_id=raw_credential_id,
-                    public_key=b"postgresql-public-key",
-                    sign_count=0,
-                    transports=["internal"],
-                )
-            )
-
-    credential = asyncio.run(create_credential())
     authorized_at = datetime.now(UTC)
     expires_at = authorized_at + timedelta(minutes=2)
     review_hash = sha256_bytes(b"postgresql-approval-review")
@@ -893,7 +1766,7 @@ def test_approval_records_enforce_atomic_usage_and_database_immutability(
         authorization_hash = calculate_authorization_hash(
             authorization_id=authorization_id,
             authorization_version=AUTHORIZATION_VERSION,
-            approval_identity_id=identity["id"],
+            approval_identity_id=current.approval_identity.id,
             passkey_credential_id=credential.id,
             subject_ref=subject_ref,
             evaluation_id=evaluation["id"],
@@ -913,7 +1786,7 @@ def test_approval_records_enforce_atomic_usage_and_database_immutability(
         )
         return PurchaseAuthorization(
             id=authorization_id,
-            approval_identity_id=identity["id"],
+            approval_identity_id=current.approval_identity.id,
             passkey_credential_id=credential.id,
             evaluation_id=evaluation["id"],
             policy_id=policy["id"],
@@ -942,7 +1815,7 @@ def test_approval_records_enforce_atomic_usage_and_database_immutability(
         async with isolated_database.database.session() as session:
             locked = await PasskeyCredentialRepository(session).get_by_credential_id_for_update(
                 raw_credential_id,
-                identity_id=identity["id"],
+                identity_id=current.approval_identity.id,
             )
             assert locked is not None
             return await PurchaseAuthorizationRepository(
@@ -1230,7 +2103,15 @@ def test_policy_rows_enforce_json_constraints_foreign_keys_and_immutability(
 
 def test_policy_api_persists_allow_and_deny_evaluations(
     domain_client: TestClient,
+    isolated_database: IsolatedDatabase,
 ) -> None:
+    current, _ = asyncio.run(
+        create_authenticated_account(
+            isolated_database,
+            display_name="PostgreSQL Policy User",
+            raw_credential_id=b"postgresql-policy-api-credential",
+        )
+    )
     merchant = create_merchant(domain_client, "policy-evaluation-merchant")
     service = create_service(
         domain_client,
@@ -1246,7 +2127,6 @@ def test_policy_api_persists_allow_and_deny_evaluations(
     quote = quote_response.json()
 
     common_policy = {
-        "subject_ref": "dev-policy-integration",
         "allowed_currencies": ["INR"],
         "allowed_merchant_ids": [merchant["id"]],
         "allowed_service_ids": [service["id"]],
@@ -1254,46 +2134,52 @@ def test_policy_api_persists_allow_and_deny_evaluations(
         "allowed_purchase_types": ["one_time"],
         "expires_in_seconds": 900,
     }
-    allow_response = domain_client.post(
-        "/api/v1/policies",
-        json={**common_policy, "maximum_amount": 1_000},
-    )
-    deny_response = domain_client.post(
-        "/api/v1/policies",
-        json={**common_policy, "maximum_amount": 100},
-    )
-    assert allow_response.status_code == 201, allow_response.text
-    assert deny_response.status_code == 201, deny_response.text
-    allow_policy = allow_response.json()
-    deny_policy = deny_response.json()
-    assert ID_PATTERN.fullmatch(allow_policy["id"])
-    assert allow_policy["constraints"]["maximum_amount"] == 1_000
-    assert allow_policy["state"] == "active"
-    assert domain_client.get(f"/api/v1/policies/{allow_policy['id']}").json() == allow_policy
+    with authenticated_domain_client(domain_client, current) as authenticated_client:
+        allow_response = authenticated_client.post(
+            "/api/v1/policies",
+            json={**common_policy, "maximum_amount": 1_000},
+        )
+        deny_response = authenticated_client.post(
+            "/api/v1/policies",
+            json={**common_policy, "maximum_amount": 100},
+        )
+        assert allow_response.status_code == 201, allow_response.text
+        assert deny_response.status_code == 201, deny_response.text
+        allow_policy = allow_response.json()
+        deny_policy = deny_response.json()
+        assert ID_PATTERN.fullmatch(allow_policy["id"])
+        assert allow_policy["subject_ref"] == current.account.id
+        assert deny_policy["subject_ref"] == current.account.id
+        assert allow_policy["constraints"]["maximum_amount"] == 1_000
+        assert allow_policy["state"] == "active"
+        assert (
+            authenticated_client.get(f"/api/v1/policies/{allow_policy['id']}").json()
+            == allow_policy
+        )
 
-    allow_evaluation_response = domain_client.post(
-        "/api/v1/policy-evaluations",
-        json={"policy_id": allow_policy["id"], "quote_id": quote["id"]},
-    )
-    deny_evaluation_response = domain_client.post(
-        "/api/v1/policy-evaluations",
-        json={"policy_id": deny_policy["id"], "quote_id": quote["id"]},
-    )
-    assert allow_evaluation_response.status_code == 201, allow_evaluation_response.text
-    assert deny_evaluation_response.status_code == 201, deny_evaluation_response.text
-    allow_evaluation = allow_evaluation_response.json()
-    deny_evaluation = deny_evaluation_response.json()
+        allow_evaluation_response = authenticated_client.post(
+            "/api/v1/policy-evaluations",
+            json={"policy_id": allow_policy["id"], "quote_id": quote["id"]},
+        )
+        deny_evaluation_response = authenticated_client.post(
+            "/api/v1/policy-evaluations",
+            json={"policy_id": deny_policy["id"], "quote_id": quote["id"]},
+        )
+        assert allow_evaluation_response.status_code == 201, allow_evaluation_response.text
+        assert deny_evaluation_response.status_code == 201, deny_evaluation_response.text
+        allow_evaluation = allow_evaluation_response.json()
+        deny_evaluation = deny_evaluation_response.json()
 
-    assert ID_PATTERN.fullmatch(allow_evaluation["id"])
-    assert allow_evaluation["decision"] == "allow"
-    assert allow_evaluation["policy_hash"] == allow_policy["policy_hash"]
-    assert allow_evaluation["quote_hash"] == quote["quote_hash"]
-    assert allow_evaluation["evaluation_version"] == "1"
-    assert allow_evaluation["checks"]
-    assert (
-        domain_client.get(f"/api/v1/policy-evaluations/{allow_evaluation['id']}").json()
-        == allow_evaluation
-    )
+        assert ID_PATTERN.fullmatch(allow_evaluation["id"])
+        assert allow_evaluation["decision"] == "allow"
+        assert allow_evaluation["policy_hash"] == allow_policy["policy_hash"]
+        assert allow_evaluation["quote_hash"] == quote["quote_hash"]
+        assert allow_evaluation["evaluation_version"] == "1"
+        assert allow_evaluation["checks"]
+        assert (
+            authenticated_client.get(f"/api/v1/policy-evaluations/{allow_evaluation['id']}").json()
+            == allow_evaluation
+        )
 
     assert deny_evaluation["decision"] == "deny"
     assert "DENY_AMOUNT_EXCEEDS_LIMIT" in deny_evaluation["reason_codes"]

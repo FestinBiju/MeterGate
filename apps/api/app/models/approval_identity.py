@@ -2,7 +2,16 @@
 
 import secrets
 
-from sqlalchemy import CheckConstraint, Enum, Index, LargeBinary, String, UniqueConstraint, event
+from sqlalchemy import (
+    CheckConstraint,
+    Enum,
+    ForeignKey,
+    Index,
+    LargeBinary,
+    String,
+    UniqueConstraint,
+    event,
+)
 from sqlalchemy import inspect as sqlalchemy_inspect
 from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.orm import Mapped, mapped_column
@@ -21,6 +30,7 @@ class ApprovalIdentity(TimestampMixin, Base):
     __tablename__ = "approval_identities"
     __table_args__ = (
         UniqueConstraint("subject_ref", name="uq_approval_identities_subject_ref"),
+        UniqueConstraint("account_id", name="uq_approval_identities_account_id"),
         UniqueConstraint(
             "webauthn_user_handle",
             name="uq_approval_identities_webauthn_user_handle",
@@ -28,6 +38,10 @@ class ApprovalIdentity(TimestampMixin, Base):
         CheckConstraint(
             "length(id) = 30 AND substr(id, 1, 4) = 'aid_'",
             name="id_length_prefix",
+        ),
+        CheckConstraint(
+            "length(account_id) = 31 AND substr(account_id, 1, 5) = 'acct_'",
+            name="account_id_length_prefix",
         ),
         CheckConstraint(
             "length(subject_ref) BETWEEN 1 AND 200 AND subject_ref = trim(subject_ref)",
@@ -53,6 +67,10 @@ class ApprovalIdentity(TimestampMixin, Base):
             "id ~ '^aid_[0-7][0-9A-HJKMNP-TV-Z]{25}$'",
             name="id_format",
         ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "account_id ~ '^acct_[0-7][0-9A-HJKMNP-TV-Z]{25}$'",
+            name="account_id_format",
+        ).ddl_if(dialect="postgresql"),
         Index("ix_approval_identities_status_created_at", "status", "created_at"),
     )
 
@@ -60,6 +78,15 @@ class ApprovalIdentity(TimestampMixin, Base):
         String(30),
         primary_key=True,
         default=new_approval_identity_id,
+    )
+    account_id: Mapped[str] = mapped_column(
+        String(31),
+        ForeignKey(
+            "accounts.id",
+            name="fk_approval_identities_account",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
     )
     subject_ref: Mapped[str] = mapped_column(String(200), nullable=False)
     display_name: Mapped[str] = mapped_column(String(200), nullable=False)
@@ -90,7 +117,13 @@ def _guard_approval_identity_update(
     identity: ApprovalIdentity,
 ) -> None:
     state = sqlalchemy_inspect(identity)
-    immutable_fields = ("id", "subject_ref", "webauthn_user_handle", "created_at")
+    immutable_fields = (
+        "id",
+        "account_id",
+        "subject_ref",
+        "webauthn_user_handle",
+        "created_at",
+    )
     if any(state.attrs[field].history.has_changes() for field in immutable_fields):
         raise InvalidRequestError(
             "Approval identity bindings are immutable; only display name and status may change"
@@ -100,3 +133,15 @@ def _guard_approval_identity_update(
 @event.listens_for(ApprovalIdentity, "before_delete")
 def _reject_approval_identity_delete(*_: object) -> None:
     raise InvalidRequestError("Approval identities cannot be deleted; disable them instead")
+
+
+@event.listens_for(ApprovalIdentity, "before_insert")
+def _require_canonical_subject_for_new_identity(
+    _mapper: object,
+    _connection: object,
+    identity: ApprovalIdentity,
+) -> None:
+    if identity.subject_ref != identity.account_id:
+        raise InvalidRequestError(
+            "New approval identity subject must equal its authenticated account ID"
+        )

@@ -31,8 +31,26 @@ class ApprovalIdentityRepository:
         )
         return result.one_or_none()
 
+    async def get_by_account_id(self, account_id: str) -> ApprovalIdentity | None:
+        result = await self._session.scalars(
+            select(ApprovalIdentity).where(ApprovalIdentity.account_id == account_id)
+        )
+        return result.one_or_none()
+
     async def get_for_update(self, identity_id: str) -> ApprovalIdentity | None:
         result = await self._session.scalars(
-            select(ApprovalIdentity).where(ApprovalIdentity.id == identity_id).with_for_update()
+            select(ApprovalIdentity)
+            .where(ApprovalIdentity.id == identity_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return result.one_or_none()
+
+    async def get_by_account_id_for_update(self, account_id: str) -> ApprovalIdentity | None:
+        result = await self._session.scalars(
+            select(ApprovalIdentity)
+            .where(ApprovalIdentity.account_id == account_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         return result.one_or_none()

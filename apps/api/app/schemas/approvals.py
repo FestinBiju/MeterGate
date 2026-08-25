@@ -7,7 +7,7 @@ from pydantic import Field, JsonValue, StringConstraints
 
 from app.domain.enums import ApprovalIdentityStatus, PurchaseType
 from app.domain.policy_engine import PolicyCheckResult, PolicyReasonCode, PolicyRule
-from app.schemas.common import APIModel, CurrencyCode, Name
+from app.schemas.common import AccountId, APIModel, CurrencyCode, Name
 from app.schemas.policies import (
     PolicyEvaluationId,
     PolicyId,
@@ -44,13 +44,9 @@ CanonicalTimestamp = Annotated[
 ]
 
 
-class ApprovalIdentityCreate(APIModel):
-    subject_ref: SubjectReference
-    display_name: Name
-
-
 class ApprovalIdentityResponse(APIModel):
     id: ApprovalIdentityId
+    account_id: AccountId
     subject_ref: SubjectReference
     display_name: Name
     status: ApprovalIdentityStatus
@@ -97,7 +93,6 @@ class PasskeyRegistrationResponse(APIModel):
 
 class ApprovalChallengeCreate(APIModel):
     evaluation_id: PolicyEvaluationId
-    approval_identity_id: ApprovalIdentityId
 
 
 class ApprovalReviewParty(APIModel):

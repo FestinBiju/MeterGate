@@ -16,6 +16,8 @@ ENVIRONMENT_VARIABLES = (
     "QUOTE_TTL_SECONDS",
     "REDIS_URL",
     "SERVICE_NAME",
+    "WEBAUTHN_EXPECTED_ORIGINS",
+    "WEBAUTHN_RP_ID",
 )
 
 
@@ -63,6 +65,8 @@ def test_settings_load_values_from_an_isolated_dotenv_file(
                 "POLICY_MAX_TTL_SECONDS=7200",
                 "QUOTE_TTL_SECONDS=900",
                 "CORS_ALLOWED_ORIGINS=https://console.example.com,https://admin.example.com",
+                "WEBAUTHN_EXPECTED_ORIGINS=https://console.example.com,https://admin.example.com",
+                "WEBAUTHN_RP_ID=example.com",
             )
         ),
         encoding="utf-8",
@@ -176,14 +180,18 @@ def test_settings_reject_non_postgresql_or_non_network_urls(database_url: str) -
 
 
 @pytest.mark.parametrize(
-    ("configured_value", "expected"),
+    ("configured_value", "expected", "rp_id", "expected_webauthn_origins"),
     [
         (
             "http://localhost:3000,http://127.0.0.1:3000",
             ["http://localhost:3000", "http://127.0.0.1:3000"],
+            "localhost",
+            ["http://localhost:3000"],
         ),
         (
             '["https://console.example.com", "https://admin.example.com/"]',
+            ["https://console.example.com", "https://admin.example.com"],
+            "example.com",
             ["https://console.example.com", "https://admin.example.com"],
         ),
     ],
@@ -191,8 +199,14 @@ def test_settings_reject_non_postgresql_or_non_network_urls(database_url: str) -
 def test_settings_parse_supported_cors_formats(
     configured_value: str,
     expected: list[str],
+    rp_id: str,
+    expected_webauthn_origins: list[str],
 ) -> None:
-    settings = build_settings(cors_allowed_origins=configured_value)
+    settings = build_settings(
+        cors_allowed_origins=configured_value,
+        webauthn_expected_origins=expected_webauthn_origins,
+        webauthn_rp_id=rp_id,
+    )
 
     assert settings.cors_allowed_origins == expected
 

@@ -3,7 +3,10 @@
 import { useEffect, useId, useRef, useState } from "react";
 import type { FormEvent } from "react";
 
+import { useAccountSession } from "@/components/account-session";
+import type { AuthenticatedRequester } from "@/components/account-session";
 import { TrustedApproval } from "@/components/trusted-approval";
+import { ApiRequestFailure } from "@/lib/api-client";
 
 type JsonPrimitive = boolean | null | number | string;
 type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
@@ -73,7 +76,6 @@ type PolicyEvaluationResponse = {
 };
 
 type PolicyDraft = {
-  subjectRef: string;
   maximumAmount: string;
   expiresInSeconds: string;
   restrictCurrency: boolean;
@@ -84,7 +86,7 @@ type PolicyDraft = {
 };
 
 type DraftErrors = Partial<
-  Record<"subjectRef" | "maximumAmount" | "expiresInSeconds", string>
+  Record<"maximumAmount" | "expiresInSeconds", string>
 >;
 
 type CreationState =
@@ -102,7 +104,6 @@ type EvaluationState =
 type RequestKind = "creation" | "evaluation";
 
 type PolicyCreatePayload = {
-  subject_ref: string;
   maximum_amount: number;
   allowed_currencies: string[] | null;
   allowed_merchant_ids: string[] | null;
@@ -240,79 +241,19 @@ function isPolicyEvaluationResponse(
   );
 }
 
-function safeMessage(value: unknown): string | null {
-  if (typeof value !== "string") {
-    return null;
-  }
-
-  const message = value
-    .replace(/[\u0000-\u001f\u007f]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  return message ? message.slice(0, 240) : null;
-}
-
-function safeDetailMessages(value: unknown): string[] {
-  if (Array.isArray(value)) {
-    return value.slice(0, 3).flatMap((item) => {
-      if (!isRecord(item)) {
-        return [];
-      }
-
-      const message = safeMessage(item.message) ?? safeMessage(item.msg);
-      return message ? [message] : [];
-    });
-  }
-
-  if (isRecord(value)) {
-    const message = safeMessage(value.message);
-    const reasonCode = safeMessage(value.reason_code);
-    const issues = safeDetailMessages(value.issues);
-
-    return [reasonCode, message, ...issues].filter(
-      (item): item is string => item !== null,
-    );
-  }
-
-  const message = safeMessage(value);
-  return message ? [message] : [];
-}
-
-function apiErrorMessage(
-  kind: RequestKind,
-  status: number,
-  body: unknown,
-): string {
-  const detail = isRecord(body)
-    ? safeDetailMessages(body.detail).slice(0, 3).join(" ")
-    : "";
-  const subject = kind === "creation" ? "policy" : "policy evaluation";
-
-  if (status === 404) {
-    return `The ${subject} could not be completed because the policy or quote was not found. No payment was attempted.`;
-  }
-
-  if (status === 422) {
-    return `The server rejected the ${subject} request.${detail ? ` ${detail}` : ""} No payment was attempted.`;
-  }
-
-  if (status >= 500) {
-    return `The ${subject} service is temporarily unavailable. No payment was attempted.`;
-  }
-
-  return `The ${subject} request failed with HTTP ${status}. No payment was attempted.`;
-}
-
 function requestErrorMessage(kind: RequestKind, error: unknown): string {
-  if (error instanceof DOMException && error.name === "AbortError") {
+  if (
+    error instanceof ApiRequestFailure &&
+    (error.code === "API_REQUEST_TIMEOUT" ||
+      error.code === "API_REQUEST_CANCELLED")
+  ) {
     return kind === "creation"
       ? "The policy request timed out. It may still have been created; submitting again can create a separate policy. No payment was attempted."
       : "The policy evaluation timed out. It may still have been recorded; submitting again can create a separate evaluation. No payment was attempted.";
   }
 
-  if (error instanceof TypeError) {
-    return `The policy ${kind === "creation" ? "endpoint" : "evaluation endpoint"} could not be reached. Confirm FastAPI is running and CORS allows this origin. No payment was attempted.`;
+  if (error instanceof ApiRequestFailure) {
+    return `${error.code}: ${error.message} No payment was attempted.`;
   }
 
   if (error instanceof PolicyRequestFailure) {
@@ -323,40 +264,21 @@ function requestErrorMessage(kind: RequestKind, error: unknown): string {
 }
 
 async function createPolicy(
+  requestAuthenticated: AuthenticatedRequester,
   endpoint: string,
   payload: PolicyCreatePayload,
+  accountId: string,
   signal: AbortSignal,
 ): Promise<PolicyResponse> {
-  const response = await fetch(endpoint, {
+  const body = await requestAuthenticated(endpoint, {
     method: "POST",
-    cache: "no-store",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
+    body: payload,
     signal,
   });
 
-  let body: unknown = null;
-
-  try {
-    body = await response.json();
-  } catch {
-    if (response.status === 201) {
-      throw new PolicyRequestFailure(
-        "The server created an unreadable policy response. No payment was attempted.",
-      );
-    }
-  }
-
-  if (response.status !== 201) {
-    throw new PolicyRequestFailure(apiErrorMessage("creation", response.status, body));
-  }
-
-  if (!isPolicyResponse(body)) {
+  if (!isPolicyResponse(body) || body.subject_ref !== accountId) {
     throw new PolicyRequestFailure(
-      "The server returned an unexpected policy response. No payment was attempted.",
+      "The server returned a policy that was not bound to the signed-in account. No payment was attempted.",
     );
   }
 
@@ -364,39 +286,17 @@ async function createPolicy(
 }
 
 async function evaluatePolicy(
+  requestAuthenticated: AuthenticatedRequester,
   endpoint: string,
   policyId: string,
   quoteId: string,
   signal: AbortSignal,
 ): Promise<PolicyEvaluationResponse> {
-  const response = await fetch(endpoint, {
+  const body = await requestAuthenticated(endpoint, {
     method: "POST",
-    cache: "no-store",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ policy_id: policyId, quote_id: quoteId }),
+    body: { policy_id: policyId, quote_id: quoteId },
     signal,
   });
-
-  let body: unknown = null;
-
-  try {
-    body = await response.json();
-  } catch {
-    if (response.status === 201) {
-      throw new PolicyRequestFailure(
-        "The server created an unreadable policy evaluation response. No payment was attempted.",
-      );
-    }
-  }
-
-  if (response.status !== 201) {
-    throw new PolicyRequestFailure(
-      apiErrorMessage("evaluation", response.status, body),
-    );
-  }
 
   if (
     !isPolicyEvaluationResponse(body) ||
@@ -413,7 +313,6 @@ async function evaluatePolicy(
 
 function initialDraft(quote: PolicyQuoteContext): PolicyDraft {
   return {
-    subjectRef: "",
     maximumAmount: quote.pricing.amount.toString(),
     expiresInSeconds: DEFAULT_POLICY_LIFETIME_SECONDS,
     restrictCurrency: true,
@@ -838,27 +737,28 @@ function RestrictionCheckbox({
   );
 }
 
-export function QuotePolicyEvaluator({
+function AuthenticatedQuotePolicyEvaluator({
+  accountId,
   apiBaseEndpoint,
   createEndpoint,
   evaluationEndpoint,
   quote,
+  requestAuthenticated,
 }: {
+  accountId: string;
   apiBaseEndpoint: string;
   createEndpoint: string;
   evaluationEndpoint: string;
   quote: PolicyQuoteContext;
+  requestAuthenticated: AuthenticatedRequester;
 }) {
   const panelId = useId();
-  const subjectId = useId();
-  const subjectErrorId = useId();
   const amountId = useId();
   const amountHelpId = useId();
   const amountErrorId = useId();
   const expiryId = useId();
   const expiryHelpId = useId();
   const expiryErrorId = useId();
-  const subjectRef = useRef<HTMLInputElement>(null);
   const amountRef = useRef<HTMLInputElement>(null);
   const expiryRef = useRef<HTMLInputElement>(null);
   const creationControllerRef = useRef<AbortController | null>(null);
@@ -950,11 +850,6 @@ export function QuotePolicyEvaluator({
     event.preventDefault();
 
     const errors: DraftErrors = {};
-    const normalizedSubject = draft.subjectRef.trim();
-    if (!normalizedSubject) {
-      errors.subjectRef = "Enter a subject reference for this policy.";
-    }
-
     const maximumAmount = parseCanonicalInteger(
       draft.maximumAmount,
       "Maximum amount",
@@ -975,9 +870,7 @@ export function QuotePolicyEvaluator({
 
     if (Object.keys(errors).length > 0) {
       setDraftErrors(errors);
-      if (errors.subjectRef) {
-        subjectRef.current?.focus();
-      } else if (errors.maximumAmount) {
+      if (errors.maximumAmount) {
         amountRef.current?.focus();
       } else {
         expiryRef.current?.focus();
@@ -990,7 +883,6 @@ export function QuotePolicyEvaluator({
     }
 
     const payload: PolicyCreatePayload = {
-      subject_ref: normalizedSubject,
       maximum_amount: maximumAmount.value,
       allowed_currencies: draft.restrictCurrency
         ? [quote.pricing.currency]
@@ -1017,7 +909,13 @@ export function QuotePolicyEvaluator({
     setEvaluationState({ kind: "idle" });
 
     try {
-      const policy = await createPolicy(createEndpoint, payload, controller.signal);
+      const policy = await createPolicy(
+        requestAuthenticated,
+        createEndpoint,
+        payload,
+        accountId,
+        controller.signal,
+      );
       if (creationControllerRef.current === controller) {
         setCreationState({ kind: "resolved", policy });
       }
@@ -1052,6 +950,7 @@ export function QuotePolicyEvaluator({
 
     try {
       const evaluation = await evaluatePolicy(
+        requestAuthenticated,
         evaluationEndpoint,
         policy.id,
         quote.id,
@@ -1080,7 +979,7 @@ export function QuotePolicyEvaluator({
     setDraftErrors({});
     setCreationState({ kind: "idle" });
     setEvaluationState({ kind: "idle" });
-    window.setTimeout(() => subjectRef.current?.focus(), 0);
+    window.setTimeout(() => amountRef.current?.focus(), 0);
   };
 
   const toggleLabel = expanded ? "Hide policy check" : "Check purchase policy";
@@ -1148,30 +1047,15 @@ export function QuotePolicyEvaluator({
                   </div>
                 </div>
 
-                <div>
-                  <label htmlFor={subjectId} className="text-xs font-medium text-slate-200">
-                    Subject reference
-                  </label>
-                  <p className="mt-1 text-[11px] leading-5 text-slate-500">
-                    A non-secret buyer or agent reference for this policy.
+                <div className="rounded-xl border border-emerald-300/10 bg-emerald-300/[0.03] px-3 py-2.5">
+                  <p className="text-xs font-medium text-emerald-100">
+                    Buyer ownership is server-derived
                   </p>
-                  <input
-                    ref={subjectRef}
-                    id={subjectId}
-                    type="text"
-                    value={draft.subjectRef}
-                    required
-                    autoComplete="off"
-                    aria-invalid={draftErrors.subjectRef ? true : undefined}
-                    aria-describedby={draftErrors.subjectRef ? subjectErrorId : undefined}
-                    onChange={(event) => updateDraft("subjectRef", event.target.value)}
-                    className="mt-2 w-full rounded-xl border border-white/10 bg-black/25 px-3 py-2.5 text-sm text-slate-200 outline-none transition focus:border-cyan-300/35 focus:ring-2 focus:ring-cyan-300/10 disabled:cursor-wait disabled:opacity-60"
-                  />
-                  {draftErrors.subjectRef ? (
-                    <p id={subjectErrorId} role="alert" className="mt-2 text-xs text-rose-200">
-                      {draftErrors.subjectRef}
-                    </p>
-                  ) : null}
+                  <p className="mt-1 break-all text-[11px] leading-5 text-slate-400">
+                    This policy will belong to the signed-in account{" "}
+                    <span className="font-mono">{accountId}</span>. The browser
+                    cannot submit a different subject reference.
+                  </p>
                 </div>
 
                 <div>
@@ -1349,5 +1233,62 @@ export function QuotePolicyEvaluator({
         </div>
       ) : null}
     </div>
+  );
+}
+
+export function QuotePolicyEvaluator({
+  apiBaseEndpoint,
+  createEndpoint,
+  evaluationEndpoint,
+  quote,
+}: {
+  apiBaseEndpoint: string;
+  createEndpoint: string;
+  evaluationEndpoint: string;
+  quote: PolicyQuoteContext;
+}) {
+  const { state, sessionRevision, requestAuthenticated } = useAccountSession();
+
+  if (state.kind === "checking") {
+    return (
+      <div
+        role="status"
+        className="mt-5 rounded-xl border border-white/[0.08] bg-white/[0.025] px-4 py-3 text-xs text-slate-400"
+      >
+        Checking your account session before enabling buyer policy controls…
+      </div>
+    );
+  }
+
+  if (state.kind === "anonymous") {
+    return (
+      <div className="mt-5 rounded-xl border border-violet-300/15 bg-violet-300/[0.035] px-4 py-4">
+        <p className="text-sm font-semibold text-violet-100">
+          Sign in to continue
+        </p>
+        <p className="mt-2 text-xs leading-5 text-slate-400">
+          This quote is public, but creating or evaluating a buyer policy requires
+          a passkey-authenticated MeterGate account.
+        </p>
+        <a
+          href="#buyer-account"
+          className="mt-3 inline-flex rounded-lg border border-violet-300/20 bg-violet-300/[0.06] px-3 py-2 text-xs font-medium text-violet-100 transition hover:border-violet-300/35 hover:bg-violet-300/[0.1] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-violet-200"
+        >
+          Sign in to continue
+        </a>
+      </div>
+    );
+  }
+
+  return (
+    <AuthenticatedQuotePolicyEvaluator
+      key={`${state.session.account.id}:${sessionRevision}`}
+      accountId={state.session.account.id}
+      apiBaseEndpoint={apiBaseEndpoint}
+      createEndpoint={createEndpoint}
+      evaluationEndpoint={evaluationEndpoint}
+      quote={quote}
+      requestAuthenticated={requestAuthenticated}
+    />
   );
 }

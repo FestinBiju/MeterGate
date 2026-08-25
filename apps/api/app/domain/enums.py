@@ -3,6 +3,12 @@
 from enum import StrEnum
 
 
+class AccountStatus(StrEnum):
+    PENDING = "pending"
+    ACTIVE = "active"
+    DISABLED = "disabled"
+
+
 class ApprovalIdentityStatus(StrEnum):
     ACTIVE = "active"
     DISABLED = "disabled"

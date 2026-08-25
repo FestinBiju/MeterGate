@@ -1,3 +1,5 @@
+import { AccountAuth } from "@/components/account-auth";
+import { AccountSessionProvider } from "@/components/account-session";
 import { ServiceCatalog } from "@/components/service-catalog";
 import { SystemStatus } from "@/components/system-status";
 
@@ -31,7 +33,7 @@ export default function Home() {
         <div className="grid gap-14 lg:grid-cols-[minmax(0,1.05fr)_minmax(25rem,0.95fr)] lg:items-center lg:gap-20">
           <section>
             <p className="mb-6 text-xs font-semibold uppercase tracking-[0.24em] text-cyan-300">
-              Developer infrastructure · Trusted approval
+              Authenticated buyer · Trusted approval
             </p>
             <h1 className="max-w-2xl text-5xl font-semibold tracking-[-0.045em] text-white sm:text-6xl lg:text-7xl">
               MeterGate
@@ -41,9 +43,9 @@ export default function Home() {
               services
             </p>
             <p className="mt-6 max-w-lg text-sm leading-6 text-slate-400 sm:text-base sm:leading-7">
-              Server-issued quotes and deterministic policy checks now lead to
-              explicit passkey-backed human approval—without crossing the money
-              boundary.
+              Passkey-first accounts bind deterministic buyer policies and
+              explicit human approval to one authenticated owner—without
+              crossing the money boundary.
             </p>
 
             <ul
@@ -64,7 +66,10 @@ export default function Home() {
           <SystemStatus />
         </div>
 
-        <ServiceCatalog />
+        <AccountSessionProvider>
+          <AccountAuth />
+          <ServiceCatalog />
+        </AccountSessionProvider>
       </main>
 
       <footer className="relative border-t border-white/[0.06]">

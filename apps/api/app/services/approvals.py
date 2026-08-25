@@ -28,13 +28,15 @@ from app.domain.approval_hashing import (
     review_policy_checks,
 )
 from app.domain.base64url import decode_base64url, encode_base64url
-from app.domain.enums import ApprovalIdentityStatus, PolicyDecision, PurchaseType
+from app.domain.enums import AccountStatus, ApprovalIdentityStatus, PolicyDecision, PurchaseType
 from app.domain.exceptions import (
     ApprovalConflictError,
     ApprovalExpiredError,
     ApprovalIntegrityError,
     ApprovalNotFoundError,
     ApprovalVerificationError,
+    AuthenticationForbiddenError,
+    AuthenticationUnauthorizedError,
     PolicyIntegrityError,
     QuoteIntegrityError,
     ResourceNotFoundError,
@@ -45,12 +47,14 @@ from app.domain.integrity import IntegrityStructureError
 from app.domain.policy_hashing import verify_policy_integrity
 from app.domain.quote_integrity import verify_quote_integrity
 from app.models import (
+    Account,
     ApprovalIdentity,
     BuyerPolicy,
     PasskeyCredential,
     PurchaseAuthorization,
     Quote,
 )
+from app.repositories.accounts import AccountRepository
 from app.repositories.approval_identities import ApprovalIdentityRepository
 from app.repositories.authorizations import PurchaseAuthorizationRepository
 from app.repositories.buyer_policies import BuyerPolicyRepository
@@ -96,6 +100,7 @@ class ApprovalApplicationService:
 
     def __init__(
         self,
+        account_repository: AccountRepository,
         identity_repository: ApprovalIdentityRepository,
         credential_repository: PasskeyCredentialRepository,
         authorization_repository: PurchaseAuthorizationRepository,
@@ -111,11 +116,13 @@ class ApprovalApplicationService:
     ) -> None:
         if challenge_ttl <= timedelta(0) or authorization_ttl <= timedelta(0):
             raise ValueError("Approval lifetimes must be positive")
+        self._account_repository = account_repository
         self._identity_repository = identity_repository
         self._credential_repository = credential_repository
         self._authorization_repository = authorization_repository
         self._policy_repository = policy_repository
         self._quote_repository = quote_repository
+        self._evaluation_repository = evaluation_repository
         self._evaluation_service = PolicyEvaluationApplicationService(
             policy_repository,
             quote_repository,
@@ -131,11 +138,23 @@ class ApprovalApplicationService:
     async def create_challenge(
         self,
         payload: ApprovalChallengeCreate,
+        *,
+        account_id: str,
+        account_session_version: int,
     ) -> ApprovalChallengeResponse:
+        await self._get_active_account_for_update(
+            account_id,
+            expected_session_version=account_session_version,
+        )
+        identity = await self._get_active_identity_for_account_update(account_id)
+        await self._require_evaluation_ownership(
+            payload.evaluation_id,
+            identity,
+            account_id=account_id,
+        )
         checked_at = self._read_clock()
         context = await self._verified_context(payload.evaluation_id, checked_at)
-        identity = await self._get_active_identity_for_update(payload.approval_identity_id)
-        self._require_subject_binding(identity, context.policy)
+        self._require_account_policy_ownership(identity, context.policy, account_id=account_id)
         context = self._bind_context_identity(context, identity)
         credentials = await self._credential_repository.list_for_identity(identity.id)
         if not credentials:
@@ -169,6 +188,7 @@ class ApprovalApplicationService:
             state = ApprovalChallengeState(
                 challenge_id=challenge_id,
                 challenge=encode_base64url(challenge),
+                account_id=account_id,
                 approval_identity_id=identity.id,
                 evaluation_id=context.evaluation.id,
                 policy_id=context.policy.id,
@@ -209,15 +229,31 @@ class ApprovalApplicationService:
         self,
         challenge_id: str,
         payload: ApprovalAssertionVerify,
+        *,
+        account_id: str,
+        account_session_version: int,
     ) -> PurchaseAuthorizationResponse:
-        state = await self._consume_challenge(challenge_id)
+        state = await self._consume_challenge(challenge_id, account_id=account_id)
         challenge = self._decode_stored_challenge(state)
 
-        identity = await self._get_active_identity_for_update(state.approval_identity_id)
+        if state.account_id != account_id:
+            raise AuthenticationForbiddenError(
+                "The authenticated account does not own this approval challenge",
+                "AUTH_RESOURCE_OWNERSHIP_MISMATCH",
+            )
+
+        await self._get_active_account_for_update(
+            account_id,
+            expected_session_version=account_session_version,
+        )
+        identity = await self._get_active_identity_for_update(
+            state.approval_identity_id,
+            account_id=account_id,
+        )
         first_checked_at = self._read_clock()
         self._require_challenge_fresh(state, first_checked_at)
         context = await self._verified_context(state.evaluation_id, first_checked_at)
-        self._require_subject_binding(identity, context.policy)
+        self._require_account_policy_ownership(identity, context.policy, account_id=account_id)
         context = self._bind_context_identity(context, identity)
         self._verify_challenge_binding(state, context)
 
@@ -266,7 +302,11 @@ class ApprovalApplicationService:
 
         final_checked_at = self._read_clock()
         final_context = await self._verified_context(state.evaluation_id, final_checked_at)
-        self._require_subject_binding(identity, final_context.policy)
+        self._require_account_policy_ownership(
+            identity,
+            final_context.policy,
+            account_id=account_id,
+        )
         final_context = self._bind_context_identity(final_context, identity)
         self._verify_challenge_binding(state, final_context)
         authorized_at = self._read_clock()
@@ -290,7 +330,7 @@ class ApprovalApplicationService:
             authorization_version=AUTHORIZATION_VERSION,
             approval_identity_id=identity.id,
             passkey_credential_id=credential.id,
-            subject_ref=identity.subject_ref,
+            subject_ref=final_context.policy.subject_ref,
             evaluation_id=final_context.evaluation.id,
             policy_id=final_context.policy.id,
             policy_hash=final_context.policy.policy_hash,
@@ -317,7 +357,7 @@ class ApprovalApplicationService:
             quote_hash=final_context.quote.quote_hash,
             merchant_id=final_context.quote.merchant_id,
             service_id=final_context.quote.service_id,
-            subject_ref=identity.subject_ref,
+            subject_ref=final_context.policy.subject_ref,
             amount=final_context.quote.amount,
             currency=final_context.quote.currency,
             purchase_type=final_context.quote.purchase_type,
@@ -345,12 +385,20 @@ class ApprovalApplicationService:
     async def get_authorization(
         self,
         authorization_id: str,
+        *,
+        account_id: str,
     ) -> PurchaseAuthorizationResponse:
         authorization = await self._authorization_repository.get(authorization_id)
         if authorization is None:
             raise ApprovalNotFoundError(
                 f"Purchase authorization '{authorization_id}' was not found",
                 "APPROVAL_AUTHORIZATION_NOT_FOUND",
+            )
+        identity = await self._identity_repository.get(authorization.approval_identity_id)
+        if identity is None or identity.account_id != account_id:
+            raise AuthenticationForbiddenError(
+                "The authenticated account does not own this purchase authorization",
+                "AUTH_RESOURCE_OWNERSHIP_MISMATCH",
             )
         if not compare_digest(
             recompute_authorization_hash(authorization),
@@ -374,7 +422,7 @@ class ApprovalApplicationService:
         now: datetime,
     ) -> _VerifiedApprovalContext:
         try:
-            evaluation = await self._evaluation_service.get(evaluation_id)
+            evaluation = await self._evaluation_service.get_verified(evaluation_id)
         except ResourceNotFoundError as error:
             raise ApprovalNotFoundError(
                 f"Policy evaluation '{evaluation_id}' was not found",
@@ -461,6 +509,27 @@ class ApprovalApplicationService:
             service_name=service_name,
         )
 
+    async def _require_evaluation_ownership(
+        self,
+        evaluation_id: str,
+        identity: ApprovalIdentity,
+        *,
+        account_id: str,
+    ) -> None:
+        evaluation = await self._evaluation_repository.get(evaluation_id)
+        if evaluation is None:
+            raise ApprovalNotFoundError(
+                f"Policy evaluation '{evaluation_id}' was not found",
+                "APPROVAL_EVALUATION_NOT_FOUND",
+            )
+        policy = await self._policy_repository.get(evaluation.policy_id)
+        if policy is None:
+            raise ApprovalIntegrityError(
+                "Approval evaluation policy is missing",
+                "INTEGRITY_POLICY_EVALUATION_DATA_INVALID",
+            )
+        self._require_account_policy_ownership(identity, policy, account_id=account_id)
+
     @staticmethod
     def _bind_context_identity(
         context: _VerifiedApprovalContext,
@@ -478,13 +547,32 @@ class ApprovalApplicationService:
             service_name=context.service_name,
         )
 
-    async def _get_active_identity(self, identity_id: str) -> ApprovalIdentity:
-        identity = await self._identity_repository.get(identity_id)
-        return self._validate_active_identity(identity, identity_id)
-
-    async def _get_active_identity_for_update(self, identity_id: str) -> ApprovalIdentity:
+    async def _get_active_identity_for_update(
+        self,
+        identity_id: str,
+        *,
+        account_id: str,
+    ) -> ApprovalIdentity:
         identity = await self._identity_repository.get_for_update(identity_id)
-        return self._validate_active_identity(identity, identity_id)
+        identity = self._validate_active_identity(identity, identity_id)
+        if identity.account_id != account_id:
+            raise AuthenticationForbiddenError(
+                "The authenticated account does not own this approval identity",
+                "AUTH_RESOURCE_OWNERSHIP_MISMATCH",
+            )
+        return identity
+
+    async def _get_active_identity_for_account_update(
+        self,
+        account_id: str,
+    ) -> ApprovalIdentity:
+        identity = await self._identity_repository.get_by_account_id_for_update(account_id)
+        if identity is None:
+            raise ApprovalNotFoundError(
+                "The authenticated account has no approval identity",
+                "APPROVAL_IDENTITY_NOT_FOUND",
+            )
+        return self._validate_active_identity(identity, identity.id)
 
     @staticmethod
     def _validate_active_identity(
@@ -504,12 +592,45 @@ class ApprovalApplicationService:
         return identity
 
     @staticmethod
-    def _require_subject_binding(identity: ApprovalIdentity, policy: BuyerPolicy) -> None:
-        if not compare_digest(identity.subject_ref, policy.subject_ref):
-            raise ApprovalConflictError(
-                "Approval identity subject does not match the buyer policy subject",
-                "APPROVAL_IDENTITY_SUBJECT_MISMATCH",
+    def _require_account_policy_ownership(
+        identity: ApprovalIdentity,
+        policy: BuyerPolicy,
+        *,
+        account_id: str,
+    ) -> None:
+        if identity.account_id != account_id or policy.subject_ref not in {
+            account_id,
+            identity.subject_ref,
+        }:
+            raise AuthenticationForbiddenError(
+                "The authenticated account does not own the approval policy",
+                "AUTH_RESOURCE_OWNERSHIP_MISMATCH",
             )
+
+    async def _get_active_account_for_update(
+        self,
+        account_id: str,
+        *,
+        expected_session_version: int,
+    ) -> Account:
+        account = await self._account_repository.get_for_update(account_id)
+        if account is None or account.session_version != expected_session_version:
+            raise AuthenticationUnauthorizedError(
+                "The authenticated session no longer matches its account",
+                "AUTH_SESSION_INVALID",
+            )
+        status = AccountStatus(account.status)
+        if status is AccountStatus.DISABLED:
+            raise AuthenticationUnauthorizedError(
+                "The authenticated account is disabled",
+                "AUTH_ACCOUNT_DISABLED",
+            )
+        if status is not AccountStatus.ACTIVE:
+            raise AuthenticationUnauthorizedError(
+                "The authenticated account is not active",
+                "AUTH_ACCOUNT_PENDING",
+            )
+        return account
 
     def _require_context_fresh(
         self,
@@ -554,9 +675,17 @@ class ApprovalApplicationService:
             for binding in state.allowed_credentials
         )
 
-    async def _consume_challenge(self, challenge_id: str) -> ApprovalChallengeState:
+    async def _consume_challenge(
+        self,
+        challenge_id: str,
+        *,
+        account_id: str,
+    ) -> ApprovalChallengeState:
         try:
-            return await self._challenge_store.consume_approval(challenge_id)
+            return await self._challenge_store.consume_approval(
+                challenge_id,
+                account_id=account_id,
+            )
         except ChallengeNotFoundError as error:
             raise ApprovalNotFoundError(
                 str(error),

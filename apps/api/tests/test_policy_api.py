@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from typing import Any
 
 from fastapi.testclient import TestClient
 
 from app.api.v1.dependencies import (
     get_buyer_policy_application_service,
     get_policy_evaluation_application_service,
+    require_authenticated_mutation,
+    require_current_account,
 )
 from app.domain.enums import PolicyDecision
 from app.domain.exceptions import (
@@ -37,13 +41,22 @@ EVALUATION_ID = "pye_00000000000000000000000001"
 QUOTE_ID = "qte_00000000000000000000000001"
 MERCHANT_ID = "mrc_00000000000000000000000001"
 SERVICE_ID = "svc_00000000000000000000000001"
+ACCOUNT_ID = "acct_00000000000000000000000001"
+IDENTITY_ID = "aid_00000000000000000000000001"
 CREATED_AT = datetime(2026, 8, 25, 12, tzinfo=UTC)
+
+
+def authenticated_context() -> Any:
+    return SimpleNamespace(
+        account=SimpleNamespace(id=ACCOUNT_ID),
+        approval_identity=SimpleNamespace(id=IDENTITY_ID, subject_ref=ACCOUNT_ID),
+    )
 
 
 def policy_response() -> BuyerPolicyResponse:
     return BuyerPolicyResponse(
         id=POLICY_ID,
-        subject_ref="dev-user-001",
+        subject_ref=ACCOUNT_ID,
         constraints=PolicyConstraints(
             maximum_amount=1000,
             allowed_currencies=["INR"],
@@ -100,17 +113,31 @@ class StubPolicyApplicationService:
     def __init__(self, *, error: Exception | None = None) -> None:
         self.error = error
         self.last_payload: BuyerPolicyCreate | None = None
+        self.last_subject_ref: str | None = None
+        self.last_owned_subject_refs: frozenset[str] | None = None
 
-    async def create(self, payload: BuyerPolicyCreate) -> BuyerPolicyResponse:
+    async def create(
+        self,
+        payload: BuyerPolicyCreate,
+        *,
+        subject_ref: str,
+    ) -> BuyerPolicyResponse:
         if self.error is not None:
             raise self.error
         self.last_payload = payload
+        self.last_subject_ref = subject_ref
         return policy_response()
 
-    async def get(self, policy_id: str) -> BuyerPolicyResponse:
+    async def get(
+        self,
+        policy_id: str,
+        *,
+        owned_subject_refs: frozenset[str],
+    ) -> BuyerPolicyResponse:
         if self.error is not None:
             raise self.error
         assert policy_id == POLICY_ID
+        self.last_owned_subject_refs = owned_subject_refs
         return policy_response()
 
 
@@ -124,17 +151,30 @@ class StubEvaluationApplicationService:
         self.response = response or evaluation_response()
         self.error = error
         self.last_payload: PolicyEvaluationCreate | None = None
+        self.last_owned_subject_refs: frozenset[str] | None = None
 
-    async def create(self, payload: PolicyEvaluationCreate) -> PolicyEvaluationResponse:
+    async def create(
+        self,
+        payload: PolicyEvaluationCreate,
+        *,
+        owned_subject_refs: frozenset[str],
+    ) -> PolicyEvaluationResponse:
         if self.error is not None:
             raise self.error
         self.last_payload = payload
+        self.last_owned_subject_refs = owned_subject_refs
         return self.response
 
-    async def get(self, evaluation_id: str) -> PolicyEvaluationResponse:
+    async def get(
+        self,
+        evaluation_id: str,
+        *,
+        owned_subject_refs: frozenset[str],
+    ) -> PolicyEvaluationResponse:
         if self.error is not None:
             raise self.error
         assert evaluation_id == EVALUATION_ID
+        self.last_owned_subject_refs = owned_subject_refs
         return self.response
 
 
@@ -150,12 +190,14 @@ def client_with_policy_services(
     client.app.dependency_overrides[get_policy_evaluation_application_service] = lambda: (
         evaluation_service or StubEvaluationApplicationService()
     )
+    current = authenticated_context()
+    client.app.dependency_overrides[require_current_account] = lambda: current
+    client.app.dependency_overrides[require_authenticated_mutation] = lambda: current
     return client
 
 
 def policy_request(**overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
-        "subject_ref": "dev-user-001",
         "maximum_amount": 1000,
         "expires_in_seconds": 900,
     }
@@ -192,6 +234,7 @@ def test_policy_create_omits_allowlists_as_unconstrained_and_returns_created_at(
     assert application.last_payload.allowed_service_ids is None
     assert application.last_payload.allowed_service_types is None
     assert application.last_payload.allowed_purchase_types is None
+    assert application.last_subject_ref == ACCOUNT_ID
     assert response.json()["created_at"] == "2026-08-25T12:00:00Z"
 
 
@@ -211,7 +254,11 @@ def test_policy_create_sorts_allowlists_and_rejects_duplicates_or_server_fields(
     )
     injected = client.post(
         "/api/v1/policies",
-        json=policy_request(policy_hash=f"sha256:{'0' * 64}", decision="allow"),
+        json=policy_request(
+            subject_ref="acct_00000000000000000000000002",
+            policy_hash=f"sha256:{'0' * 64}",
+            decision="allow",
+        ),
     )
 
     assert created.status_code == 201
@@ -272,6 +319,7 @@ def test_evaluation_request_is_exact_and_denial_evidence_is_returned(
         policy_id=POLICY_ID,
         quote_id=QUOTE_ID,
     )
+    assert application.last_owned_subject_refs == frozenset({ACCOUNT_ID})
     assert created.json()["decision"] == "deny"
     assert created.json()["reason_codes"] == ["DENY_AMOUNT_EXCEEDS_LIMIT"]
     assert created.json()["evaluation_version"] == "1"

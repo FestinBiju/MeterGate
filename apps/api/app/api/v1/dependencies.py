@@ -1,14 +1,22 @@
-"""Request-scoped application-service dependencies."""
+"""Request-scoped application-service and authenticated-principal dependencies."""
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
+from hmac import compare_digest
 from typing import Annotated
 
-from fastapi import Depends, Request
+from fastapi import Depends, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache.approval_challenges import ChallengeStore
+from app.cache.auth import AuthStore
 from app.core.config import Settings
 from app.db.session import get_session
+from app.domain.enums import AccountStatus
+from app.domain.exceptions import (
+    AuthenticationForbiddenError,
+    AuthenticationUnauthorizedError,
+)
+from app.repositories.accounts import AccountRepository
 from app.repositories.approval_identities import ApprovalIdentityRepository
 from app.repositories.authorizations import PurchaseAuthorizationRepository
 from app.repositories.buyer_policies import BuyerPolicyRepository
@@ -18,6 +26,7 @@ from app.repositories.policy_evaluations import PolicyEvaluationRepository
 from app.repositories.quotes import QuoteRepository
 from app.repositories.services import ServiceRepository
 from app.services.approvals import ApprovalApplicationService
+from app.services.auth import AuthenticationApplicationService, ResolvedAuthSession
 from app.services.catalog import CatalogApplicationService
 from app.services.merchants import MerchantApplicationService
 from app.services.passkeys import PasskeyApplicationService
@@ -56,6 +65,16 @@ def get_webauthn_backend(request: Request) -> WebAuthnBackend:
 
 ChallengeStoreDependency = Annotated[ChallengeStore, Depends(get_challenge_store)]
 WebAuthnBackendDependency = Annotated[WebAuthnBackend, Depends(get_webauthn_backend)]
+
+
+def get_auth_store(request: Request) -> AuthStore:
+    auth_store = getattr(request.app.state, "auth_store", None)
+    if not isinstance(auth_store, AuthStore):
+        raise RuntimeError("Authentication storage is not configured")
+    return auth_store
+
+
+AuthStoreDependency = Annotated[AuthStore, Depends(get_auth_store)]
 
 
 def get_merchant_application_service(
@@ -117,6 +136,7 @@ def get_passkey_application_service(
     webauthn_backend: WebAuthnBackendDependency,
 ) -> PasskeyApplicationService:
     return PasskeyApplicationService(
+        AccountRepository(session),
         ApprovalIdentityRepository(session),
         PasskeyCredentialRepository(session),
         challenge_store,
@@ -132,6 +152,7 @@ def get_approval_application_service(
     webauthn_backend: WebAuthnBackendDependency,
 ) -> ApprovalApplicationService:
     return ApprovalApplicationService(
+        AccountRepository(session),
         ApprovalIdentityRepository(session),
         PasskeyCredentialRepository(session),
         PurchaseAuthorizationRepository(session),
@@ -143,6 +164,193 @@ def get_approval_application_service(
         challenge_ttl=timedelta(seconds=settings.webauthn_challenge_ttl_seconds),
         authorization_ttl=timedelta(seconds=settings.authorization_ttl_seconds),
     )
+
+
+def get_authentication_application_service(
+    session: SessionDependency,
+    settings: SettingsDependency,
+    auth_store: AuthStoreDependency,
+    webauthn_backend: WebAuthnBackendDependency,
+) -> AuthenticationApplicationService:
+    return AuthenticationApplicationService(
+        AccountRepository(session),
+        ApprovalIdentityRepository(session),
+        PasskeyCredentialRepository(session),
+        auth_store,
+        webauthn_backend,
+        challenge_ttl=timedelta(seconds=settings.webauthn_challenge_ttl_seconds),
+        session_ttl=timedelta(seconds=settings.auth_session_ttl_seconds),
+    )
+
+
+AuthenticationApplicationDependency = Annotated[
+    AuthenticationApplicationService,
+    Depends(get_authentication_application_service),
+]
+
+
+def _single_header(request: Request, name: bytes) -> str | None:
+    """Return one raw header value, rejecting ambiguous duplicate evidence."""
+    values = [value for key, value in request.scope.get("headers", ()) if key.lower() == name]
+    if not values:
+        return None
+    if len(values) != 1:
+        return ""
+    try:
+        return values[0].decode("latin-1")
+    except UnicodeDecodeError:
+        return ""
+
+
+def require_allowed_origin(
+    request: Request,
+    settings: SettingsDependency,
+) -> str:
+    """Require exactly one configured WebAuthn-capable browser Origin."""
+    origin = _single_header(request, b"origin")
+    origin_allowed = (
+        origin is not None
+        and origin != ""
+        and any(
+            len(expected) == len(origin) and compare_digest(expected, origin)
+            for expected in settings.webauthn_expected_origins
+        )
+    )
+    if not origin_allowed:
+        raise AuthenticationForbiddenError(
+            "Request Origin is not allowed",
+            "AUTH_ORIGIN_NOT_ALLOWED",
+        )
+    return origin
+
+
+AllowedOriginDependency = Annotated[str, Depends(require_allowed_origin)]
+
+
+def require_safe_authenticated_origin(
+    request: Request,
+    settings: SettingsDependency,
+) -> str | None:
+    """Block credentialed cross-origin reads outside the trusted browser origins."""
+    origin = _single_header(request, b"origin")
+    if origin is None:
+        return None
+    origin_allowed = origin != "" and any(
+        len(expected) == len(origin) and compare_digest(expected, origin)
+        for expected in settings.webauthn_expected_origins
+    )
+    if not origin_allowed:
+        raise AuthenticationForbiddenError(
+            "Request Origin is not allowed",
+            "AUTH_ORIGIN_NOT_ALLOWED",
+        )
+    return origin
+
+
+AuthenticatedOriginDependency = Annotated[
+    str | None,
+    Depends(require_safe_authenticated_origin),
+]
+
+
+def disable_private_caching(response: Response) -> None:
+    """Keep cookie-authenticated and ceremony responses out of shared caches."""
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Pragma"] = "no-cache"
+
+
+async def require_current_account(
+    request: Request,
+    response: Response,
+    settings: SettingsDependency,
+    application_service: AuthenticationApplicationDependency,
+    authenticated_origin: AuthenticatedOriginDependency,
+) -> ResolvedAuthSession:
+    """Resolve the opaque cookie into an active account on every protected request."""
+    del authenticated_origin
+    disable_private_caching(response)
+    session_id = request.cookies.get(settings.auth_cookie_name)
+    if not session_id:
+        raise AuthenticationUnauthorizedError(
+            "An authenticated session is required",
+            "AUTH_SESSION_REQUIRED",
+        )
+    return await application_service.resolve_session(session_id)
+
+
+CurrentAccountDependency = Annotated[
+    ResolvedAuthSession,
+    Depends(require_current_account),
+]
+
+
+async def require_authenticated_mutation(
+    request: Request,
+    settings: SettingsDependency,
+    session: SessionDependency,
+    current: CurrentAccountDependency,
+    origin: AllowedOriginDependency,
+) -> ResolvedAuthSession:
+    """Apply strict Origin and synchronizer-token checks to cookie mutations."""
+    del origin
+    csrf_token = _single_header(request, b"x-csrf-token")
+    if csrf_token is None:
+        raise AuthenticationForbiddenError(
+            "A CSRF token is required",
+            "AUTH_CSRF_REQUIRED",
+        )
+    expected = current.state.csrf_token
+    if len(csrf_token) != len(expected) or not compare_digest(csrf_token, expected):
+        raise AuthenticationForbiddenError(
+            "The CSRF token is invalid",
+            "AUTH_CSRF_INVALID",
+        )
+    account = await AccountRepository(session).get_for_update(current.account.id)
+    if account is None or account.session_version != current.state.account_session_version:
+        raise AuthenticationUnauthorizedError(
+            "Authentication session is invalid",
+            "AUTH_SESSION_INVALID",
+        )
+    status = AccountStatus(account.status)
+    if status is AccountStatus.DISABLED:
+        raise AuthenticationUnauthorizedError(
+            "Account is disabled",
+            "AUTH_ACCOUNT_DISABLED",
+        )
+    if status is not AccountStatus.ACTIVE:
+        raise AuthenticationUnauthorizedError(
+            "Account is pending first-passkey verification",
+            "AUTH_ACCOUNT_PENDING",
+        )
+    return current
+
+
+AuthenticatedMutationDependency = Annotated[
+    ResolvedAuthSession,
+    Depends(require_authenticated_mutation),
+]
+
+
+async def require_recent_authentication(
+    settings: SettingsDependency,
+    current: AuthenticatedMutationDependency,
+) -> ResolvedAuthSession:
+    """Require the session's passkey proof to fall inside the reauthentication window."""
+    authenticated_at = current.state.authenticated_at.astimezone(UTC)
+    if datetime.now(UTC) - authenticated_at > timedelta(
+        seconds=settings.auth_reauth_max_age_seconds
+    ):
+        raise AuthenticationForbiddenError(
+            "Recent passkey authentication is required",
+            "AUTH_REAUTH_REQUIRED",
+        )
+    return current
+
+
+RecentAuthenticationDependency = Annotated[
+    ResolvedAuthSession,
+    Depends(require_recent_authentication),
+]
 
 
 MerchantApplicationDependency = Annotated[

@@ -161,13 +161,13 @@ function creationOptionsFromJson(
 function requestOptionsFromJson(
   value: unknown,
 ): PublicKeyCredentialRequestOptions {
-  const options = requireRecord(value, "passkey approval options");
+  const options = requireRecord(value, "passkey authentication options");
 
   return {
     ...options,
     challenge: base64UrlToArrayBuffer(
-      requireString(options.challenge, "approval challenge"),
-      "approval challenge",
+      requireString(options.challenge, "authentication challenge"),
+      "authentication challenge",
     ),
     allowCredentials: credentialDescriptors(
       options.allowCredentials,
@@ -293,7 +293,7 @@ export async function getPasskeyCredential(
     if (!(credential instanceof PublicKeyCredential)) {
       throw new WebAuthnBrowserFailure(
         "invalid_response",
-        "The browser returned an unexpected passkey approval response.",
+        "The browser returned an unexpected passkey authentication response.",
       );
     }
 

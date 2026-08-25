@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from app.domain.enums import PolicyDecision, PurchaseType, ServiceType
 from app.domain.exceptions import (
+    AuthenticationForbiddenError,
     PolicyEvaluationIntegrityError,
     PolicyIntegrityError,
     PolicyTTLExceededError,
@@ -44,6 +45,8 @@ OTHER_MERCHANT_ID = "mrc_00000000000000000000000002"
 SERVICE_ID = "svc_00000000000000000000000001"
 OTHER_SERVICE_ID = "svc_00000000000000000000000002"
 ISSUED_AT = datetime(2026, 8, 25, 12, tzinfo=UTC)
+OWNED_SUBJECT_REFS = frozenset({"dev-user-001"})
+OTHER_ACCOUNT_SUBJECT_REFS = frozenset({"acct_00000000000000000000000002"})
 
 
 @dataclass
@@ -191,7 +194,6 @@ def make_quote(
 
 def policy_payload(**overrides: Any) -> BuyerPolicyCreate:
     values: dict[str, Any] = {
-        "subject_ref": "dev-user-001",
         "maximum_amount": 1000,
         "allowed_currencies": ["INR"],
         "allowed_merchant_ids": [MERCHANT_ID],
@@ -206,14 +208,12 @@ def policy_payload(**overrides: Any) -> BuyerPolicyCreate:
 
 def test_policy_schema_normalizes_sets_and_omission_means_unconstrained() -> None:
     payload = BuyerPolicyCreate(
-        subject_ref=" dev-user-001 ",
         maximum_amount=1000,
         allowed_currencies=["USD", "INR"],
         allowed_service_ids=[OTHER_SERVICE_ID, SERVICE_ID],
         expires_in_seconds=900,
     )
 
-    assert payload.subject_ref == "dev-user-001"
     assert payload.allowed_currencies == ["INR", "USD"]
     assert payload.allowed_service_ids == [SERVICE_ID, OTHER_SERVICE_ID]
     assert payload.allowed_merchant_ids is None
@@ -232,6 +232,7 @@ def test_policy_schema_normalizes_sets_and_omission_means_unconstrained() -> Non
         {"allowed_currencies": ["inr"]},
         {"allowed_service_types": ["unknown"]},
         {"expires_in_seconds": True},
+        {"subject_ref": "client-controlled-subject"},
     ],
 )
 def test_policy_schema_rejects_ambiguous_or_malformed_constraints(
@@ -427,7 +428,8 @@ async def test_policy_application_creates_normalized_fresh_policy_and_derives_ex
         policy_payload(
             allowed_currencies=["USD", "INR"],
             allowed_service_ids=[OTHER_SERVICE_ID, SERVICE_ID],
-        )
+        ),
+        subject_ref="dev-user-001",
     )
 
     assert response.id.startswith("pol_")
@@ -436,17 +438,22 @@ async def test_policy_application_creates_normalized_fresh_policy_and_derives_ex
     assert response.expires_at - response.issued_at == timedelta(minutes=15)
     assert response.created_at == response.issued_at
     persisted = repository.records[response.id]
+    assert persisted.subject_ref == "dev-user-001"
     assert recompute_policy_hash(persisted) == persisted.policy_hash
 
     clock.current = response.issued_at - timedelta(microseconds=1)
     with pytest.raises(PolicyIntegrityError) as future_error:
-        await application.get(response.id)
+        await application.get(response.id, owned_subject_refs=OWNED_SUBJECT_REFS)
     assert future_error.value.reason_code == "INTEGRITY_POLICY_DATA_INVALID"
 
     clock.current = response.issued_at
-    assert (await application.get(response.id)).state == "active"
+    assert (
+        await application.get(response.id, owned_subject_refs=OWNED_SUBJECT_REFS)
+    ).state == "active"
     clock.current = response.expires_at
-    assert (await application.get(response.id)).state == "expired"
+    assert (
+        await application.get(response.id, owned_subject_refs=OWNED_SUBJECT_REFS)
+    ).state == "expired"
 
 
 @pytest.mark.asyncio
@@ -458,13 +465,16 @@ async def test_policy_application_enforces_configured_ttl_and_integrity() -> Non
         clock=FrozenClock(ISSUED_AT),
     )
     with pytest.raises(PolicyTTLExceededError):
-        await application.create(policy_payload(expires_in_seconds=301))
+        await application.create(
+            policy_payload(expires_in_seconds=301),
+            subject_ref="dev-user-001",
+        )
 
     policy = make_policy()
     repository.records[policy.id] = policy
     policy.maximum_amount += 1
     with pytest.raises(PolicyIntegrityError):
-        await application.get(policy.id)
+        await application.get(policy.id, owned_subject_refs=OWNED_SUBJECT_REFS)
 
     oversized_policy = make_policy()
     oversized_policy.allowed_currencies = [
@@ -475,14 +485,14 @@ async def test_policy_application_enforces_configured_ttl_and_integrity() -> Non
     ][:101]
     repository.records[oversized_policy.id] = oversized_policy
     with pytest.raises(PolicyIntegrityError) as oversized_error:
-        await application.get(oversized_policy.id)
+        await application.get(oversized_policy.id, owned_subject_refs=OWNED_SUBJECT_REFS)
     assert oversized_error.value.reason_code == "INTEGRITY_POLICY_DATA_INVALID"
 
     malformed_policy = make_policy()
     malformed_policy.allowed_currencies = {"INR": "ignored"}  # type: ignore[assignment]
     repository.records[malformed_policy.id] = malformed_policy
     with pytest.raises(PolicyIntegrityError) as malformed_error:
-        await application.get(malformed_policy.id)
+        await application.get(malformed_policy.id, owned_subject_refs=OWNED_SUBJECT_REFS)
     assert malformed_error.value.reason_code == "INTEGRITY_POLICY_DATA_INVALID"
 
 
@@ -500,15 +510,61 @@ async def test_evaluation_application_replays_evidence_at_original_evaluation_ti
     )
 
     created = await application.create(
-        PolicyEvaluationCreate(policy_id=POLICY_ID, quote_id=QUOTE_ID)
+        PolicyEvaluationCreate(policy_id=POLICY_ID, quote_id=QUOTE_ID),
+        owned_subject_refs=OWNED_SUBJECT_REFS,
     )
     clock.current = policy.expires_at + timedelta(days=1)
-    historical = await application.get(created.id)
+    historical = await application.get(created.id, owned_subject_refs=OWNED_SUBJECT_REFS)
 
     assert created.decision is PolicyDecision.ALLOW
     assert created.reason_codes == [PolicyReasonCode.ALLOW_POLICY_SATISFIED]
     assert created.created_at == created.evaluated_at
     assert historical == created
+
+
+@pytest.mark.asyncio
+async def test_account_cannot_get_or_evaluate_another_accounts_policy() -> None:
+    policy = make_policy()
+    quote = make_quote()
+    policies = FakePolicyRepository([policy])
+    evaluations = FakeEvaluationRepository()
+    policy_service = BuyerPolicyApplicationService(  # type: ignore[arg-type]
+        policies,
+        maximum_ttl=timedelta(hours=1),
+        clock=FrozenClock(ISSUED_AT),
+    )
+    evaluation_service = PolicyEvaluationApplicationService(  # type: ignore[arg-type]
+        policies,
+        FakeQuoteRepository([quote]),
+        evaluations,
+        clock=FrozenClock(ISSUED_AT + timedelta(minutes=1)),
+    )
+
+    with pytest.raises(AuthenticationForbiddenError) as policy_error:
+        await policy_service.get(
+            policy.id,
+            owned_subject_refs=OTHER_ACCOUNT_SUBJECT_REFS,
+        )
+    with pytest.raises(AuthenticationForbiddenError) as create_error:
+        await evaluation_service.create(
+            PolicyEvaluationCreate(policy_id=policy.id, quote_id=quote.id),
+            owned_subject_refs=OTHER_ACCOUNT_SUBJECT_REFS,
+        )
+
+    owned = await evaluation_service.create(
+        PolicyEvaluationCreate(policy_id=policy.id, quote_id=quote.id),
+        owned_subject_refs=OWNED_SUBJECT_REFS,
+    )
+    with pytest.raises(AuthenticationForbiddenError) as get_error:
+        await evaluation_service.get(
+            owned.id,
+            owned_subject_refs=OTHER_ACCOUNT_SUBJECT_REFS,
+        )
+
+    assert policy_error.value.reason_code == "AUTH_RESOURCE_OWNERSHIP_MISMATCH"
+    assert create_error.value.reason_code == "AUTH_RESOURCE_OWNERSHIP_MISMATCH"
+    assert get_error.value.reason_code == "AUTH_RESOURCE_OWNERSHIP_MISMATCH"
+    assert len(evaluations.records) == 1
 
 
 @pytest.mark.asyncio
@@ -523,14 +579,15 @@ async def test_evaluation_application_rejects_forged_persisted_evidence() -> Non
         clock=FrozenClock(ISSUED_AT + timedelta(minutes=1)),
     )
     created = await application.create(
-        PolicyEvaluationCreate(policy_id=POLICY_ID, quote_id=QUOTE_ID)
+        PolicyEvaluationCreate(policy_id=POLICY_ID, quote_id=QUOTE_ID),
+        owned_subject_refs=OWNED_SUBJECT_REFS,
     )
     evaluation_repository.records[created.id].checks = evaluation_repository.records[
         created.id
     ].checks[:1]
 
     with pytest.raises(PolicyEvaluationIntegrityError):
-        await application.get(created.id)
+        await application.get(created.id, owned_subject_refs=OWNED_SUBJECT_REFS)
 
 
 @pytest.mark.asyncio
@@ -550,7 +607,10 @@ async def test_evaluation_creation_rejects_a_persistence_timestamp_change() -> N
     )
 
     with pytest.raises(PolicyEvaluationIntegrityError):
-        await application.create(PolicyEvaluationCreate(policy_id=POLICY_ID, quote_id=QUOTE_ID))
+        await application.create(
+            PolicyEvaluationCreate(policy_id=POLICY_ID, quote_id=QUOTE_ID),
+            owned_subject_refs=OWNED_SUBJECT_REFS,
+        )
 
 
 @pytest.mark.asyncio
@@ -568,7 +628,8 @@ async def test_evaluation_hash_mismatch_persists_deny_but_structural_failure_doe
     )
 
     denied = await application.create(
-        PolicyEvaluationCreate(policy_id=POLICY_ID, quote_id=QUOTE_ID)
+        PolicyEvaluationCreate(policy_id=POLICY_ID, quote_id=QUOTE_ID),
+        owned_subject_refs=OWNED_SUBJECT_REFS,
     )
 
     assert denied.decision is PolicyDecision.DENY
@@ -580,7 +641,10 @@ async def test_evaluation_hash_mismatch_persists_deny_but_structural_failure_doe
 
     policy.allowed_currencies = []
     with pytest.raises(PolicyIntegrityError):
-        await application.create(PolicyEvaluationCreate(policy_id=POLICY_ID, quote_id=QUOTE_ID))
+        await application.create(
+            PolicyEvaluationCreate(policy_id=POLICY_ID, quote_id=QUOTE_ID),
+            owned_subject_refs=OWNED_SUBJECT_REFS,
+        )
     assert len(evaluation_repository.records) == 1
 
 
@@ -631,7 +695,10 @@ async def test_future_issued_source_fails_closed_without_persisting_evidence(
     )
 
     with pytest.raises(error_type) as error:
-        await application.create(PolicyEvaluationCreate(policy_id=POLICY_ID, quote_id=QUOTE_ID))
+        await application.create(
+            PolicyEvaluationCreate(policy_id=POLICY_ID, quote_id=QUOTE_ID),
+            owned_subject_refs=OWNED_SUBJECT_REFS,
+        )
 
     assert error.value.reason_code == reason_code
     assert evaluation_repository.records == {}
@@ -646,7 +713,10 @@ async def test_evaluation_application_distinguishes_unknown_records() -> None:
         clock=FrozenClock(ISSUED_AT),
     )
     with pytest.raises(ResourceNotFoundError, match="Buyer policy"):
-        await application.create(PolicyEvaluationCreate(policy_id=POLICY_ID, quote_id=QUOTE_ID))
+        await application.create(
+            PolicyEvaluationCreate(policy_id=POLICY_ID, quote_id=QUOTE_ID),
+            owned_subject_refs=OWNED_SUBJECT_REFS,
+        )
 
     application = PolicyEvaluationApplicationService(  # type: ignore[arg-type]
         FakePolicyRepository([make_policy()]),
@@ -655,9 +725,12 @@ async def test_evaluation_application_distinguishes_unknown_records() -> None:
         clock=FrozenClock(ISSUED_AT),
     )
     with pytest.raises(ResourceNotFoundError, match="Quote"):
-        await application.create(PolicyEvaluationCreate(policy_id=POLICY_ID, quote_id=QUOTE_ID))
+        await application.create(
+            PolicyEvaluationCreate(policy_id=POLICY_ID, quote_id=QUOTE_ID),
+            owned_subject_refs=OWNED_SUBJECT_REFS,
+        )
     with pytest.raises(ResourceNotFoundError, match="Policy evaluation"):
-        await application.get(EVALUATION_ID)
+        await application.get(EVALUATION_ID, owned_subject_refs=OWNED_SUBJECT_REFS)
 
 
 @pytest.mark.asyncio
@@ -673,7 +746,10 @@ async def test_structurally_invalid_quote_returns_integrity_error_without_persis
     )
 
     with pytest.raises(QuoteIntegrityError) as error:
-        await application.create(PolicyEvaluationCreate(policy_id=POLICY_ID, quote_id=QUOTE_ID))
+        await application.create(
+            PolicyEvaluationCreate(policy_id=POLICY_ID, quote_id=QUOTE_ID),
+            owned_subject_refs=OWNED_SUBJECT_REFS,
+        )
 
     assert error.value.reason_code == "INTEGRITY_QUOTE_DATA_INVALID"
     assert evaluation_repository.records == {}

@@ -23,6 +23,7 @@ from app.domain.hashing import MAX_CANONICAL_INTEGER, canonical_utc_datetime
 
 CHALLENGE_STATE_VERSION = "1"
 _CHALLENGE_ID_PATTERN = r"^ach_[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+_ACCOUNT_ID_PATTERN = r"^acct_[0-7][0-9A-HJKMNP-TV-Z]{25}$"
 _APPROVAL_IDENTITY_ID_PATTERN = r"^aid_[0-7][0-9A-HJKMNP-TV-Z]{25}$"
 _PASSKEY_CREDENTIAL_ID_PATTERN = r"^pkc_[0-7][0-9A-HJKMNP-TV-Z]{25}$"
 _POLICY_EVALUATION_ID_PATTERN = r"^pye_[0-7][0-9A-HJKMNP-TV-Z]{25}$"
@@ -125,7 +126,9 @@ class RegistrationChallengeState(_ChallengeState):
     """Redis-only binding for one passkey registration ceremony."""
 
     kind: Literal["registration"] = "registration"
+    account_id: Annotated[str, Field(pattern=_ACCOUNT_ID_PATTERN)]
     approval_identity_id: Annotated[str, Field(pattern=_APPROVAL_IDENTITY_ID_PATTERN)]
+    session_id_hash: Annotated[str, Field(pattern=_HASH_PATTERN)]
     user_handle: Annotated[
         str,
         Field(min_length=1, max_length=86, pattern=_BASE64URL_PATTERN),
@@ -136,6 +139,7 @@ class ApprovalChallengeState(_ChallengeState):
     """Redis-only binding for one exact, server-derived approval review."""
 
     kind: Literal["approval"] = "approval"
+    account_id: Annotated[str, Field(pattern=_ACCOUNT_ID_PATTERN)]
     approval_identity_id: Annotated[str, Field(pattern=_APPROVAL_IDENTITY_ID_PATTERN)]
     evaluation_id: Annotated[str, Field(pattern=_POLICY_EVALUATION_ID_PATTERN)]
     policy_id: Annotated[str, Field(pattern=_POLICY_ID_PATTERN)]
@@ -177,7 +181,12 @@ class ChallengeStore(Protocol):
         ttl_seconds: int,
     ) -> None: ...
 
-    async def consume_registration(self, challenge_id: str) -> RegistrationChallengeState: ...
+    async def consume_registration(
+        self,
+        challenge_id: str,
+        *,
+        account_id: str,
+    ) -> RegistrationChallengeState: ...
 
     async def save_approval(
         self,
@@ -186,7 +195,12 @@ class ChallengeStore(Protocol):
         ttl_seconds: int,
     ) -> None: ...
 
-    async def consume_approval(self, challenge_id: str) -> ApprovalChallengeState: ...
+    async def consume_approval(
+        self,
+        challenge_id: str,
+        *,
+        account_id: str,
+    ) -> ApprovalChallengeState: ...
 
 
 @runtime_checkable
@@ -250,10 +264,16 @@ class RedisChallengeStore:
     ) -> None:
         await self._save("registration", state, ttl_seconds=ttl_seconds)
 
-    async def consume_registration(self, challenge_id: str) -> RegistrationChallengeState:
+    async def consume_registration(
+        self,
+        challenge_id: str,
+        *,
+        account_id: str,
+    ) -> RegistrationChallengeState:
         return await self._consume(
             "registration",
             challenge_id,
+            account_id,
             RegistrationChallengeState,
         )
 
@@ -265,8 +285,18 @@ class RedisChallengeStore:
     ) -> None:
         await self._save("approval", state, ttl_seconds=ttl_seconds)
 
-    async def consume_approval(self, challenge_id: str) -> ApprovalChallengeState:
-        return await self._consume("approval", challenge_id, ApprovalChallengeState)
+    async def consume_approval(
+        self,
+        challenge_id: str,
+        *,
+        account_id: str,
+    ) -> ApprovalChallengeState:
+        return await self._consume(
+            "approval",
+            challenge_id,
+            account_id,
+            ApprovalChallengeState,
+        )
 
     async def _save(
         self,
@@ -287,7 +317,7 @@ class RedisChallengeStore:
         except (CanonicalJSONError, TypeError, ValueError) as error:
             raise ChallengeStateInvalidError(state.challenge_id) from error
 
-        state_key, status_key = self._keys(kind, state.challenge_id)
+        state_key, status_key = self._keys(kind, state.account_id, state.challenge_id)
         marker_ttl = ttl_seconds * 2
         created = await self._client.eval(
             _CREATE_SCRIPT,
@@ -305,10 +335,12 @@ class RedisChallengeStore:
         self,
         kind: ChallengeKind,
         challenge_id: str,
+        account_id: str,
         state_type: type[StateT],
     ) -> StateT:
         self._validate_challenge_id(challenge_id)
-        state_key, status_key = self._keys(kind, challenge_id)
+        self._validate_account_id(account_id)
+        state_key, status_key = self._keys(kind, account_id, challenge_id)
         result = await self._client.eval(
             _CONSUME_SCRIPT,
             2,
@@ -333,20 +365,34 @@ class RedisChallengeStore:
             state = state_type.model_validate_json(payload)
         except (ValidationError, ValueError, TypeError) as error:
             raise ChallengeStateInvalidError(challenge_id) from error
-        if state.challenge_id != challenge_id or state.kind != kind:
+        if (
+            state.challenge_id != challenge_id
+            or state.kind != kind
+            or state.account_id != account_id
+        ):
             raise ChallengeStateInvalidError(challenge_id)
         if self._read_clock() >= state.expires_at:
             raise ChallengeExpiredError(challenge_id)
         return state
 
-    def _keys(self, kind: ChallengeKind, challenge_id: str) -> tuple[str, str]:
-        base = f"{self._namespace}:{kind}:{{{challenge_id}}}"
+    def _keys(
+        self,
+        kind: ChallengeKind,
+        account_id: str,
+        challenge_id: str,
+    ) -> tuple[str, str]:
+        base = f"{self._namespace}:{kind}:{{{account_id}:{challenge_id}}}"
         return f"{base}:state", f"{base}:status"
 
     @staticmethod
     def _validate_challenge_id(challenge_id: str) -> None:
         if re.fullmatch(_CHALLENGE_ID_PATTERN, challenge_id) is None:
             raise ChallengeNotFoundError(challenge_id)
+
+    @staticmethod
+    def _validate_account_id(account_id: str) -> None:
+        if re.fullmatch(_ACCOUNT_ID_PATTERN, account_id) is None:
+            raise ChallengeNotFoundError(account_id)
 
     def _read_clock(self) -> datetime:
         value = self._clock()

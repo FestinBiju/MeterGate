@@ -40,6 +40,13 @@ class Settings(BaseSettings):
     )
     webauthn_challenge_ttl_seconds: int = Field(default=300, ge=1, le=600)
     authorization_ttl_seconds: int = Field(default=120, ge=1, le=600)
+    auth_session_ttl_seconds: int = Field(default=3_600, ge=60, le=86_400)
+    auth_reauth_max_age_seconds: int = Field(default=300, ge=1, le=3_600)
+    auth_cookie_name: str = Field(default="metergate_session", min_length=1, max_length=128)
+    auth_cookie_secure: bool = False
+    auth_cookie_samesite: Literal["lax", "strict", "none"] = "lax"
+    auth_cookie_domain: str | None = None
+    auth_cookie_path: str = Field(default="/api/v1", min_length=1, max_length=256)
     database_url: SecretStr
     redis_url: SecretStr
     cors_allowed_origins: Annotated[list[str], NoDecode] = Field(
@@ -120,6 +127,41 @@ class Settings(BaseSettings):
             raise ValueError("WEBAUTHN_RP_NAME must not be blank")
         return normalized
 
+    @field_validator("auth_cookie_name", mode="after")
+    @classmethod
+    def validate_auth_cookie_name(cls, value: str) -> str:
+        if re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", value) is None:
+            raise ValueError("AUTH_COOKIE_NAME must be a valid cookie name")
+        return value
+
+    @field_validator("auth_cookie_domain", mode="before")
+    @classmethod
+    def normalize_auth_cookie_domain(cls, value: object) -> object:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip().lower().lstrip(".")
+        return normalized or None
+
+    @field_validator("auth_cookie_domain", mode="after")
+    @classmethod
+    def validate_auth_cookie_domain(cls, value: str | None) -> str | None:
+        if value is not None and _RP_ID_PATTERN.fullmatch(value) is None:
+            raise ValueError("AUTH_COOKIE_DOMAIN must be a bare domain")
+        return value
+
+    @field_validator("auth_cookie_path", mode="after")
+    @classmethod
+    def validate_auth_cookie_path(cls, value: str) -> str:
+        if (
+            not value.startswith("/")
+            or ";" in value
+            or any(character.isspace() for character in value)
+        ):
+            raise ValueError("AUTH_COOKIE_PATH must be an absolute cookie path")
+        return value
+
     @field_validator("webauthn_expected_origins", mode="before")
     @classmethod
     def parse_webauthn_expected_origins(cls, value: object) -> list[str]:
@@ -184,6 +226,20 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "WEBAUTHN_EXPECTED_ORIGINS hosts must equal or be subdomains of WEBAUTHN_RP_ID"
                 )
+            if origin not in self.cors_allowed_origins:
+                raise ValueError(
+                    "WEBAUTHN_EXPECTED_ORIGINS must also be present in CORS_ALLOWED_ORIGINS"
+                )
+        if self.auth_reauth_max_age_seconds > self.auth_session_ttl_seconds:
+            raise ValueError("AUTH_REAUTH_MAX_AGE_SECONDS cannot exceed AUTH_SESSION_TTL_SECONDS")
+        if self.auth_cookie_samesite == "none" and not self.auth_cookie_secure:
+            raise ValueError("AUTH_COOKIE_SAMESITE=none requires AUTH_COOKIE_SECURE=true")
+        if self.auth_cookie_name.startswith("__Host-") and (
+            not self.auth_cookie_secure
+            or self.auth_cookie_domain is not None
+            or self.auth_cookie_path != "/"
+        ):
+            raise ValueError("__Host- cookies require Secure=true, no Domain, and Path=/")
         return self
 
 

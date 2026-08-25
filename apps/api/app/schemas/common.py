@@ -34,6 +34,10 @@ OutputContentType = Annotated[
     ),
 ]
 JSONObject = dict[str, Any]
+AccountId = Annotated[
+    str,
+    StringConstraints(pattern=r"^acct_[0-7][0-9A-HJKMNP-TV-Z]{25}$"),
+]
 
 
 class APIModel(BaseModel):

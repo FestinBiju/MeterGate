@@ -1,10 +1,10 @@
 "use client";
 
-import { useEffect, useId, useRef, useState } from "react";
-import type { FormEvent } from "react";
+import { useEffect, useRef, useState } from "react";
 
+import { useAccountSession } from "@/components/account-session";
+import { ApiRequestFailure } from "@/lib/api-client";
 import {
-  createPasskeyCredential,
   getPasskeyCredential,
   passkeySupportError,
   WebAuthnBrowserFailure,
@@ -12,19 +12,6 @@ import {
 
 type JsonPrimitive = boolean | null | number | string;
 type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
-
-type ApprovalIdentity = {
-  id: string;
-  subject_ref: string;
-  display_name: string;
-  status: "active" | "disabled";
-  created_at: string;
-  has_passkey?: boolean;
-  has_registered_passkey?: boolean;
-  passkey_registered?: boolean;
-  credential_count?: number;
-  passkey_count?: number;
-};
 
 type CeremonyOptions = {
   challenge_id: string;
@@ -86,8 +73,6 @@ type DisplayFailure = {
   message: string;
 };
 
-type IdentityPhase = "idle" | "creating" | "loading" | "resolved";
-type RegistrationPhase = "idle" | "options" | "browser" | "verifying";
 type ApprovalPhase =
   | "idle"
   | "preparing"
@@ -106,7 +91,6 @@ class ApprovalRequestFailure extends Error {
   }
 }
 
-const REQUEST_TIMEOUT_MS = 10_000;
 const integerFormatter = new Intl.NumberFormat("en-IN", {
   maximumFractionDigits: 0,
 });
@@ -165,161 +149,6 @@ function safeMessage(value: unknown): string | null {
     .trim();
 
   return message ? message.slice(0, 240) : null;
-}
-
-function detailMessage(value: unknown): string | null {
-  if (Array.isArray(value)) {
-    for (const item of value.slice(0, 3)) {
-      if (isRecord(item)) {
-        const message = safeMessage(item.message) ?? safeMessage(item.msg);
-        if (message) {
-          return message;
-        }
-      }
-    }
-    return null;
-  }
-
-  if (isRecord(value)) {
-    return safeMessage(value.message) ?? detailMessage(value.issues);
-  }
-
-  return safeMessage(value);
-}
-
-function apiFailure(status: number, body: unknown): ApprovalRequestFailure {
-  const code =
-    (isRecord(body) ? safeMessage(body.reason_code) : null) ??
-    `APPROVAL_HTTP_${status}`;
-  const message =
-    (isRecord(body) ? detailMessage(body.detail) : null) ??
-    (status >= 500
-      ? "The trusted approval service is temporarily unavailable."
-      : `The trusted approval request failed with HTTP ${status}.`);
-
-  return new ApprovalRequestFailure(code, message);
-}
-
-async function requestJson(
-  endpoint: string,
-  method: "GET" | "POST",
-  payload?: Record<string, unknown>,
-): Promise<Record<string, unknown>> {
-  const controller = new AbortController();
-  const timeout = window.setTimeout(
-    () => controller.abort(),
-    REQUEST_TIMEOUT_MS,
-  );
-
-  try {
-    const response = await fetch(endpoint, {
-      method,
-      cache: "no-store",
-      headers:
-        method === "POST"
-          ? {
-              Accept: "application/json",
-              "Content-Type": "application/json",
-            }
-          : { Accept: "application/json" },
-      body: payload === undefined ? undefined : JSON.stringify(payload),
-      signal: controller.signal,
-    });
-
-    let body: unknown = null;
-    try {
-      body = await response.json();
-    } catch {
-      if (response.ok) {
-        throw new ApprovalRequestFailure(
-          "APPROVAL_RESPONSE_INVALID",
-          "The trusted approval service returned unreadable JSON.",
-        );
-      }
-    }
-
-    if (!response.ok) {
-      throw apiFailure(response.status, body);
-    }
-
-    if (!isRecord(body)) {
-      throw new ApprovalRequestFailure(
-        "APPROVAL_RESPONSE_INVALID",
-        "The trusted approval service returned an unexpected response.",
-      );
-    }
-
-    return body;
-  } catch (error: unknown) {
-    if (error instanceof ApprovalRequestFailure) {
-      throw error;
-    }
-
-    if (error instanceof DOMException && error.name === "AbortError") {
-      throw new ApprovalRequestFailure(
-        "APPROVAL_REQUEST_TIMEOUT",
-        "The trusted approval request timed out. Its final server state may be unknown.",
-      );
-    }
-
-    if (error instanceof TypeError) {
-      throw new ApprovalRequestFailure(
-        "APPROVAL_SERVICE_UNAVAILABLE",
-        "The trusted approval API could not be reached. Confirm FastAPI is running and CORS permits this origin.",
-      );
-    }
-
-    throw new ApprovalRequestFailure(
-      "APPROVAL_REQUEST_FAILED",
-      "The trusted approval request could not be completed.",
-    );
-  } finally {
-    window.clearTimeout(timeout);
-  }
-}
-
-function parseIdentity(value: unknown): ApprovalIdentity | null {
-  if (
-    !isRecord(value) ||
-    !isNonEmptyString(value.id) ||
-    !isNonEmptyString(value.subject_ref) ||
-    !isNonEmptyString(value.display_name) ||
-    (value.status !== "active" && value.status !== "disabled") ||
-    !isTimestamp(value.created_at)
-  ) {
-    return null;
-  }
-
-  const optionalBooleans = [
-    value.has_passkey,
-    value.has_registered_passkey,
-    value.passkey_registered,
-  ];
-  const optionalCounts = [value.credential_count, value.passkey_count];
-  if (
-    optionalBooleans.some(
-      (item) => item !== undefined && typeof item !== "boolean",
-    ) ||
-    optionalCounts.some(
-      (item) =>
-        item !== undefined &&
-        (typeof item !== "number" || !Number.isSafeInteger(item) || item < 0),
-    )
-  ) {
-    return null;
-  }
-
-  return value as ApprovalIdentity;
-}
-
-function identityHasPasskey(identity: ApprovalIdentity): boolean {
-  return (
-    identity.has_passkey === true ||
-    identity.has_registered_passkey === true ||
-    identity.passkey_registered === true ||
-    (identity.credential_count ?? 0) > 0 ||
-    (identity.passkey_count ?? 0) > 0
-  );
 }
 
 function parseCeremonyOptions(value: unknown): CeremonyOptions | null {
@@ -477,7 +306,11 @@ function parseAuthorization(value: unknown): Authorization | null {
   };
 }
 
-function failureFrom(error: unknown, stage: "approval" | "registration"): DisplayFailure {
+function failureFrom(error: unknown): DisplayFailure {
+  if (error instanceof ApiRequestFailure) {
+    return { code: error.code, message: error.message };
+  }
+
   if (error instanceof ApprovalRequestFailure) {
     return { code: error.code, message: error.message };
   }
@@ -485,9 +318,7 @@ function failureFrom(error: unknown, stage: "approval" | "registration"): Displa
   if (error instanceof WebAuthnBrowserFailure) {
     const code =
       error.kind === "cancelled"
-        ? stage === "registration"
-          ? "APPROVAL_PASSKEY_REGISTRATION_CANCELLED"
-          : "APPROVAL_CANCELLED"
+        ? "APPROVAL_CANCELLED"
         : error.kind === "unsupported"
           ? "APPROVAL_PASSKEY_UNSUPPORTED"
           : "APPROVAL_WEBAUTHN_VERIFICATION_FAILED";
@@ -743,26 +574,11 @@ export function TrustedApproval({
   evaluationId: string;
   policySubjectRef: string;
 }) {
-  const displayNameId = useId();
-  const existingIdentityId = useId();
-  const identityHeadingRef = useRef<HTMLHeadingElement>(null);
-  const passkeyStatusRef = useRef<HTMLDivElement>(null);
+  const { state, requestAuthenticated } = useAccountSession();
   const [supportFailure, setSupportFailure] = useState<DisplayFailure | null>(
     null,
   );
   const [supportChecked, setSupportChecked] = useState(false);
-  const [displayName, setDisplayName] = useState("Local MeterGate User");
-  const [existingIdentity, setExistingIdentity] = useState("");
-  const [identity, setIdentity] = useState<ApprovalIdentity | null>(null);
-  const [identityPhase, setIdentityPhase] = useState<IdentityPhase>("idle");
-  const [identityFailure, setIdentityFailure] = useState<DisplayFailure | null>(
-    null,
-  );
-  const [passkeyRegistered, setPasskeyRegistered] = useState(false);
-  const [registrationPhase, setRegistrationPhase] =
-    useState<RegistrationPhase>("idle");
-  const [registrationFailure, setRegistrationFailure] =
-    useState<DisplayFailure | null>(null);
   const [approvalPhase, setApprovalPhase] = useState<ApprovalPhase>("idle");
   const [approvalFailure, setApprovalFailure] =
     useState<DisplayFailure | null>(null);
@@ -797,149 +613,16 @@ export function TrustedApproval({
     return () => window.clearTimeout(timeout);
   }, [challenge]);
 
-  const identityBusy = identityPhase === "creating" || identityPhase === "loading";
-  const registrationBusy = registrationPhase !== "idle";
   const approvalBusy =
     approvalPhase === "preparing" ||
     approvalPhase === "browser" ||
     approvalPhase === "verifying";
   const canUsePasskeys = supportChecked && supportFailure === null;
-
-  const acceptIdentity = (candidate: ApprovalIdentity) => {
-    if (candidate.subject_ref !== policySubjectRef) {
-      throw new ApprovalRequestFailure(
-        "APPROVAL_IDENTITY_SUBJECT_MISMATCH",
-        "This approval identity belongs to a different policy subject.",
-      );
-    }
-
-    setIdentity(candidate);
-    setPasskeyRegistered(identityHasPasskey(candidate));
-    setIdentityPhase("resolved");
-    setChallenge(null);
-    setAuthorization(null);
-    setApprovalPhase("idle");
-    window.setTimeout(() => identityHeadingRef.current?.focus(), 0);
-  };
-
-  const createIdentity = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const normalizedName = displayName.trim();
-    if (!normalizedName) {
-      setIdentityFailure({
-        code: "APPROVAL_IDENTITY_INVALID",
-        message: "Enter a display name for the approval identity.",
-      });
-      return;
-    }
-
-    setIdentityFailure(null);
-    setIdentityPhase("creating");
-    try {
-      const body = await requestJson(
-        `${apiBaseEndpoint}/approval-identities`,
-        "POST",
-        { subject_ref: policySubjectRef, display_name: normalizedName },
-      );
-      const created = parseIdentity(body);
-      if (!created) {
-        throw new ApprovalRequestFailure(
-          "APPROVAL_RESPONSE_INVALID",
-          "The server returned an unexpected approval identity.",
-        );
-      }
-      acceptIdentity(created);
-    } catch (error: unknown) {
-      setIdentityPhase("idle");
-      setIdentityFailure(failureFrom(error, "approval"));
-    }
-  };
-
-  const loadIdentity = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const identityId = existingIdentity.trim();
-    if (!identityId) {
-      setIdentityFailure({
-        code: "APPROVAL_IDENTITY_INVALID",
-        message: "Enter an approval identity ID.",
-      });
-      return;
-    }
-
-    setIdentityFailure(null);
-    setIdentityPhase("loading");
-    try {
-      const body = await requestJson(
-        `${apiBaseEndpoint}/approval-identities/${encodeURIComponent(identityId)}`,
-        "GET",
-      );
-      const loaded = parseIdentity(body);
-      if (!loaded || loaded.id !== identityId) {
-        throw new ApprovalRequestFailure(
-          "APPROVAL_RESPONSE_INVALID",
-          "The server returned an unexpected approval identity.",
-        );
-      }
-      acceptIdentity(loaded);
-    } catch (error: unknown) {
-      setIdentityPhase("idle");
-      setIdentityFailure(failureFrom(error, "approval"));
-    }
-  };
-
-  const registerPasskey = async () => {
-    if (!identity || !canUsePasskeys || registrationBusy) {
-      return;
-    }
-
-    setRegistrationFailure(null);
-    setRegistrationPhase("options");
-    try {
-      const body = await requestJson(
-        `${apiBaseEndpoint}/approval-identities/${encodeURIComponent(identity.id)}/passkeys/options`,
-        "POST",
-        {},
-      );
-      const options = parseCeremonyOptions(body);
-      if (!options) {
-        throw new ApprovalRequestFailure(
-          "APPROVAL_RESPONSE_INVALID",
-          "The server returned unexpected passkey registration options.",
-        );
-      }
-
-      setRegistrationPhase("browser");
-      const credential = await createPasskeyCredential(options.public_key);
-      setRegistrationPhase("verifying");
-      const verified = await requestJson(
-        `${apiBaseEndpoint}/approval-identities/${encodeURIComponent(identity.id)}/passkeys/verify`,
-        "POST",
-        { challenge_id: options.challenge_id, credential },
-      );
-
-      const registeredCredential = verified.credential;
-      if (
-        verified.status !== "registered" ||
-        !isRecord(registeredCredential) ||
-        !isNonEmptyString(registeredCredential.id)
-      ) {
-        throw new ApprovalRequestFailure(
-          "APPROVAL_RESPONSE_INVALID",
-          "The server returned an unexpected passkey registration result.",
-        );
-      }
-
-      setPasskeyRegistered(true);
-      setRegistrationPhase("idle");
-      window.setTimeout(() => passkeyStatusRef.current?.focus(), 0);
-    } catch (error: unknown) {
-      setRegistrationPhase("idle");
-      setRegistrationFailure(failureFrom(error, "registration"));
-    }
-  };
+  const session = state.kind === "authenticated" ? state.session : null;
+  const accountMatchesPolicy = session?.account.id === policySubjectRef;
 
   const prepareReview = async () => {
-    if (!identity || !passkeyRegistered || !canUsePasskeys || approvalBusy) {
+    if (!session || !accountMatchesPolicy || !canUsePasskeys || approvalBusy) {
       return;
     }
 
@@ -949,19 +632,15 @@ export function TrustedApproval({
     setAuthorization(null);
     setApprovalPhase("preparing");
     try {
-      const body = await requestJson(
+      const body = await requestAuthenticated(
         `${apiBaseEndpoint}/approval-challenges`,
-        "POST",
-        {
-          evaluation_id: evaluationId,
-          approval_identity_id: identity.id,
-        },
+        { method: "POST", body: { evaluation_id: evaluationId } },
       );
       const prepared = parseApprovalChallenge(body);
       if (
         !prepared ||
         prepared.review.evaluation_id !== evaluationId ||
-        prepared.review.approval_identity_id !== identity.id ||
+        prepared.review.approval_identity_id !== session.approval_identity.id ||
         prepared.review.subject_ref !== policySubjectRef
       ) {
         throw new ApprovalRequestFailure(
@@ -974,12 +653,18 @@ export function TrustedApproval({
       setApprovalPhase("ready");
     } catch (error: unknown) {
       setApprovalPhase("idle");
-      setApprovalFailure(failureFrom(error, "approval"));
+      setApprovalFailure(failureFrom(error));
     }
   };
 
   const approveWithPasskey = async () => {
-    if (!challenge || !identity || !canUsePasskeys || approvalBusy) {
+    if (
+      !challenge ||
+      !session ||
+      !accountMatchesPolicy ||
+      !canUsePasskeys ||
+      approvalBusy
+    ) {
       return;
     }
 
@@ -999,10 +684,9 @@ export function TrustedApproval({
 
       let body: Record<string, unknown>;
       try {
-        body = await requestJson(
+        body = await requestAuthenticated(
           `${apiBaseEndpoint}/approval-challenges/${encodeURIComponent(challenge.challenge_id)}/verify`,
-          "POST",
-          { credential },
+          { method: "POST", body: { credential } },
         );
       } catch (error: unknown) {
         setChallenge(null);
@@ -1032,22 +716,41 @@ export function TrustedApproval({
       } else {
         setApprovalPhase("idle");
       }
-      setApprovalFailure(failureFrom(error, "approval"));
+      setApprovalFailure(failureFrom(error));
     }
   };
 
-  const resetIdentity = () => {
-    setIdentity(null);
-    setIdentityPhase("idle");
-    setIdentityFailure(null);
-    setPasskeyRegistered(false);
-    setRegistrationPhase("idle");
-    setRegistrationFailure(null);
-    setChallenge(null);
-    setAuthorization(null);
-    setApprovalPhase("idle");
-    setApprovalFailure(null);
-  };
+  if (!session) {
+    return (
+      <div className="mt-4 rounded-xl border border-violet-300/15 bg-violet-300/[0.035] px-4 py-4">
+        <p className="text-sm font-semibold text-violet-100">
+          Sign in to continue
+        </p>
+        <p className="mt-2 text-xs leading-5 text-slate-400">
+          Purchase approval requires the passkey-authenticated owner of this
+          buyer policy.
+        </p>
+        <a
+          href="#buyer-account"
+          className="mt-3 inline-flex rounded-lg border border-violet-300/20 px-3 py-2 text-xs font-medium text-violet-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-violet-200"
+        >
+          Sign in to continue
+        </a>
+      </div>
+    );
+  }
+
+  if (!accountMatchesPolicy) {
+    return (
+      <FailureNotice
+        failure={{
+          code: "AUTH_RESOURCE_OWNERSHIP_MISMATCH",
+          message:
+            "This policy does not belong to the currently authenticated account.",
+        }}
+      />
+    );
+  }
 
   return (
     <section className="mt-4 rounded-2xl border border-amber-300/20 bg-amber-300/[0.025] p-4">
@@ -1072,168 +775,23 @@ export function TrustedApproval({
       ) : null}
       {supportFailure ? <FailureNotice failure={supportFailure} /> : null}
 
-      {!identity ? (
-        <div className="mt-4 grid gap-4 lg:grid-cols-2">
-          <form
-            onSubmit={createIdentity}
-            aria-busy={identityPhase === "creating"}
-            className="rounded-xl border border-white/[0.08] bg-black/15 p-3"
-          >
-            <fieldset disabled={identityBusy}>
-              <legend className="text-xs font-semibold text-slate-200">
-                Create approval identity
-              </legend>
-              <p className="mt-2 text-[11px] leading-5 text-slate-500">
-                Subject is fixed to this policy: {policySubjectRef}
-              </p>
-              <label
-                htmlFor={displayNameId}
-                className="mt-3 block text-xs font-medium text-slate-300"
-              >
-                Display name
-              </label>
-              <input
-                id={displayNameId}
-                value={displayName}
-                required
-                autoComplete="name"
-                onChange={(event) => {
-                  setDisplayName(event.target.value);
-                  setIdentityFailure(null);
-                }}
-                className="mt-2 w-full rounded-lg border border-white/10 bg-black/25 px-3 py-2 text-sm text-slate-200 outline-none transition focus:border-amber-300/35 focus:ring-2 focus:ring-amber-300/10 disabled:cursor-wait disabled:opacity-60"
-              />
-              <button
-                type="submit"
-                className="mt-3 w-full rounded-lg border border-amber-300/20 bg-amber-300/[0.07] px-3 py-2 text-xs font-medium text-amber-100 transition hover:border-amber-300/35 hover:bg-amber-300/[0.1] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-200 disabled:cursor-wait disabled:opacity-60"
-              >
-                {identityPhase === "creating"
-                  ? "Creating identity…"
-                  : "Create approval identity"}
-              </button>
-            </fieldset>
-          </form>
+      <div className="mt-4 rounded-xl border border-emerald-300/15 bg-emerald-300/[0.04] p-3">
+        <p className="text-xs font-semibold text-emerald-100">
+          Account-bound approval identity ready
+        </p>
+        <p className="mt-1 break-all text-[11px] leading-5 text-slate-400">
+          Signed in as {session.account.display_name} ·{" "}
+          <span className="font-mono">{session.account.id}</span>
+        </p>
+        <p className="mt-1 text-[11px] text-emerald-100/70">
+          {session.approval_identity.credential_count} registered passkey
+          {session.approval_identity.credential_count === 1 ? "" : "s"} can
+          verify this approval. Identity selection and enrollment are not
+          accepted from this purchase flow.
+        </p>
+      </div>
 
-          <form
-            onSubmit={loadIdentity}
-            aria-busy={identityPhase === "loading"}
-            className="rounded-xl border border-white/[0.08] bg-black/15 p-3"
-          >
-            <fieldset disabled={identityBusy}>
-              <legend className="text-xs font-semibold text-slate-200">
-                Use existing identity
-              </legend>
-              <p className="mt-2 text-[11px] leading-5 text-slate-500">
-                The server must confirm that its subject matches this policy.
-              </p>
-              <label
-                htmlFor={existingIdentityId}
-                className="mt-3 block text-xs font-medium text-slate-300"
-              >
-                Approval identity ID
-              </label>
-              <input
-                id={existingIdentityId}
-                value={existingIdentity}
-                required
-                autoComplete="off"
-                placeholder="aid_…"
-                onChange={(event) => {
-                  setExistingIdentity(event.target.value);
-                  setIdentityFailure(null);
-                }}
-                className="mt-2 w-full rounded-lg border border-white/10 bg-black/25 px-3 py-2 font-mono text-sm text-slate-200 outline-none transition placeholder:text-slate-700 focus:border-amber-300/35 focus:ring-2 focus:ring-amber-300/10 disabled:cursor-wait disabled:opacity-60"
-              />
-              <button
-                type="submit"
-                className="mt-3 w-full rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2 text-xs font-medium text-slate-200 transition hover:border-amber-300/25 hover:text-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-200 disabled:cursor-wait disabled:opacity-60"
-              >
-                {identityPhase === "loading" ? "Loading identity…" : "Load identity"}
-              </button>
-            </fieldset>
-          </form>
-        </div>
-      ) : (
-        <div className="mt-4 rounded-xl border border-white/[0.08] bg-black/15 p-3">
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <h6
-                ref={identityHeadingRef}
-                tabIndex={-1}
-                className="text-sm font-semibold text-white focus:outline-none"
-              >
-                {identity.display_name}
-              </h6>
-              <p className="mt-1 break-all font-mono text-[10px] text-slate-500">
-                {identity.id}
-              </p>
-              <p className="mt-1 break-all text-[11px] text-slate-400">
-                Subject: {identity.subject_ref}
-              </p>
-            </div>
-            <span className="rounded-full border border-white/10 px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.1em] text-slate-300">
-              {identity.status}
-            </span>
-          </div>
-
-          {identity.status === "disabled" ? (
-            <FailureNotice
-              failure={{
-                code: "APPROVAL_IDENTITY_DISABLED",
-                message: "This approval identity is disabled and cannot approve purchases.",
-              }}
-            />
-          ) : null}
-
-          {passkeyRegistered ? (
-            <div
-              ref={passkeyStatusRef}
-              tabIndex={-1}
-              role="status"
-              className="mt-3 rounded-lg border border-emerald-300/15 bg-emerald-300/[0.05] px-3 py-2.5 focus:outline-none"
-            >
-              <p className="text-xs font-semibold text-emerald-100">
-                Passkey registered
-              </p>
-              <p className="mt-1 text-[11px] text-emerald-100/70">
-                Credential available for approvals
-              </p>
-            </div>
-          ) : identity.status === "active" ? (
-            <button
-              type="button"
-              disabled={!canUsePasskeys || registrationBusy || approvalBusy}
-              onClick={registerPasskey}
-              className="mt-3 w-full rounded-lg border border-cyan-300/20 bg-cyan-300/[0.07] px-3 py-2.5 text-xs font-medium text-cyan-100 transition hover:border-cyan-300/35 hover:bg-cyan-300/[0.1] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-200 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {registrationPhase === "options"
-                ? "Requesting registration challenge…"
-                : registrationPhase === "browser"
-                  ? "Waiting for passkey registration…"
-                  : registrationPhase === "verifying"
-                    ? "Verifying passkey…"
-                    : "Register Passkey"}
-            </button>
-          ) : null}
-
-          {registrationFailure ? (
-            <FailureNotice failure={registrationFailure} />
-          ) : null}
-
-          <button
-            type="button"
-            disabled={registrationBusy || approvalBusy}
-            onClick={resetIdentity}
-            className="mt-3 w-full rounded-lg border border-white/10 px-3 py-2 text-xs font-medium text-slate-400 transition hover:border-white/20 hover:text-slate-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-200 disabled:cursor-wait disabled:opacity-50"
-          >
-            Use another identity
-          </button>
-        </div>
-      )}
-
-      {identityFailure ? <FailureNotice failure={identityFailure} /> : null}
-
-      {identity?.status === "active" && passkeyRegistered && !authorization ? (
+      {!authorization ? (
         <div className="mt-4 border-t border-white/[0.08] pt-4">
           {!challenge ? (
             <button

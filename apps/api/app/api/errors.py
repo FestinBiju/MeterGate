@@ -9,6 +9,13 @@ from app.domain.exceptions import (
     ApprovalIntegrityError,
     ApprovalNotFoundError,
     ApprovalVerificationError,
+    AuthenticationConflictError,
+    AuthenticationExpiredError,
+    AuthenticationForbiddenError,
+    AuthenticationIntegrityError,
+    AuthenticationNotFoundError,
+    AuthenticationUnauthorizedError,
+    AuthenticationVerificationError,
     InvalidStateTransitionError,
     PolicyTTLExceededError,
     QuoteConflictError,
@@ -33,6 +40,34 @@ def register_domain_exception_handlers(application: FastAPI) -> None:
     application.add_exception_handler(ApprovalVerificationError, _approval_verification_handler)
     application.add_exception_handler(ApprovalConflictError, _approval_conflict_handler)
     application.add_exception_handler(ApprovalIntegrityError, _approval_integrity_handler)
+    application.add_exception_handler(
+        AuthenticationUnauthorizedError,
+        _authentication_unauthorized_handler,
+    )
+    application.add_exception_handler(
+        AuthenticationForbiddenError,
+        _authentication_forbidden_handler,
+    )
+    application.add_exception_handler(
+        AuthenticationNotFoundError,
+        _authentication_not_found_handler,
+    )
+    application.add_exception_handler(
+        AuthenticationExpiredError,
+        _authentication_expired_handler,
+    )
+    application.add_exception_handler(
+        AuthenticationVerificationError,
+        _authentication_verification_handler,
+    )
+    application.add_exception_handler(
+        AuthenticationConflictError,
+        _authentication_conflict_handler,
+    )
+    application.add_exception_handler(
+        AuthenticationIntegrityError,
+        _authentication_integrity_handler,
+    )
 
 
 async def _not_found_handler(
@@ -175,3 +210,63 @@ async def _approval_conflict_handler(request: Request, error: Exception) -> JSON
 async def _approval_integrity_handler(request: Request, error: Exception) -> JSONResponse:
     del request
     return _approval_response(error, status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+def _authentication_response(error: Exception, status_code: int) -> JSONResponse:
+    assert isinstance(
+        error,
+        (
+            AuthenticationUnauthorizedError,
+            AuthenticationForbiddenError,
+            AuthenticationNotFoundError,
+            AuthenticationExpiredError,
+            AuthenticationVerificationError,
+            AuthenticationConflictError,
+            AuthenticationIntegrityError,
+        ),
+    )
+    return JSONResponse(
+        status_code=status_code,
+        content={"detail": str(error), "reason_code": error.reason_code},
+    )
+
+
+async def _authentication_unauthorized_handler(
+    request: Request,
+    error: Exception,
+) -> JSONResponse:
+    del request
+    return _authentication_response(error, status.HTTP_401_UNAUTHORIZED)
+
+
+async def _authentication_forbidden_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _authentication_response(error, status.HTTP_403_FORBIDDEN)
+
+
+async def _authentication_not_found_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _authentication_response(error, status.HTTP_404_NOT_FOUND)
+
+
+async def _authentication_expired_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _authentication_response(error, status.HTTP_410_GONE)
+
+
+async def _authentication_verification_handler(
+    request: Request,
+    error: Exception,
+) -> JSONResponse:
+    del request
+    return _authentication_response(error, status.HTTP_400_BAD_REQUEST)
+
+
+async def _authentication_conflict_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _authentication_response(error, status.HTTP_409_CONFLICT)
+
+
+async def _authentication_integrity_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _authentication_response(error, status.HTTP_500_INTERNAL_SERVER_ERROR)

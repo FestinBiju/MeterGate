@@ -21,10 +21,14 @@ from app.cache.approval_challenges import (
     RegistrationChallengeState,
 )
 from app.domain.base64url import encode_base64url
+from app.domain.hashing import sha256_bytes
 
 NOW = datetime(2026, 8, 25, 12, tzinfo=UTC)
 CHALLENGE_ID = "ach_00000000000000000000000001"
 IDENTITY_ID = "aid_00000000000000000000000001"
+ACCOUNT_ID = "acct_00000000000000000000000001"
+OTHER_ACCOUNT_ID = "acct_00000000000000000000000002"
+SESSION_ID = "ses_00000000000000000000000001"
 
 
 @dataclass
@@ -77,7 +81,9 @@ def registration_state(
     return RegistrationChallengeState(
         challenge_id=challenge_id,
         challenge=encode_base64url(b"r" * 32),
+        account_id=ACCOUNT_ID,
         approval_identity_id=IDENTITY_ID,
+        session_id_hash=sha256_bytes(SESSION_ID.encode()),
         user_handle=encode_base64url(b"u" * 32),
         issued_at=NOW,
         expires_at=expires_at,
@@ -91,8 +97,8 @@ async def test_challenge_store_consumes_exactly_once_under_concurrency() -> None
     await store.save_registration(registration_state(), ttl_seconds=300)
 
     results = await asyncio.gather(
-        store.consume_registration(CHALLENGE_ID),
-        store.consume_registration(CHALLENGE_ID),
+        store.consume_registration(CHALLENGE_ID, account_id=ACCOUNT_ID),
+        store.consume_registration(CHALLENGE_ID, account_id=ACCOUNT_ID),
         return_exceptions=True,
     )
 
@@ -109,12 +115,19 @@ async def test_challenge_store_rejects_duplicate_id_and_distinguishes_states() -
     with pytest.raises(ChallengeAlreadyExistsError):
         await store.save_registration(registration_state(), ttl_seconds=300)
     with pytest.raises(ChallengeNotFoundError):
-        await store.consume_registration("ach_00000000000000000000000002")
+        await store.consume_registration(
+            "ach_00000000000000000000000002",
+            account_id=ACCOUNT_ID,
+        )
 
-    state_key, _ = store._keys("registration", CHALLENGE_ID)  # noqa: SLF001
+    state_key, _ = store._keys(  # noqa: SLF001
+        "registration",
+        ACCOUNT_ID,
+        CHALLENGE_ID,
+    )
     redis.values.pop(state_key)
     with pytest.raises(ChallengeExpiredError):
-        await store.consume_registration(CHALLENGE_ID)
+        await store.consume_registration(CHALLENGE_ID, account_id=ACCOUNT_ID)
 
 
 @pytest.mark.asyncio
@@ -125,7 +138,7 @@ async def test_challenge_store_rejects_elapsed_payload_even_if_redis_returns_it(
     clock.current = NOW + timedelta(minutes=5)
 
     with pytest.raises(ChallengeExpiredError):
-        await store.consume_registration(CHALLENGE_ID)
+        await store.consume_registration(CHALLENGE_ID, account_id=ACCOUNT_ID)
 
 
 @pytest.mark.asyncio
@@ -135,8 +148,22 @@ async def test_registration_and_approval_namespaces_do_not_cross_consume() -> No
     await store.save_registration(registration_state(), ttl_seconds=300)
 
     with pytest.raises(ChallengeNotFoundError):
-        await store.consume_approval(CHALLENGE_ID)
-    assert (await store.consume_registration(CHALLENGE_ID)).kind == "registration"
+        await store.consume_approval(CHALLENGE_ID, account_id=ACCOUNT_ID)
+    assert (
+        await store.consume_registration(CHALLENGE_ID, account_id=ACCOUNT_ID)
+    ).kind == "registration"
+
+
+@pytest.mark.asyncio
+async def test_other_account_cannot_consume_or_burn_a_challenge() -> None:
+    store = RedisChallengeStore(AtomicFakeRedis(), clock=FrozenClock(NOW))
+    await store.save_registration(registration_state(), ttl_seconds=300)
+
+    with pytest.raises(ChallengeNotFoundError):
+        await store.consume_registration(CHALLENGE_ID, account_id=OTHER_ACCOUNT_ID)
+
+    state = await store.consume_registration(CHALLENGE_ID, account_id=ACCOUNT_ID)
+    assert state.account_id == ACCOUNT_ID
 
 
 @pytest.mark.asyncio
@@ -163,14 +190,18 @@ async def test_real_redis_challenge_ttl_and_atomic_replay_when_configured() -> N
     try:
         await store.save_registration(state, ttl_seconds=2)
         results = await asyncio.gather(
-            store.consume_registration(challenge_id),
-            store.consume_registration(challenge_id),
+            store.consume_registration(challenge_id, account_id=ACCOUNT_ID),
+            store.consume_registration(challenge_id, account_id=ACCOUNT_ID),
             return_exceptions=True,
         )
         assert sum(isinstance(result, RegistrationChallengeState) for result in results) == 1
         assert sum(isinstance(result, ChallengeAlreadyUsedError) for result in results) == 1
 
-        state_key, status_key = store._keys("registration", challenge_id)  # noqa: SLF001
+        state_key, status_key = store._keys(  # noqa: SLF001
+            "registration",
+            ACCOUNT_ID,
+            challenge_id,
+        )
         assert await client.exists(state_key) == 0
         assert await client.ttl(status_key) > 0
 
@@ -183,7 +214,7 @@ async def test_real_redis_challenge_ttl_and_atomic_replay_when_configured() -> N
         await store.save_registration(expiring, ttl_seconds=1)
         await asyncio.sleep(1.1)
         with pytest.raises(ChallengeExpiredError):
-            await store.consume_registration(expiring_id)
+            await store.consume_registration(expiring_id, account_id=ACCOUNT_ID)
     finally:
         keys = [key async for key in client.scan_iter(match=f"{namespace}:*")]
         if keys:
@@ -204,6 +235,7 @@ def test_approval_state_forbids_duplicate_credential_bindings() -> None:
         ApprovalChallengeState(
             challenge_id=CHALLENGE_ID,
             challenge=encode_base64url(b"a" * 32),
+            account_id=ACCOUNT_ID,
             approval_identity_id=IDENTITY_ID,
             evaluation_id="pye_00000000000000000000000001",
             policy_id="pol_00000000000000000000000001",

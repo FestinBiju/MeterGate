@@ -73,7 +73,6 @@ class PolicyConstraints(APIModel):
 
 
 class BuyerPolicyCreate(PolicyConstraints):
-    subject_ref: SubjectReference
     expires_in_seconds: PolicyTTLSeconds
 
     @field_validator(

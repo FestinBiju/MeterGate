@@ -6,6 +6,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 from app.domain.exceptions import (
+    AuthenticationForbiddenError,
     PolicyIntegrityError,
     PolicyTTLExceededError,
     ResourceNotFoundError,
@@ -47,7 +48,12 @@ class BuyerPolicyApplicationService:
         self._maximum_ttl = maximum_ttl
         self._clock = clock
 
-    async def create(self, payload: BuyerPolicyCreate) -> BuyerPolicyResponse:
+    async def create(
+        self,
+        payload: BuyerPolicyCreate,
+        *,
+        subject_ref: str,
+    ) -> BuyerPolicyResponse:
         requested_ttl = timedelta(seconds=payload.expires_in_seconds)
         if requested_ttl > self._maximum_ttl:
             raise PolicyTTLExceededError(int(self._maximum_ttl.total_seconds()))
@@ -59,7 +65,7 @@ class BuyerPolicyApplicationService:
         constraint_values = constraints.model_dump(mode="json")
         policy_hash = calculate_policy_hash(
             policy_id=policy_id,
-            subject_ref=payload.subject_ref,
+            subject_ref=subject_ref,
             **constraint_values,
             issued_at=issued_at,
             expires_at=expires_at,
@@ -67,7 +73,7 @@ class BuyerPolicyApplicationService:
         )
         policy = BuyerPolicy(
             id=policy_id,
-            subject_ref=payload.subject_ref,
+            subject_ref=subject_ref,
             **constraint_values,
             issued_at=issued_at,
             expires_at=expires_at,
@@ -77,11 +83,28 @@ class BuyerPolicyApplicationService:
         persisted = await self._repository.create(policy)
         return self._to_response(persisted, now=self._read_clock())
 
-    async def get(self, policy_id: str) -> BuyerPolicyResponse:
+    async def get(
+        self,
+        policy_id: str,
+        *,
+        owned_subject_refs: frozenset[str],
+    ) -> BuyerPolicyResponse:
         policy = await self._repository.get(policy_id)
         if policy is None:
             raise ResourceNotFoundError("Buyer policy", policy_id)
+        self._require_ownership(policy, owned_subject_refs)
         return self._to_response(policy, now=self._read_clock())
+
+    @staticmethod
+    def _require_ownership(
+        policy: BuyerPolicy,
+        owned_subject_refs: frozenset[str],
+    ) -> None:
+        if policy.subject_ref not in owned_subject_refs:
+            raise AuthenticationForbiddenError(
+                "The authenticated account does not own this buyer policy",
+                "AUTH_RESOURCE_OWNERSHIP_MISMATCH",
+            )
 
     @staticmethod
     def _normalized_constraints(payload: BuyerPolicyCreate) -> PolicyConstraints:

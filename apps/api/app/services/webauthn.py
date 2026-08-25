@@ -93,7 +93,7 @@ class WebAuthnBackend(Protocol):
         self,
         *,
         challenge: bytes,
-        allow_credentials: Sequence[WebAuthnCredentialDescriptor],
+        allow_credentials: Sequence[WebAuthnCredentialDescriptor] | None = None,
     ) -> dict[str, Any]: ...
 
     def verify_authentication(
@@ -193,19 +193,26 @@ class PyWebAuthnBackend:
         self,
         *,
         challenge: bytes,
-        allow_credentials: Sequence[WebAuthnCredentialDescriptor],
+        allow_credentials: Sequence[WebAuthnCredentialDescriptor] | None = None,
     ) -> dict[str, Any]:
         self._validate_challenge(challenge)
-        if not allow_credentials:
-            raise ValueError("Approval authentication requires at least one credential")
+        if allow_credentials is not None and not allow_credentials:
+            raise ValueError("WebAuthn allow-credential lists must not be empty")
         options = generate_authentication_options(
             rp_id=self._rp_id,
             challenge=challenge,
             timeout=self._timeout_ms,
-            allow_credentials=self._to_library_descriptors(allow_credentials),
+            allow_credentials=(
+                self._to_library_descriptors(allow_credentials)
+                if allow_credentials is not None
+                else None
+            ),
             user_verification=UserVerificationRequirement.REQUIRED,
         )
-        return self._browser_options(options_to_json(options))
+        browser_options = self._browser_options(options_to_json(options))
+        if allow_credentials is None:
+            browser_options.pop("allowCredentials", None)
+        return browser_options
 
     def verify_authentication(
         self,

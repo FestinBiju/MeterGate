@@ -18,6 +18,7 @@ def test_migrations_upgrade_and_downgrade_with_injected_connection() -> None:
 
         inspector = inspect(connection)
         assert set(inspector.get_table_names()) == {
+            "accounts",
             "alembic_version",
             "approval_identities",
             "buyer_policies",
@@ -27,6 +28,18 @@ def test_migrations_upgrade_and_downgrade_with_injected_connection() -> None:
             "purchase_authorizations",
             "quotes",
             "services",
+        }
+        account_columns = {column["name"] for column in inspector.get_columns("accounts")}
+        assert account_columns == {
+            "id",
+            "display_name",
+            "status",
+            "session_version",
+            "created_at",
+            "updated_at",
+        }
+        assert {index["name"] for index in inspector.get_indexes("accounts")} >= {
+            "ix_accounts_status_created_at"
         }
         assert {index["name"] for index in inspector.get_indexes("services")} >= {
             "ix_services_catalog",
@@ -130,6 +143,7 @@ def test_migrations_upgrade_and_downgrade_with_injected_connection() -> None:
         }
         assert identity_columns == {
             "id",
+            "account_id",
             "subject_ref",
             "display_name",
             "webauthn_user_handle",
@@ -144,9 +158,13 @@ def test_migrations_upgrade_and_downgrade_with_injected_connection() -> None:
             constraint["name"]
             for constraint in inspector.get_unique_constraints("approval_identities")
         } == {
+            "uq_approval_identities_account_id",
             "uq_approval_identities_subject_ref",
             "uq_approval_identities_webauthn_user_handle",
         }
+        identity_foreign_key = inspector.get_foreign_keys("approval_identities")[0]
+        assert identity_foreign_key["referred_table"] == "accounts"
+        assert identity_foreign_key["options"]["ondelete"] == "RESTRICT"
 
         credential_columns = {
             column["name"] for column in inspector.get_columns("passkey_credentials")
@@ -230,6 +248,25 @@ def test_migrations_upgrade_and_downgrade_with_injected_connection() -> None:
             "services": "RESTRICT",
         }
 
+        command.downgrade(config, "20260825_0004")
+        assert set(inspect(connection).get_table_names()) == {
+            "alembic_version",
+            "approval_identities",
+            "buyer_policies",
+            "merchants",
+            "passkey_credentials",
+            "policy_evaluations",
+            "purchase_authorizations",
+            "quotes",
+            "services",
+        }
+        assert "account_id" not in {
+            column["name"] for column in inspect(connection).get_columns("approval_identities")
+        }
+
+        command.upgrade(config, "head")
+        assert "accounts" in inspect(connection).get_table_names()
+
         command.downgrade(config, "20260825_0003")
         assert set(inspect(connection).get_table_names()) == {
             "alembic_version",
@@ -273,5 +310,100 @@ def test_migrations_upgrade_and_downgrade_with_injected_connection() -> None:
 
         command.downgrade(config, "base")
         assert inspect(connection).get_table_names() == ["alembic_version"]
+
+    engine.dispose()
+
+
+def test_account_migration_backfills_legacy_identities_without_changing_subjects() -> None:
+    engine = create_engine("sqlite://")
+    config = Config(API_ROOT / "alembic.ini")
+    identities = (
+        (
+            "aid_00000000000000000000000001",
+            "legacy-active",
+            "Legacy active",
+            b"a" * 32,
+            "active",
+        ),
+        (
+            "aid_00000000000000000000000002",
+            "legacy-pending",
+            "Legacy pending",
+            b"b" * 32,
+            "active",
+        ),
+        (
+            "aid_00000000000000000000000003",
+            "legacy-disabled",
+            "Legacy disabled",
+            b"c" * 32,
+            "disabled",
+        ),
+    )
+
+    with engine.connect() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, "20260825_0004")
+        for identity in identities:
+            connection.exec_driver_sql(
+                """
+                INSERT INTO approval_identities (
+                    id, subject_ref, display_name, webauthn_user_handle, status
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                identity,
+            )
+        for index, identity_id in enumerate((identities[0][0], identities[2][0]), start=1):
+            connection.exec_driver_sql(
+                """
+                INSERT INTO passkey_credentials (
+                    id, approval_identity_id, credential_id, public_key, sign_count, transports
+                ) VALUES (?, ?, ?, ?, 0, NULL)
+                """,
+                (
+                    f"pkc_0000000000000000000000000{index}",
+                    identity_id,
+                    f"credential-{index}".encode(),
+                    f"public-key-{index}".encode(),
+                ),
+            )
+        connection.commit()
+
+        command.upgrade(config, "head")
+        backfilled = connection.exec_driver_sql(
+            """
+            SELECT account.id, account.status, identity.subject_ref, identity.account_id
+            FROM accounts AS account
+            JOIN approval_identities AS identity ON identity.account_id = account.id
+            ORDER BY account.id
+            """
+        ).all()
+        assert backfilled == [
+            (
+                "acct_00000000000000000000000001",
+                "active",
+                "legacy-active",
+                "acct_00000000000000000000000001",
+            ),
+            (
+                "acct_00000000000000000000000002",
+                "pending",
+                "legacy-pending",
+                "acct_00000000000000000000000002",
+            ),
+            (
+                "acct_00000000000000000000000003",
+                "disabled",
+                "legacy-disabled",
+                "acct_00000000000000000000000003",
+            ),
+        ]
+
+        command.downgrade(config, "20260825_0004")
+        assert "accounts" not in inspect(connection).get_table_names()
+        preserved_subjects = connection.exec_driver_sql(
+            "SELECT id, subject_ref FROM approval_identities ORDER BY id"
+        ).all()
+        assert preserved_subjects == [(identity[0], identity[1]) for identity in identities]
 
     engine.dispose()

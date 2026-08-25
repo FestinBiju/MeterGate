@@ -13,17 +13,20 @@ from app.cache.approval_challenges import (
     ChallengeNotFoundError,
     RegistrationChallengeState,
 )
-from app.domain.enums import ApprovalIdentityStatus, PurchaseType
+from app.domain.enums import AccountStatus, ApprovalIdentityStatus, PurchaseType
 from app.domain.exceptions import (
     ApprovalConflictError,
     ApprovalExpiredError,
     ApprovalIntegrityError,
+    ApprovalNotFoundError,
     ApprovalVerificationError,
+    AuthenticationForbiddenError,
 )
-from app.domain.hashing import calculate_quote_hash, sha256_json
+from app.domain.hashing import calculate_quote_hash, sha256_bytes, sha256_json
 from app.domain.policy_engine import POLICY_EVALUATION_VERSION, evaluate_policy
 from app.domain.policy_hashing import POLICY_VERSION, calculate_policy_hash
 from app.models import (
+    Account,
     ApprovalIdentity,
     BuyerPolicy,
     PasskeyCredential,
@@ -34,7 +37,6 @@ from app.models import (
 from app.schemas.approvals import (
     ApprovalAssertionVerify,
     ApprovalChallengeCreate,
-    ApprovalIdentityCreate,
     BrowserCredential,
     PasskeyRegistrationVerify,
 )
@@ -48,6 +50,8 @@ from app.services.webauthn import (
 )
 
 NOW = datetime(2026, 8, 25, 12, tzinfo=UTC)
+ACCOUNT_ID = "acct_00000000000000000000000001"
+OTHER_ACCOUNT_ID = "acct_00000000000000000000000002"
 IDENTITY_ID = "aid_00000000000000000000000001"
 OTHER_IDENTITY_ID = "aid_00000000000000000000000002"
 CREDENTIAL_ID = "pkc_00000000000000000000000001"
@@ -58,6 +62,8 @@ MERCHANT_ID = "mrc_00000000000000000000000001"
 SERVICE_ID = "svc_00000000000000000000000001"
 RAW_CREDENTIAL_ID = b"credential-id-1"
 PUBLIC_KEY = b"cose-public-key"
+SESSION_ID = "ses_00000000000000000000000001"
+SESSION_VERSION = 1
 
 
 @dataclass
@@ -85,6 +91,26 @@ class MemoryIdentityRepository:
 
     async def get_for_update(self, identity_id: str) -> ApprovalIdentity | None:
         return self.records.get(identity_id)
+
+    async def get_by_account_id_for_update(
+        self,
+        account_id: str,
+    ) -> ApprovalIdentity | None:
+        return next(
+            (identity for identity in self.records.values() if identity.account_id == account_id),
+            None,
+        )
+
+
+class MemoryAccountRepository:
+    def __init__(self, accounts: Sequence[Account] = ()) -> None:
+        self.records = {account.id: account for account in accounts}
+
+    async def get(self, account_id: str) -> Account | None:
+        return self.records.get(account_id)
+
+    async def get_for_update(self, account_id: str) -> Account | None:
+        return self.records.get(account_id)
 
 
 class MemoryCredentialRepository:
@@ -126,8 +152,8 @@ class MemoryChallengeStore:
     def __init__(self) -> None:
         self.registrations: dict[str, RegistrationChallengeState] = {}
         self.approvals: dict[str, ApprovalChallengeState] = {}
-        self.used_registrations: set[str] = set()
-        self.used_approvals: set[str] = set()
+        self.used_registrations: set[tuple[str, str]] = set()
+        self.used_approvals: set[tuple[str, str]] = set()
 
     async def save_registration(
         self,
@@ -138,13 +164,20 @@ class MemoryChallengeStore:
         assert ttl_seconds > 0
         self.registrations[state.challenge_id] = state
 
-    async def consume_registration(self, challenge_id: str) -> RegistrationChallengeState:
-        if challenge_id in self.used_registrations:
+    async def consume_registration(
+        self,
+        challenge_id: str,
+        *,
+        account_id: str,
+    ) -> RegistrationChallengeState:
+        key = (account_id, challenge_id)
+        if key in self.used_registrations:
             raise ChallengeAlreadyUsedError(challenge_id)
-        state = self.registrations.pop(challenge_id, None)
-        if state is None:
+        state = self.registrations.get(challenge_id)
+        if state is None or state.account_id != account_id:
             raise ChallengeNotFoundError(challenge_id)
-        self.used_registrations.add(challenge_id)
+        self.registrations.pop(challenge_id)
+        self.used_registrations.add(key)
         return state
 
     async def save_approval(
@@ -156,13 +189,20 @@ class MemoryChallengeStore:
         assert ttl_seconds > 0
         self.approvals[state.challenge_id] = state
 
-    async def consume_approval(self, challenge_id: str) -> ApprovalChallengeState:
-        if challenge_id in self.used_approvals:
+    async def consume_approval(
+        self,
+        challenge_id: str,
+        *,
+        account_id: str,
+    ) -> ApprovalChallengeState:
+        key = (account_id, challenge_id)
+        if key in self.used_approvals:
             raise ChallengeAlreadyUsedError(challenge_id)
-        state = self.approvals.pop(challenge_id, None)
-        if state is None:
+        state = self.approvals.get(challenge_id)
+        if state is None or state.account_id != account_id:
             raise ChallengeNotFoundError(challenge_id)
-        self.used_approvals.add(challenge_id)
+        self.approvals.pop(challenge_id)
+        self.used_approvals.add(key)
         return state
 
 
@@ -285,15 +325,33 @@ class MemoryAuthorizationRepository(ObjectRepository):
 def make_identity(
     *,
     identity_id: str = IDENTITY_ID,
+    account_id: str = ACCOUNT_ID,
     subject_ref: str = "dev-user-001",
     status: ApprovalIdentityStatus = ApprovalIdentityStatus.ACTIVE,
 ) -> ApprovalIdentity:
     return ApprovalIdentity(
         id=identity_id,
+        account_id=account_id,
         subject_ref=subject_ref,
         display_name="Development User",
         webauthn_user_handle=b"u" * 32,
         status=status,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
+def make_account(
+    *,
+    account_id: str = ACCOUNT_ID,
+    status: AccountStatus = AccountStatus.ACTIVE,
+    session_version: int = SESSION_VERSION,
+) -> Account:
+    return Account(
+        id=account_id,
+        display_name="Development User",
+        status=status,
+        session_version=session_version,
         created_at=NOW,
         updated_at=NOW,
     )
@@ -450,6 +508,7 @@ def passkey_service(
     store = MemoryChallengeStore()
     webauthn = FakeWebAuthnBackend()
     service = PasskeyApplicationService(
+        MemoryAccountRepository([make_account(account_id=identities[0].account_id)]),  # type: ignore[arg-type]
         identity_repo,  # type: ignore[arg-type]
         credential_repo,  # type: ignore[arg-type]
         store,
@@ -484,6 +543,7 @@ def approval_service(
     authorizations = MemoryAuthorizationRepository()
     clock = clock or FrozenClock(NOW)
     service = ApprovalApplicationService(
+        MemoryAccountRepository([make_account(account_id=identity.account_id)]),  # type: ignore[arg-type]
         MemoryIdentityRepository([identity]),  # type: ignore[arg-type]
         MemoryCredentialRepository(credentials),  # type: ignore[arg-type]
         authorizations,  # type: ignore[arg-type]
@@ -499,20 +559,67 @@ def approval_service(
     return service, store, webauthn, authorizations, clock
 
 
+async def registration_options(
+    service: PasskeyApplicationService,
+    identity_id: str = IDENTITY_ID,
+) -> Any:
+    return await service.registration_options(
+        identity_id,
+        account_id=ACCOUNT_ID,
+        session_id=SESSION_ID,
+    )
+
+
+async def verify_registration(
+    service: PasskeyApplicationService,
+    identity_id: str,
+    payload: PasskeyRegistrationVerify,
+) -> Any:
+    return await service.verify_registration(
+        identity_id,
+        payload,
+        account_id=ACCOUNT_ID,
+        account_session_version=SESSION_VERSION,
+        session_id=SESSION_ID,
+    )
+
+
+async def create_approval_challenge(service: ApprovalApplicationService) -> Any:
+    return await service.create_challenge(
+        ApprovalChallengeCreate(evaluation_id=EVALUATION_ID),
+        account_id=ACCOUNT_ID,
+        account_session_version=SESSION_VERSION,
+    )
+
+
+async def verify_approval_challenge(
+    service: ApprovalApplicationService,
+    challenge_id: str,
+    payload: ApprovalAssertionVerify,
+) -> Any:
+    return await service.verify_challenge(
+        challenge_id,
+        payload,
+        account_id=ACCOUNT_ID,
+        account_session_version=SESSION_VERSION,
+    )
+
+
 @pytest.mark.asyncio
-async def test_identity_create_and_get_return_only_safe_metadata() -> None:
+async def test_identity_get_returns_only_safe_account_bound_metadata() -> None:
     service, _, _, _, _ = passkey_service()
 
-    created = await service.create_identity(
-        ApprovalIdentityCreate(subject_ref="dev-user-001", display_name="Development User")
+    fetched = await service.get_identity(
+        IDENTITY_ID,
+        account_id=ACCOUNT_ID,
     )
-    fetched = await service.get_identity(created.id)
 
-    assert created == fetched
-    assert created.status is ApprovalIdentityStatus.ACTIVE
-    assert created.credential_count == 0
-    assert set(created.model_dump()) == {
+    assert fetched.status is ApprovalIdentityStatus.ACTIVE
+    assert fetched.account_id == ACCOUNT_ID
+    assert fetched.credential_count == 0
+    assert set(fetched.model_dump()) == {
         "id",
+        "account_id",
         "subject_ref",
         "display_name",
         "status",
@@ -523,14 +630,33 @@ async def test_identity_create_and_get_return_only_safe_metadata() -> None:
 
 
 @pytest.mark.asyncio
+async def test_account_cannot_get_or_enroll_another_accounts_approval_identity() -> None:
+    service, _, _, _, _ = passkey_service()
+
+    with pytest.raises(AuthenticationForbiddenError) as get_error:
+        await service.get_identity(IDENTITY_ID, account_id=OTHER_ACCOUNT_ID)
+    with pytest.raises(AuthenticationForbiddenError) as enroll_error:
+        await service.registration_options(
+            IDENTITY_ID,
+            account_id=OTHER_ACCOUNT_ID,
+            session_id=SESSION_ID,
+        )
+
+    assert get_error.value.reason_code == "AUTH_RESOURCE_OWNERSHIP_MISMATCH"
+    assert enroll_error.value.reason_code == "AUTH_RESOURCE_OWNERSHIP_MISMATCH"
+
+
+@pytest.mark.asyncio
 async def test_registration_binds_challenge_identity_and_excludes_existing_credentials() -> None:
     existing = make_credential()
     service, _, _, store, webauthn = passkey_service(credentials=[existing])
 
-    options = await service.registration_options(IDENTITY_ID)
+    options = await registration_options(service)
 
     state = store.registrations[options.challenge_id]
+    assert state.account_id == ACCOUNT_ID
     assert state.approval_identity_id == IDENTITY_ID
+    assert state.session_id_hash == sha256_bytes(SESSION_ID.encode())
     assert state.user_handle
     assert webauthn.registration_excludes == (
         WebAuthnCredentialDescriptor(RAW_CREDENTIAL_ID, ("internal",)),
@@ -541,13 +667,13 @@ async def test_registration_binds_challenge_identity_and_excludes_existing_crede
 @pytest.mark.asyncio
 async def test_registration_verification_persists_safe_credential_and_consumes_challenge() -> None:
     service, _, credentials, _, _ = passkey_service()
-    options = await service.registration_options(IDENTITY_ID)
+    options = await registration_options(service)
     payload = PasskeyRegistrationVerify(
         challenge_id=options.challenge_id,
         credential=browser_credential(),
     )
 
-    response = await service.verify_registration(IDENTITY_ID, payload)
+    response = await verify_registration(service, IDENTITY_ID, payload)
 
     assert response.status == "registered"
     assert response.credential.id == CREDENTIAL_ID
@@ -560,18 +686,18 @@ async def test_registration_verification_persists_safe_credential_and_consumes_c
     }
     assert credentials.records[CREDENTIAL_ID].public_key == PUBLIC_KEY
     with pytest.raises(ApprovalConflictError, match="already used"):
-        await service.verify_registration(IDENTITY_ID, payload)
+        await verify_registration(service, IDENTITY_ID, payload)
 
 
 @pytest.mark.asyncio
 async def test_registration_rejects_disabled_identity_and_missing_uv() -> None:
     disabled, *_ = passkey_service(identity=make_identity(status=ApprovalIdentityStatus.DISABLED))
     with pytest.raises(ApprovalConflictError) as disabled_error:
-        await disabled.registration_options(IDENTITY_ID)
+        await registration_options(disabled)
     assert disabled_error.value.reason_code == "APPROVAL_IDENTITY_DISABLED"
 
     service, _, _, _, webauthn = passkey_service()
-    options = await service.registration_options(IDENTITY_ID)
+    options = await registration_options(service)
     webauthn.registration_verification = RegistrationVerification(
         credential_id=RAW_CREDENTIAL_ID,
         public_key=PUBLIC_KEY,
@@ -582,7 +708,8 @@ async def test_registration_rejects_disabled_identity_and_missing_uv() -> None:
         user_verified=False,
     )
     with pytest.raises(ApprovalVerificationError) as uv_error:
-        await service.verify_registration(
+        await verify_registration(
+            service,
             IDENTITY_ID,
             PasskeyRegistrationVerify(
                 challenge_id=options.challenge_id,
@@ -595,19 +722,42 @@ async def test_registration_rejects_disabled_identity_and_missing_uv() -> None:
 @pytest.mark.asyncio
 async def test_registration_challenge_cannot_move_between_identities() -> None:
     service, _, _, _, _ = passkey_service()
-    options = await service.registration_options(IDENTITY_ID)
+    options = await registration_options(service)
     payload = PasskeyRegistrationVerify(
         challenge_id=options.challenge_id,
         credential=browser_credential(),
     )
 
     with pytest.raises(ApprovalConflictError) as error:
-        await service.verify_registration(OTHER_IDENTITY_ID, payload)
+        await verify_registration(service, OTHER_IDENTITY_ID, payload)
 
     assert error.value.reason_code == "PASSKEY_IDENTITY_BINDING_MISMATCH"
     with pytest.raises(ApprovalConflictError) as replay:
-        await service.verify_registration(IDENTITY_ID, payload)
+        await verify_registration(service, IDENTITY_ID, payload)
     assert replay.value.reason_code == "PASSKEY_CHALLENGE_ALREADY_USED"
+
+
+@pytest.mark.asyncio
+async def test_other_account_cannot_burn_a_passkey_registration_challenge() -> None:
+    service, _, _, _, _ = passkey_service()
+    options = await registration_options(service)
+    payload = PasskeyRegistrationVerify(
+        challenge_id=options.challenge_id,
+        credential=browser_credential(),
+    )
+
+    with pytest.raises(ApprovalNotFoundError) as other_account:
+        await service.verify_registration(
+            IDENTITY_ID,
+            payload,
+            account_id=OTHER_ACCOUNT_ID,
+            account_session_version=SESSION_VERSION,
+            session_id=SESSION_ID,
+        )
+
+    registered = await verify_registration(service, IDENTITY_ID, payload)
+    assert other_account.value.reason_code == "PASSKEY_CHALLENGE_NOT_FOUND"
+    assert registered.credential.id == CREDENTIAL_ID
 
 
 @pytest.mark.asyncio
@@ -615,55 +765,51 @@ async def test_approval_challenge_requires_allow_matching_active_subject_and_pas
     denied_policy = make_policy(maximum_amount=100)
     denied, *_ = approval_service(policy=denied_policy)
     with pytest.raises(ApprovalConflictError) as denied_error:
-        await denied.create_challenge(
-            ApprovalChallengeCreate(
-                evaluation_id=EVALUATION_ID,
-                approval_identity_id=IDENTITY_ID,
-            )
-        )
+        await create_approval_challenge(denied)
     assert denied_error.value.reason_code == "APPROVAL_EVALUATION_NOT_ALLOWED"
 
     mismatched, *_ = approval_service(identity=make_identity(subject_ref="someone-else"))
-    with pytest.raises(ApprovalConflictError) as subject_error:
-        await mismatched.create_challenge(
-            ApprovalChallengeCreate(
-                evaluation_id=EVALUATION_ID,
-                approval_identity_id=IDENTITY_ID,
-            )
-        )
-    assert subject_error.value.reason_code == "APPROVAL_IDENTITY_SUBJECT_MISMATCH"
+    with pytest.raises(AuthenticationForbiddenError) as subject_error:
+        await create_approval_challenge(mismatched)
+    assert subject_error.value.reason_code == "AUTH_RESOURCE_OWNERSHIP_MISMATCH"
 
     disabled, *_ = approval_service(identity=make_identity(status=ApprovalIdentityStatus.DISABLED))
     with pytest.raises(ApprovalConflictError) as disabled_error:
-        await disabled.create_challenge(
-            ApprovalChallengeCreate(
-                evaluation_id=EVALUATION_ID,
-                approval_identity_id=IDENTITY_ID,
-            )
-        )
+        await create_approval_challenge(disabled)
     assert disabled_error.value.reason_code == "APPROVAL_IDENTITY_DISABLED"
 
     no_passkey, *_ = approval_service(credentials=[])
     with pytest.raises(ApprovalConflictError) as passkey_error:
-        await no_passkey.create_challenge(
-            ApprovalChallengeCreate(
-                evaluation_id=EVALUATION_ID,
-                approval_identity_id=IDENTITY_ID,
-            )
-        )
+        await create_approval_challenge(no_passkey)
     assert passkey_error.value.reason_code == "APPROVAL_PASSKEY_REQUIRED"
+
+
+@pytest.mark.asyncio
+async def test_account_cannot_create_a_challenge_for_another_accounts_evaluation() -> None:
+    account_b_identity = make_identity(
+        account_id=OTHER_ACCOUNT_ID,
+        subject_ref=OTHER_ACCOUNT_ID,
+    )
+    service, *_ = approval_service(
+        policy=make_policy(subject_ref=ACCOUNT_ID, maximum_amount=100),
+        identity=account_b_identity,
+    )
+
+    with pytest.raises(AuthenticationForbiddenError) as error:
+        await service.create_challenge(
+            ApprovalChallengeCreate(evaluation_id=EVALUATION_ID),
+            account_id=OTHER_ACCOUNT_ID,
+            account_session_version=SESSION_VERSION,
+        )
+
+    assert error.value.reason_code == "AUTH_RESOURCE_OWNERSHIP_MISMATCH"
 
 
 @pytest.mark.asyncio
 async def test_approval_challenge_returns_server_review_and_credential_allowlist() -> None:
     service, store, webauthn, _, _ = approval_service()
 
-    response = await service.create_challenge(
-        ApprovalChallengeCreate(
-            evaluation_id=EVALUATION_ID,
-            approval_identity_id=IDENTITY_ID,
-        )
-    )
+    response = await create_approval_challenge(service)
 
     assert response.review.subject_ref == "dev-user-001"
     assert response.review.merchant.name == "OrbitIntel"
@@ -682,14 +828,10 @@ async def test_verified_approval_creates_hashed_short_lived_authorization_and_up
     None
 ):
     service, _, _, authorizations, _ = approval_service()
-    challenge = await service.create_challenge(
-        ApprovalChallengeCreate(
-            evaluation_id=EVALUATION_ID,
-            approval_identity_id=IDENTITY_ID,
-        )
-    )
+    challenge = await create_approval_challenge(service)
 
-    response = await service.verify_challenge(
+    response = await verify_approval_challenge(
+        service,
         challenge.challenge_id,
         ApprovalAssertionVerify(credential=browser_credential()),
     )
@@ -709,25 +851,16 @@ async def test_verified_approval_creates_hashed_short_lived_authorization_and_up
 @pytest.mark.asyncio
 async def test_approval_rejects_wrong_credential_uv_failure_and_bad_assertion() -> None:
     service, _, webauthn, _, _ = approval_service()
-    wrong = await service.create_challenge(
-        ApprovalChallengeCreate(
-            evaluation_id=EVALUATION_ID,
-            approval_identity_id=IDENTITY_ID,
-        )
-    )
+    wrong = await create_approval_challenge(service)
     with pytest.raises(ApprovalConflictError) as wrong_error:
-        await service.verify_challenge(
+        await verify_approval_challenge(
+            service,
             wrong.challenge_id,
             ApprovalAssertionVerify(credential=browser_credential(b"other")),
         )
     assert wrong_error.value.reason_code == "APPROVAL_CREDENTIAL_NOT_FOUND"
 
-    uv = await service.create_challenge(
-        ApprovalChallengeCreate(
-            evaluation_id=EVALUATION_ID,
-            approval_identity_id=IDENTITY_ID,
-        )
-    )
+    uv = await create_approval_challenge(service)
     webauthn.authentication_verification = AuthenticationVerification(
         credential_id=RAW_CREDENTIAL_ID,
         new_sign_count=1,
@@ -736,21 +869,18 @@ async def test_approval_rejects_wrong_credential_uv_failure_and_bad_assertion() 
         user_verified=False,
     )
     with pytest.raises(ApprovalVerificationError) as uv_error:
-        await service.verify_challenge(
+        await verify_approval_challenge(
+            service,
             uv.challenge_id,
             ApprovalAssertionVerify(credential=browser_credential()),
         )
     assert uv_error.value.reason_code == "APPROVAL_USER_VERIFICATION_REQUIRED"
 
-    malformed = await service.create_challenge(
-        ApprovalChallengeCreate(
-            evaluation_id=EVALUATION_ID,
-            approval_identity_id=IDENTITY_ID,
-        )
-    )
+    malformed = await create_approval_challenge(service)
     webauthn.authentication_error = True
     with pytest.raises(ApprovalVerificationError) as verification_error:
-        await service.verify_challenge(
+        await verify_approval_challenge(
+            service,
             malformed.challenge_id,
             ApprovalAssertionVerify(credential=browser_credential()),
         )
@@ -760,17 +890,13 @@ async def test_approval_rejects_wrong_credential_uv_failure_and_bad_assertion() 
 @pytest.mark.asyncio
 async def test_approval_review_binding_tamper_fails_before_webauthn() -> None:
     service, store, webauthn, _, _ = approval_service()
-    challenge = await service.create_challenge(
-        ApprovalChallengeCreate(
-            evaluation_id=EVALUATION_ID,
-            approval_identity_id=IDENTITY_ID,
-        )
-    )
+    challenge = await create_approval_challenge(service)
     state = store.approvals[challenge.challenge_id]
     store.approvals[challenge.challenge_id] = state.model_copy(update={"amount": state.amount + 1})
 
     with pytest.raises(ApprovalConflictError) as error:
-        await service.verify_challenge(
+        await verify_approval_challenge(
+            service,
             challenge.challenge_id,
             ApprovalAssertionVerify(credential=browser_credential()),
         )
@@ -789,12 +915,7 @@ async def test_approval_revalidates_freshness_after_webauthn_to_close_toctou() -
         quote=quote,
         clock=clock,
     )
-    challenge = await service.create_challenge(
-        ApprovalChallengeCreate(
-            evaluation_id=EVALUATION_ID,
-            approval_identity_id=IDENTITY_ID,
-        )
-    )
+    challenge = await create_approval_challenge(service)
     webauthn.authentication_hook = lambda: setattr(
         clock,
         "current",
@@ -802,7 +923,8 @@ async def test_approval_revalidates_freshness_after_webauthn_to_close_toctou() -
     )
 
     with pytest.raises(ApprovalExpiredError) as error:
-        await service.verify_challenge(
+        await verify_approval_challenge(
+            service,
             challenge.challenge_id,
             ApprovalAssertionVerify(credential=browser_credential()),
         )
@@ -820,12 +942,7 @@ async def test_approval_rejects_challenge_that_expires_during_final_replay() -> 
         credentials=[credential],
         clock=clock,
     )
-    challenge = await service.create_challenge(
-        ApprovalChallengeCreate(
-            evaluation_id=EVALUATION_ID,
-            approval_identity_id=IDENTITY_ID,
-        )
-    )
+    challenge = await create_approval_challenge(service)
     webauthn.authentication_hook = lambda: setattr(
         clock,
         "current",
@@ -833,7 +950,8 @@ async def test_approval_rejects_challenge_that_expires_during_final_replay() -> 
     )
 
     with pytest.raises(ApprovalExpiredError) as error:
-        await service.verify_challenge(
+        await verify_approval_challenge(
+            service,
             challenge.challenge_id,
             ApprovalAssertionVerify(credential=browser_credential()),
         )
@@ -859,12 +977,7 @@ async def test_approval_issuance_refuses_context_expiring_during_option_generati
     )
 
     with pytest.raises(ApprovalExpiredError) as error:
-        await service.create_challenge(
-            ApprovalChallengeCreate(
-                evaluation_id=EVALUATION_ID,
-                approval_identity_id=IDENTITY_ID,
-            )
-        )
+        await create_approval_challenge(service)
 
     assert error.value.reason_code == "APPROVAL_POLICY_EXPIRED"
     assert not store.approvals
@@ -874,41 +987,54 @@ async def test_approval_issuance_refuses_context_expiring_during_option_generati
 @pytest.mark.asyncio
 async def test_approval_challenge_replay_cannot_create_second_authorization() -> None:
     service, _, _, authorizations, _ = approval_service()
-    challenge = await service.create_challenge(
-        ApprovalChallengeCreate(
-            evaluation_id=EVALUATION_ID,
-            approval_identity_id=IDENTITY_ID,
-        )
-    )
+    challenge = await create_approval_challenge(service)
     payload = ApprovalAssertionVerify(credential=browser_credential())
-    await service.verify_challenge(challenge.challenge_id, payload)
+    await verify_approval_challenge(service, challenge.challenge_id, payload)
 
     with pytest.raises(ApprovalConflictError) as error:
-        await service.verify_challenge(challenge.challenge_id, payload)
+        await verify_approval_challenge(service, challenge.challenge_id, payload)
 
     assert error.value.reason_code == "APPROVAL_CHALLENGE_ALREADY_USED"
     assert len(authorizations.records) == 1
 
 
 @pytest.mark.asyncio
+async def test_other_account_cannot_burn_challenge_or_get_authorization() -> None:
+    service, _, _, _, _ = approval_service()
+    challenge = await create_approval_challenge(service)
+    assertion = ApprovalAssertionVerify(credential=browser_credential())
+
+    with pytest.raises(ApprovalNotFoundError) as challenge_error:
+        await service.verify_challenge(
+            challenge.challenge_id,
+            assertion,
+            account_id=OTHER_ACCOUNT_ID,
+            account_session_version=SESSION_VERSION,
+        )
+
+    created = await verify_approval_challenge(service, challenge.challenge_id, assertion)
+    with pytest.raises(AuthenticationForbiddenError) as authorization_error:
+        await service.get_authorization(created.id, account_id=OTHER_ACCOUNT_ID)
+
+    assert challenge_error.value.reason_code == "APPROVAL_CHALLENGE_NOT_FOUND"
+    assert authorization_error.value.reason_code == "AUTH_RESOURCE_OWNERSHIP_MISMATCH"
+
+
+@pytest.mark.asyncio
 async def test_get_authorization_derives_expiry_and_recomputes_integrity() -> None:
     service, _, _, authorizations, clock = approval_service()
-    challenge = await service.create_challenge(
-        ApprovalChallengeCreate(
-            evaluation_id=EVALUATION_ID,
-            approval_identity_id=IDENTITY_ID,
-        )
-    )
-    created = await service.verify_challenge(
+    challenge = await create_approval_challenge(service)
+    created = await verify_approval_challenge(
+        service,
         challenge.challenge_id,
         ApprovalAssertionVerify(credential=browser_credential()),
     )
     clock.current = NOW + timedelta(seconds=121)
 
-    fetched = await service.get_authorization(created.id)
+    fetched = await service.get_authorization(created.id, account_id=ACCOUNT_ID)
     assert fetched.state == "expired"
 
     authorizations.records[created.id].authorization_hash = f"sha256:{'f' * 64}"
     with pytest.raises(ApprovalIntegrityError) as error:
-        await service.get_authorization(created.id)
+        await service.get_authorization(created.id, account_id=ACCOUNT_ID)
     assert error.value.reason_code == "INTEGRITY_AUTHORIZATION_HASH_MISMATCH"

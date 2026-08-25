@@ -7,6 +7,42 @@ class DomainError(Exception):
     """Base class for expected domain failures."""
 
 
+class AuthenticationError(DomainError):
+    """Fail-closed account/session failure with a stable public code."""
+
+    def __init__(self, detail: str, reason_code: str) -> None:
+        self.reason_code = reason_code
+        super().__init__(detail)
+
+
+class AuthenticationUnauthorizedError(AuthenticationError):
+    """A valid active authenticated session is required."""
+
+
+class AuthenticationForbiddenError(AuthenticationError):
+    """An authenticated principal does not own or cannot perform an action."""
+
+
+class AuthenticationNotFoundError(AuthenticationError):
+    """An authentication challenge or account could not be found."""
+
+
+class AuthenticationExpiredError(AuthenticationError):
+    """A short-lived authentication ceremony expired."""
+
+
+class AuthenticationConflictError(AuthenticationError):
+    """Authentication state was already used or conflicts with durable state."""
+
+
+class AuthenticationVerificationError(AuthenticationError):
+    """A supplied passkey response could not be verified."""
+
+
+class AuthenticationIntegrityError(AuthenticationError):
+    """Persisted or ephemeral authentication state failed validation."""
+
+
 class ApprovalError(DomainError):
     """Fail-closed trusted-approval failure with a stable public code."""
 

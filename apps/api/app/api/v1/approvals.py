@@ -2,7 +2,11 @@
 
 from fastapi import APIRouter, status
 
-from app.api.v1.dependencies import ApprovalApplicationDependency
+from app.api.v1.dependencies import (
+    ApprovalApplicationDependency,
+    AuthenticatedMutationDependency,
+    CurrentAccountDependency,
+)
 from app.schemas.approvals import (
     ApprovalAssertionVerify,
     ApprovalChallengeCreate,
@@ -21,8 +25,13 @@ router = APIRouter(tags=["trusted-approval"])
 async def create_approval_challenge(
     payload: ApprovalChallengeCreate,
     application_service: ApprovalApplicationDependency,
+    current: AuthenticatedMutationDependency,
 ) -> ApprovalChallengeResponse:
-    return await application_service.create_challenge(payload)
+    return await application_service.create_challenge(
+        payload,
+        account_id=current.account.id,
+        account_session_version=current.state.account_session_version,
+    )
 
 
 @router.post(
@@ -34,8 +43,14 @@ async def verify_approval_challenge(
     challenge_id: str,
     payload: ApprovalAssertionVerify,
     application_service: ApprovalApplicationDependency,
+    current: AuthenticatedMutationDependency,
 ) -> PurchaseAuthorizationResponse:
-    return await application_service.verify_challenge(challenge_id, payload)
+    return await application_service.verify_challenge(
+        challenge_id,
+        payload,
+        account_id=current.account.id,
+        account_session_version=current.state.account_session_version,
+    )
 
 
 @router.get(
@@ -45,5 +60,9 @@ async def verify_approval_challenge(
 async def get_purchase_authorization(
     authorization_id: str,
     application_service: ApprovalApplicationDependency,
+    current: CurrentAccountDependency,
 ) -> PurchaseAuthorizationResponse:
-    return await application_service.get_authorization(authorization_id)
+    return await application_service.get_authorization(
+        authorization_id,
+        account_id=current.account.id,
+    )

@@ -1,5 +1,6 @@
 """ORM model registry."""
 
+from app.models.account import Account
 from app.models.approval_identity import ApprovalIdentity
 from app.models.base import Base
 from app.models.buyer_policy import BuyerPolicy
@@ -11,6 +12,7 @@ from app.models.quote import Quote
 from app.models.service import Service
 
 __all__ = [
+    "Account",
     "ApprovalIdentity",
     "Base",
     "BuyerPolicy",

@@ -17,8 +17,24 @@ from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.orm import Session
 
-from app.domain.enums import MerchantStatus, PolicyDecision, PurchaseType, ServiceStatus
-from app.models import Base, BuyerPolicy, Merchant, PolicyEvaluation, Quote, Service
+from app.domain.enums import (
+    AccountStatus,
+    ApprovalIdentityStatus,
+    MerchantStatus,
+    PolicyDecision,
+    PurchaseType,
+    ServiceStatus,
+)
+from app.models import (
+    Account,
+    ApprovalIdentity,
+    Base,
+    BuyerPolicy,
+    Merchant,
+    PolicyEvaluation,
+    Quote,
+    Service,
+)
 from app.repositories import BuyerPolicyRepository, PolicyEvaluationRepository
 
 HASH_PREFIX = "sha256:"
@@ -80,6 +96,11 @@ def evaluation_for_test(*, hash_value: int = 301) -> PolicyEvaluation:
 
 
 def test_models_use_prefixed_string_primary_keys() -> None:
+    account_id_column = Account.__table__.c.id
+    assert account_id_column.primary_key is True
+    assert isinstance(account_id_column.type, String)
+    assert account_id_column.type.length == 31
+
     for table in (
         BuyerPolicy.__table__,
         Merchant.__table__,
@@ -330,6 +351,7 @@ def test_policy_models_define_integrity_constraints_and_query_indexes() -> None:
 
 def test_persisted_enum_values_are_lowercase_strings() -> None:
     enum_columns = (
+        Account.__table__.c.status,
         Merchant.__table__.c.status,
         Service.__table__.c.status,
         Service.__table__.c.service_type,
@@ -342,6 +364,121 @@ def test_persisted_enum_values_are_lowercase_strings() -> None:
         assert all(value == value.lower() for value in column.type.enums)
         assert column.type.native_enum is False
         assert column.type.create_constraint is False
+
+
+def test_account_model_defines_security_constraints_and_identity_binding() -> None:
+    account_checks = {
+        constraint.name
+        for constraint in Account.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    identity_checks = {
+        constraint.name
+        for constraint in ApprovalIdentity.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    identity_unique = {
+        constraint.name
+        for constraint in ApprovalIdentity.__table__.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    account_foreign_key = next(iter(ApprovalIdentity.__table__.c.account_id.foreign_keys))
+
+    assert Account.__table__.c.status.default.arg is AccountStatus.PENDING
+    assert str(Account.__table__.c.status.server_default.arg) == "pending"
+    assert Account.__table__.c.session_version.default.arg == 1
+    assert str(Account.__table__.c.session_version.server_default.arg) == "1"
+    assert {
+        "ck_accounts_display_name_valid",
+        "ck_accounts_id_format",
+        "ck_accounts_id_length_prefix",
+        "ck_accounts_session_version_positive",
+        "ck_accounts_status",
+        "ck_accounts_updated_at_valid",
+    } <= account_checks
+    assert {index.name for index in Account.__table__.indexes} == {"ix_accounts_status_created_at"}
+    assert {
+        "ck_approval_identities_account_id_format",
+        "ck_approval_identities_account_id_length_prefix",
+    } <= identity_checks
+    assert "uq_approval_identities_account_id" in identity_unique
+    assert account_foreign_key.target_fullname == "accounts.id"
+    assert account_foreign_key.ondelete == "RESTRICT"
+    assert ApprovalIdentity.__table__.c.account_id.nullable is False
+
+
+def test_account_and_identity_mappers_enforce_account_security_guards() -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    account_id = "acct_00000000000000000000000000"
+    identity_id = "aid_00000000000000000000000000"
+
+    with Session(engine, expire_on_commit=False) as session:
+        account = Account(
+            id=account_id,
+            display_name="Account owner",
+            status=AccountStatus.PENDING,
+            session_version=1,
+        )
+        session.add(account)
+        session.commit()
+
+        account.status = AccountStatus.ACTIVE
+        with pytest.raises(InvalidRequestError, match="session version must advance"):
+            session.commit()
+        session.rollback()
+
+        account = session.get(Account, account_id)
+        assert account is not None
+        account.status = AccountStatus.ACTIVE
+        account.session_version = 2
+        session.commit()
+
+        account.status = AccountStatus.PENDING
+        account.session_version = 3
+        with pytest.raises(InvalidRequestError, match="status transition"):
+            session.commit()
+        session.rollback()
+
+        account = session.get(Account, account_id)
+        assert account is not None
+        identity = ApprovalIdentity(
+            id=identity_id,
+            account_id=account.id,
+            subject_ref=account.id,
+            display_name="Account owner",
+            webauthn_user_handle=b"u" * 32,
+            status=ApprovalIdentityStatus.ACTIVE,
+        )
+        session.add(identity)
+        session.commit()
+
+        identity.account_id = "acct_00000000000000000000000001"
+        with pytest.raises(InvalidRequestError, match="bindings are immutable"):
+            session.commit()
+        session.rollback()
+
+        account = session.get(Account, account_id)
+        assert account is not None
+        session.delete(account)
+        with pytest.raises(InvalidRequestError, match="Accounts cannot be deleted"):
+            session.commit()
+        session.rollback()
+
+        invalid_identity = ApprovalIdentity(
+            id="aid_00000000000000000000000001",
+            account_id=account_id,
+            subject_ref="legacy-client-subject",
+            display_name="Invalid binding",
+            webauthn_user_handle=b"v" * 32,
+            status=ApprovalIdentityStatus.ACTIVE,
+        )
+        session.add(invalid_identity)
+        with pytest.raises(InvalidRequestError, match="subject must equal"):
+            session.commit()
+        session.rollback()
+
+    engine.dispose()
 
 
 def test_timestamps_are_timezone_aware() -> None:
