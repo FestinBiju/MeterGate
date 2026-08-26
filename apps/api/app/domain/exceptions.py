@@ -111,6 +111,38 @@ class PaymentTimeoutError(PaymentError):
     """A read-only provider operation exceeded its bounded timeout."""
 
 
+class CompensationError(DomainError):
+    """Fail-closed compensation/refund failure with a stable public code."""
+
+    def __init__(self, detail: str, reason_code: str) -> None:
+        self.reason_code = reason_code
+        super().__init__(detail)
+
+
+class CompensationNotFoundError(CompensationError):
+    """A compensation case or refund could not be found."""
+
+
+class CompensationForbiddenError(CompensationError):
+    """The authenticated account does not own this compensation evidence."""
+
+
+class CompensationConflictError(CompensationError):
+    """The requested compensation operation conflicts with durable state."""
+
+
+class CompensationIntegrityError(CompensationError):
+    """Stored or provider compensation evidence failed an integrity check."""
+
+
+class CompensationUnavailableError(CompensationError):
+    """The refund provider or durable recovery path is temporarily unavailable."""
+
+
+class CompensationTimeoutError(CompensationError):
+    """A bounded refund-provider operation timed out ambiguously."""
+
+
 class EntitlementError(DomainError):
     """Fail-closed paid-access failure with a stable public code."""
 

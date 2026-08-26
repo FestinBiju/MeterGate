@@ -51,6 +51,67 @@ class PaymentProvider(StrEnum):
     RAZORPAY = "razorpay"
 
 
+class CompensationDecisionState(StrEnum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    EXECUTING = "executing"
+    COMPLETED = "completed"
+    MANUAL_REVIEW = "manual_review"
+
+
+class CompensationRecommendedAction(StrEnum):
+    FULL_REFUND = "full_refund"
+    MANUAL_REVIEW = "manual_review"
+    NO_REFUND = "no_refund"
+
+
+class CompensationDecisionProvenance(StrEnum):
+    AUTOMATIC_APPROVED = "automatic_approved"
+    MANUAL_APPROVED = "manual_approved"
+    MANUAL_REJECTED = "manual_rejected"
+    MANUAL_REVIEW = "manual_review"
+
+
+class PaymentRefundState(StrEnum):
+    REFUND_PENDING = "refund_pending"
+    REFUND_PROCESSING = "refund_processing"
+    REFUNDED = "refunded"
+    REFUND_FAILED = "refund_failed"
+    REFUND_UNCERTAIN = "refund_uncertain"
+    RECONCILIATION_REQUIRED = "reconciliation_required"
+
+
+class CompensationEventType(StrEnum):
+    COMPENSATION_CASE_CREATED = "compensation_case_created"
+    COMPENSATION_RECOMMENDED = "compensation_recommended"
+    COMPENSATION_APPROVED = "compensation_approved"
+    COMPENSATION_REJECTED = "compensation_rejected"
+    REFUND_OUTBOX_CREATED = "refund_outbox_created"
+    REFUND_REQUESTED = "refund_requested"
+    REFUND_REQUEST_STARTED = "refund_request_started"
+    RAZORPAY_REFUND_CREATED = "razorpay_refund_created"
+    REFUND_PROCESSING = "refund_processing"
+    REFUND_COMPLETED = "refund_completed"
+    REFUND_FAILED = "refund_failed"
+    REFUND_UNCERTAIN = "refund_uncertain"
+    REFUND_RECONCILIATION_REQUIRED = "refund_reconciliation_required"
+    REFUND_RECONCILIATION_RESOLVED = "refund_reconciliation_resolved"
+    COMPENSATION_CLOSED = "compensation_closed"
+
+
+class CompensationEventActorType(StrEnum):
+    SYSTEM = "system"
+    REFUND_WORKER = "refund_worker"
+    PROVIDER_API = "provider_api"
+    PROVIDER_WEBHOOK = "provider_webhook"
+    OPERATOR = "operator"
+
+
+class RefundOutboxEventType(StrEnum):
+    REFUND_REQUESTED = "refund_requested"
+
+
 class PaymentTransactionState(StrEnum):
     ORDER_CREATION_PENDING = "order_creation_pending"
     ORDER_CREATED = "order_created"

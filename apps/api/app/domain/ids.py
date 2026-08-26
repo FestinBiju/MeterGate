@@ -11,6 +11,8 @@ IdPrefix = Literal[
     "ach_",
     "aut_",
     "cap_",
+    "cmp_",
+    "cpe_",
     "ent_",
     "ful_",
     "fve_",
@@ -22,6 +24,8 @@ IdPrefix = Literal[
     "pte_",
     "pye_",
     "qte_",
+    "rfd_",
+    "rox_",
     "rwe_",
     "sfc_",
     "svc_",
@@ -33,6 +37,8 @@ APPROVAL_IDENTITY_ID_PREFIX: IdPrefix = "aid_"
 APPROVAL_CHALLENGE_ID_PREFIX: IdPrefix = "ach_"
 AUTHORIZATION_ID_PREFIX: IdPrefix = "aut_"
 CAPABILITY_ID_PREFIX: IdPrefix = "cap_"
+COMPENSATION_CASE_ID_PREFIX: IdPrefix = "cmp_"
+COMPENSATION_EVENT_ID_PREFIX: IdPrefix = "cpe_"
 ENTITLEMENT_ID_PREFIX: IdPrefix = "ent_"
 FULFILLMENT_EXECUTION_ID_PREFIX: IdPrefix = "ful_"
 FULFILLMENT_EVENT_ID_PREFIX: IdPrefix = "fve_"
@@ -44,6 +50,8 @@ POLICY_ID_PREFIX: IdPrefix = "pol_"
 PAYMENT_TRANSACTION_EVENT_ID_PREFIX: IdPrefix = "pte_"
 POLICY_EVALUATION_ID_PREFIX: IdPrefix = "pye_"
 QUOTE_ID_PREFIX: IdPrefix = "qte_"
+PAYMENT_REFUND_ID_PREFIX: IdPrefix = "rfd_"
+REFUND_OUTBOX_EVENT_ID_PREFIX: IdPrefix = "rox_"
 RAZORPAY_WEBHOOK_EVENT_ID_PREFIX: IdPrefix = "rwe_"
 SERVICE_FULFILLMENT_CONFIG_ID_PREFIX: IdPrefix = "sfc_"
 SERVICE_ID_PREFIX: IdPrefix = "svc_"
@@ -66,6 +74,8 @@ def generate_id(prefix: IdPrefix) -> str:
         APPROVAL_CHALLENGE_ID_PREFIX,
         AUTHORIZATION_ID_PREFIX,
         CAPABILITY_ID_PREFIX,
+        COMPENSATION_CASE_ID_PREFIX,
+        COMPENSATION_EVENT_ID_PREFIX,
         ENTITLEMENT_ID_PREFIX,
         FULFILLMENT_EXECUTION_ID_PREFIX,
         FULFILLMENT_EVENT_ID_PREFIX,
@@ -77,6 +87,8 @@ def generate_id(prefix: IdPrefix) -> str:
         PAYMENT_TRANSACTION_EVENT_ID_PREFIX,
         POLICY_EVALUATION_ID_PREFIX,
         QUOTE_ID_PREFIX,
+        PAYMENT_REFUND_ID_PREFIX,
+        REFUND_OUTBOX_EVENT_ID_PREFIX,
         RAZORPAY_WEBHOOK_EVENT_ID_PREFIX,
         SERVICE_FULFILLMENT_CONFIG_ID_PREFIX,
         SERVICE_ID_PREFIX,
@@ -107,6 +119,14 @@ def new_authorization_id() -> str:
 
 def new_capability_id() -> str:
     return generate_id(CAPABILITY_ID_PREFIX)
+
+
+def new_compensation_case_id() -> str:
+    return generate_id(COMPENSATION_CASE_ID_PREFIX)
+
+
+def new_compensation_event_id() -> str:
+    return generate_id(COMPENSATION_EVENT_ID_PREFIX)
 
 
 def new_entitlement_id() -> str:
@@ -151,6 +171,14 @@ def new_policy_evaluation_id() -> str:
 
 def new_quote_id() -> str:
     return generate_id(QUOTE_ID_PREFIX)
+
+
+def new_payment_refund_id() -> str:
+    return generate_id(PAYMENT_REFUND_ID_PREFIX)
+
+
+def new_refund_outbox_event_id() -> str:
+    return generate_id(REFUND_OUTBOX_EVENT_ID_PREFIX)
 
 
 def new_razorpay_webhook_event_id() -> str:

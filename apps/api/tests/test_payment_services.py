@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy.exc import IntegrityError
@@ -41,6 +42,7 @@ from app.providers import (
     ProviderPayment,
     checkout_signature_digest,
 )
+from app.schemas.compensations import CompensationSummary, RefundSummary
 from app.schemas.payments import CheckoutVerificationCreate, PaymentTransactionCreate
 from app.services.payments import PaymentApplicationService
 
@@ -249,6 +251,25 @@ class LookupRepository:
         return self.values.get(value_id)
 
 
+class EmptyCompensationReadService:
+    async def projection_for_transaction(
+        self,
+        transaction_id: str,
+        *,
+        payment_state: PaymentTransactionState | str,
+    ) -> SimpleNamespace:
+        del transaction_id
+        return SimpleNamespace(
+            compensation_summary=None,
+            refund_summary=None,
+            commerce_outcome=(
+                "paid"
+                if PaymentTransactionState(payment_state) is PaymentTransactionState.PAID
+                else "payment_pending"
+            ),
+        )
+
+
 class CatalogRepository:
     def __init__(self, merchant: Any, service: Any) -> None:
         self.merchant = merchant
@@ -294,6 +315,9 @@ class MemoryAttemptRepository:
         ]
 
     async def get_by_provider_payment_id_for_update(self, payment_id: str) -> Any | None:
+        return self.state.attempts_by_payment_id.get(payment_id)
+
+    async def get_by_provider_payment_id(self, payment_id: str) -> Any | None:
         return self.state.attempts_by_payment_id.get(payment_id)
 
 
@@ -435,6 +459,35 @@ class MemoryTransactionRepository:
             )
         await self.session.commit()
         return transaction
+
+    async def update_many_with_events(
+        self,
+        updates: Sequence[tuple[PaymentTransaction, Any]],
+        *,
+        webhook_event: Any | None = None,
+    ) -> tuple[PaymentTransaction, ...]:
+        if any(event.idempotency_key in self.state.events_by_key for _, event in updates):
+            await self.session.rollback()
+            raise _integrity_error()
+        if (
+            webhook_event is not None
+            and webhook_event.provider_event_id in self.state.webhooks_by_provider_event_id
+        ):
+            await self.session.rollback()
+            raise _integrity_error()
+        transactions: list[PaymentTransaction] = []
+        for transaction, event in updates:
+            transaction.revision += 1
+            transaction.updated_at = self.clock.current
+            self.state.transactions[transaction.id] = transaction
+            self.state.events_by_key[event.idempotency_key] = event
+            transactions.append(transaction)
+        if webhook_event is not None:
+            self.state.webhooks_by_provider_event_id[webhook_event.provider_event_id] = (
+                webhook_event
+            )
+        await self.session.commit()
+        return tuple(transactions)
 
 
 class FakeEvaluationService:
@@ -644,6 +697,7 @@ class ServiceHarness:
             self.clock,
         )
         application_service._attempts = MemoryAttemptRepository(self.state)  # noqa: SLF001
+        application_service._compensation_reads = EmptyCompensationReadService()  # noqa: SLF001
         application_service._events = MemoryEventRepository(self.state)  # noqa: SLF001
         application_service._webhooks = MemoryWebhookRepository(  # noqa: SLF001
             self.state,
@@ -1055,6 +1109,63 @@ async def test_checkout_uses_server_fetched_payment_truth(
     assert harness.state.attempts_by_payment_id[PAYMENT_ID].provider_status is (
         PaymentAttemptStatus(payment_status)
     )
+
+
+@pytest.mark.asyncio
+async def test_payment_response_projects_compensation_refund_and_commerce_outcome() -> None:
+    harness = make_harness()
+    await harness.create_transaction()
+    transaction = harness.transaction
+    harness.provider.fetch_payment_outcome = make_provider_payment(status="captured")
+    harness.provider.fetch_order_outcome = make_provider_order(
+        receipt=transaction.provider_receipt,
+        status="paid",
+    )
+    await harness.build_service().verify_checkout(
+        transaction.id,
+        checkout_payload(transaction),
+        account_id=ACCOUNT_ID,
+    )
+    compensation = CompensationSummary(
+        compensation_id="cmp_00000000000000000000000001",
+        fulfillment_execution_id="ful_00000000000000000000000001",
+        failure_code="FULFILLMENT_PROVIDER_PERMANENT_FAILURE",
+        recommended_action="full_refund",
+        decision_state="completed",
+        decision_provenance="automatic_approved",
+        approved_refund_amount=transaction.amount,
+        decision_reason_code="COMPENSATION_FULL_REFUND_FULFILLMENT_FAILED",
+    )
+    refund = RefundSummary(
+        refund_id="rfd_00000000000000000000000001",
+        provider_payment_id=PAYMENT_ID,
+        provider_refund_id="rfnd_testRefund123",
+        amount=transaction.amount,
+        currency=transaction.currency,
+        state="refunded",
+        provider_status="processed",
+    )
+    recovery_reads = SimpleNamespace(
+        projection_for_transaction=AsyncMock(
+            return_value=SimpleNamespace(
+                compensation_summary=compensation,
+                refund_summary=refund,
+                commerce_outcome="refunded",
+            )
+        )
+    )
+    service = harness.build_service()
+    service._compensation_reads = recovery_reads  # noqa: SLF001
+
+    response = await service.get_transaction(transaction.id, account_id=ACCOUNT_ID)
+
+    recovery_reads.projection_for_transaction.assert_awaited_once_with(
+        transaction.id,
+        payment_state=PaymentTransactionState.PAID,
+    )
+    assert response.compensation_summary == compensation
+    assert response.refund_summary == refund
+    assert response.commerce_outcome == "refunded"
 
 
 @pytest.mark.asyncio

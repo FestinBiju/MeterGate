@@ -18,6 +18,7 @@ from app.domain.entitlement_hashing import (
     recompute_entitlement_integrity,
 )
 from app.domain.enums import (
+    CompensationEventType,
     FulfillmentEventActorType,
     FulfillmentEventType,
     FulfillmentExecutionState,
@@ -42,6 +43,8 @@ from app.models import (
 )
 from app.repositories import (
     CommerceOutboxEventRepository,
+    CompensationCaseRepository,
+    CompensationEventRepository,
     EntitlementRepository,
     FulfillmentEventRepository,
     FulfillmentExecutionRepository,
@@ -104,6 +107,8 @@ class EntitlementApplicationService:
         self._clock = clock
         self._transactions = PaymentTransactionRepository(session)
         self._outbox = CommerceOutboxEventRepository(session)
+        self._compensation_cases = CompensationCaseRepository(session)
+        self._compensation_events = CompensationEventRepository(session)
         self._entitlements = EntitlementRepository(session)
         self._executions = FulfillmentExecutionRepository(session)
         self._fulfillment_events = FulfillmentEventRepository(session)
@@ -222,13 +227,18 @@ class EntitlementApplicationService:
             )
         payment_events = await self._payment_events.list_for_transaction(transaction_id)
         fulfillment_events = await self._fulfillment_events.list_for_transaction(transaction_id)
+        compensation_events = await self._compensation_events.list_for_transaction(transaction_id)
         entries = [
             EntitlementTimelineEntry(
-                event_type=event.event_type.value.upper(),
+                event_type=(
+                    "COMMERCE_COMPENSATED"
+                    if event.event_type is CompensationEventType.COMPENSATION_CLOSED
+                    else event.event_type.value.upper()
+                ),
                 reason_code=event.reason_code,
                 occurred_at=self._as_utc(event.occurred_at),
             )
-            for event in (*payment_events, *fulfillment_events)
+            for event in (*payment_events, *fulfillment_events, *compensation_events)
         ]
         work = await self._outbox.get_by_deduplication_key(f"entitlement:{transaction_id}")
         entitlement = await self._entitlements.get_by_transaction_id(transaction_id)
@@ -260,18 +270,24 @@ class EntitlementApplicationService:
             entitlement.transaction_id,
             for_update=True,
         )
-        execution = await self._executions.get_by_entitlement_id(entitlement.id)
+        compensation_case = await self._compensation_cases.get_by_transaction_id(
+            entitlement.transaction_id
+        )
+        execution = await self._executions.get_by_entitlement_id_for_update(entitlement.id)
+        if compensation_case is not None or (
+            execution is not None and execution.compensation_required
+        ):
+            raise EntitlementConflictError(
+                "Compensation evidence quarantines capability issuance",
+                "CAPABILITY_COMPENSATION_QUARANTINED",
+            )
         if execution is not None and FulfillmentExecutionState(execution.execution_state) in {
             FulfillmentExecutionState.PERMANENT_FAILURE,
             FulfillmentExecutionState.RECONCILIATION_REQUIRED,
         }:
             raise EntitlementConflictError(
                 "The fulfillment cannot accept another capability",
-                (
-                    "FULFILLMENT_COMPENSATION_REQUIRED"
-                    if execution.compensation_required
-                    else "FULFILLMENT_RECONCILIATION_REQUIRED"
-                ),
+                "FULFILLMENT_RECONCILIATION_REQUIRED",
             )
         issued = self._capabilities.issue(entitlement)
         self._session.add(

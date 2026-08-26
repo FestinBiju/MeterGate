@@ -19,6 +19,12 @@ from app.domain.exceptions import (
     CapabilityExpiredError,
     CapabilityForbiddenError,
     CapabilityInvalidError,
+    CompensationConflictError,
+    CompensationForbiddenError,
+    CompensationIntegrityError,
+    CompensationNotFoundError,
+    CompensationTimeoutError,
+    CompensationUnavailableError,
     EntitlementConflictError,
     EntitlementExpiredError,
     EntitlementForbiddenError,
@@ -99,6 +105,15 @@ def register_domain_exception_handlers(application: FastAPI) -> None:
     application.add_exception_handler(PaymentProviderError, _payment_provider_handler)
     application.add_exception_handler(PaymentUnavailableError, _payment_unavailable_handler)
     application.add_exception_handler(PaymentTimeoutError, _payment_timeout_handler)
+    application.add_exception_handler(CompensationNotFoundError, _compensation_not_found_handler)
+    application.add_exception_handler(CompensationForbiddenError, _compensation_forbidden_handler)
+    application.add_exception_handler(CompensationConflictError, _compensation_conflict_handler)
+    application.add_exception_handler(CompensationIntegrityError, _compensation_integrity_handler)
+    application.add_exception_handler(
+        CompensationUnavailableError,
+        _compensation_unavailable_handler,
+    )
+    application.add_exception_handler(CompensationTimeoutError, _compensation_timeout_handler)
     application.add_exception_handler(EntitlementNotFoundError, _entitlement_not_found_handler)
     application.add_exception_handler(EntitlementForbiddenError, _entitlement_forbidden_handler)
     application.add_exception_handler(EntitlementExpiredError, _entitlement_expired_handler)
@@ -391,6 +406,55 @@ async def _payment_unavailable_handler(request: Request, error: Exception) -> JS
 async def _payment_timeout_handler(request: Request, error: Exception) -> JSONResponse:
     del request
     return _payment_response(error, status.HTTP_504_GATEWAY_TIMEOUT)
+
+
+def _compensation_response(error: Exception, status_code: int) -> JSONResponse:
+    assert isinstance(
+        error,
+        (
+            CompensationNotFoundError,
+            CompensationForbiddenError,
+            CompensationConflictError,
+            CompensationIntegrityError,
+            CompensationUnavailableError,
+            CompensationTimeoutError,
+        ),
+    )
+    return JSONResponse(
+        status_code=status_code,
+        content={"detail": str(error), "reason_code": error.reason_code},
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+async def _compensation_not_found_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _compensation_response(error, status.HTTP_404_NOT_FOUND)
+
+
+async def _compensation_forbidden_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _compensation_response(error, status.HTTP_403_FORBIDDEN)
+
+
+async def _compensation_conflict_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _compensation_response(error, status.HTTP_409_CONFLICT)
+
+
+async def _compensation_integrity_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _compensation_response(error, status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+async def _compensation_unavailable_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _compensation_response(error, status.HTTP_503_SERVICE_UNAVAILABLE)
+
+
+async def _compensation_timeout_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _compensation_response(error, status.HTTP_504_GATEWAY_TIMEOUT)
 
 
 def _paid_access_response(

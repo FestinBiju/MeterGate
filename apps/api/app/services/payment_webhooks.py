@@ -17,8 +17,8 @@ from app.providers import validate_provider_event_type, verify_webhook_signature
 
 Clock = Callable[[], datetime]
 VerifiedWebhookHook = Callable[[VerifiedWebhookPayload], Awaitable[None]]
-_VALUE_REVOKING_WEBHOOK_EVENTS = frozenset(
-    {"refund.created", "refund.processed", "refund.speed_changed"}
+_REFUND_WEBHOOK_EVENTS = frozenset(
+    {"refund.created", "refund.processed", "refund.failed", "refund.speed_changed"}
 )
 _VALUE_REVOKING_WEBHOOK_MAXIMUM_AGE = timedelta(days=15)
 _MAXIMUM_FUTURE_SKEW = timedelta(seconds=60)
@@ -78,7 +78,7 @@ class RazorpayWebhookIngressService:
         age = now - provider_created_at
         maximum_age = (
             _VALUE_REVOKING_WEBHOOK_MAXIMUM_AGE
-            if event_type in _VALUE_REVOKING_WEBHOOK_EVENTS
+            if event_type in _REFUND_WEBHOOK_EVENTS
             else self._maximum_age
         )
         if age > maximum_age or age < -_MAXIMUM_FUTURE_SKEW:

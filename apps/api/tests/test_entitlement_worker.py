@@ -213,6 +213,7 @@ def _create_purchase_evidence(
     isolated: IsolatedDatabase,
     *,
     label: str,
+    refund_on_fulfillment_failure: bool = True,
 ) -> PurchaseEvidence:
     unique = uuid.uuid4().hex
     slug_label = label.replace("_", "-")
@@ -231,6 +232,13 @@ def _create_purchase_evidence(
         f"{slug_label}-service-{unique[:10]}",
         base_price=500,
     )
+    if not refund_on_fulfillment_failure:
+        update_response = client.patch(
+            f"/api/v1/services/{service['id']}",
+            json={"refund_on_fulfillment_failure": False},
+        )
+        assert update_response.status_code == 200, update_response.text
+        service = update_response.json()
     quote_response = client.post(
         "/api/v1/quotes",
         json={"service_id": service["id"], "input": {"norad_id": 25544}},

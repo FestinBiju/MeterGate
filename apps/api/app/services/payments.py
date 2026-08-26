@@ -39,6 +39,7 @@ from app.domain.enums import (
 )
 from app.domain.exceptions import (
     AuthenticationForbiddenError,
+    CompensationError,
     EntitlementConflictError,
     EntitlementIntegrityError,
     EntitlementUnavailableError,
@@ -86,6 +87,7 @@ from app.providers import (
     ProviderOrder,
     ProviderPayment,
     RazorpayPaymentProvider,
+    RefundProvider,
     validate_provider_event_type,
     verify_checkout_signature,
 )
@@ -111,12 +113,16 @@ from app.schemas.payments import (
     PaymentTransactionResponse,
     RazorpayCheckoutConfiguration,
 )
+from app.services.compensations import (
+    CompensationApplicationService,
+    RefundApplicationService,
+)
 from app.services.policy_evaluations import PolicyEvaluationApplicationService
 from app.workers.razorpay_webhooks import RazorpayWebhookWorker
 
 Clock = Callable[[], datetime]
 _VALUE_REVOKING_WEBHOOK_EVENTS = frozenset(
-    {"refund.created", "refund.processed", "refund.speed_changed"}
+    {"refund.created", "refund.processed", "refund.failed", "refund.speed_changed"}
 )
 _SUPPORTED_WEBHOOK_EVENTS = (
     frozenset(
@@ -129,6 +135,13 @@ _SUPPORTED_WEBHOOK_EVENTS = (
         }
     )
     | _VALUE_REVOKING_WEBHOOK_EVENTS
+)
+_MANUAL_RECONCILIATION_REASON_CODES = frozenset(
+    {
+        "PAYMENT_REFUND_EVIDENCE_CONFLICT",
+        "PAYMENT_REFUND_EVIDENCE_DETECTED",
+        "PAYMENT_MULTIPLE_CAPTURES_DETECTED",
+    }
 )
 
 
@@ -180,6 +193,16 @@ class _WebhookEnvelope:
     provider_payment_id: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class _RefundWebhookCorrelationHints:
+    """Validated identities extracted without accepting contradictory evidence."""
+
+    event_type: str
+    provider_created_at: datetime | None
+    provider_order_ids: tuple[str, ...]
+    provider_payment_ids: tuple[str, ...]
+
+
 class PaymentApplicationService:
     """Keep browser and provider evidence behind one conservative money boundary."""
 
@@ -204,6 +227,13 @@ class PaymentApplicationService:
         self._services = ServiceRepository(session)
         self._transactions = PaymentTransactionRepository(session)
         self._attempts = PaymentAttemptRepository(session)
+        self._compensation_reads = CompensationApplicationService(session)
+        self._refund_recovery = RefundApplicationService(
+            session,
+            provider if isinstance(provider, RefundProvider) else None,
+            settings,
+            clock=clock,
+        )
         self._events = PaymentTransactionEventRepository(session)
         self._webhooks = RazorpayWebhookEventRepository(session)
         self._evaluation_service = PolicyEvaluationApplicationService(
@@ -747,18 +777,50 @@ class PaymentApplicationService:
                     "A Razorpay event ID was reused with different signed content",
                     "PAYMENT_WEBHOOK_EVENT_INTEGRITY_FAILED",
                 ) from None
+            if existing.provider_event_type in _VALUE_REVOKING_WEBHOOK_EVENTS:
+                try:
+                    await self._refund_recovery.process_refund_webhook(payload)
+                except CompensationError:
+                    # The immutable webhook row and paid-aggregate quarantine
+                    # are already durable. Invalid, unmatched, or conflicting
+                    # refund evidence therefore remains fail-closed without
+                    # poisoning the at-least-once Redis delivery forever.
+                    pass
             return
 
         try:
             envelope = self._parse_webhook_envelope(payload.raw_body)
         except (TypeError, ValueError):
+            hints = self._parse_refund_webhook_correlation_hints(payload.raw_body)
             await self._persist_unmatched_webhook(
                 payload,
                 body_hash=body_hash,
-                event_type="invalid",
-                provider_created_at=payload.received_at,
-                reason_code="PAYMENT_WEBHOOK_PAYLOAD_INVALID",
-                status=WebhookProcessingStatus.FAILED,
+                event_type=hints.event_type if hints is not None else "invalid",
+                provider_created_at=(
+                    hints.provider_created_at
+                    if hints is not None and hints.provider_created_at is not None
+                    else payload.received_at
+                ),
+                reason_code=(
+                    "PAYMENT_REFUND_EVIDENCE_CONFLICT"
+                    if hints is not None
+                    else "PAYMENT_WEBHOOK_PAYLOAD_INVALID"
+                ),
+                status=(
+                    WebhookProcessingStatus.RECONCILIATION_REQUIRED
+                    if hints is not None
+                    else WebhookProcessingStatus.FAILED
+                ),
+                provider_order_id=(
+                    hints.provider_order_ids[0]
+                    if hints is not None and len(hints.provider_order_ids) == 1
+                    else None
+                ),
+                provider_payment_id=(
+                    hints.provider_payment_ids[0]
+                    if hints is not None and len(hints.provider_payment_ids) == 1
+                    else None
+                ),
             )
             return
 
@@ -841,6 +903,10 @@ class PaymentApplicationService:
                 body_hash=body_hash,
                 transaction=locked,
             )
+            try:
+                await self._refund_recovery.process_refund_webhook(payload)
+            except CompensationError:
+                pass
             return
 
         await self._session.commit()
@@ -919,6 +985,13 @@ class PaymentApplicationService:
         try:
             envelope = self._parse_webhook_envelope(payload.raw_body)
         except (TypeError, ValueError):
+            hints = self._parse_refund_webhook_correlation_hints(payload.raw_body)
+            if hints is not None:
+                await self._quarantine_contradictory_refund_webhook(
+                    payload,
+                    hints=hints,
+                    body_hash=sha256_bytes(payload.raw_body),
+                )
             return
         if envelope.event_type not in _VALUE_REVOKING_WEBHOOK_EVENTS:
             return
@@ -930,9 +1003,61 @@ class PaymentApplicationService:
                     "A Razorpay event ID was reused with different signed content",
                     "PAYMENT_WEBHOOK_EVENT_INTEGRITY_FAILED",
                 )
-            await self._session.rollback()
+        payment_attempt = (
+            await self._attempts.get_by_provider_payment_id(envelope.provider_payment_id)
+            if envelope.provider_payment_id is not None
+            else None
+        )
+        order_transaction = (
+            await self._transactions.get_by_provider_order_id(envelope.provider_order_id)
+            if envelope.provider_order_id is not None
+            else None
+        )
+        payment_order_conflict = (
+            payment_attempt is not None
+            and envelope.provider_order_id is not None
+            and payment_attempt.provider_order_id != envelope.provider_order_id
+        )
+        if (
+            existing is not None
+            or payment_order_conflict
+            or (
+                payment_attempt is not None
+                and order_transaction is not None
+                and payment_attempt.transaction_id != order_transaction.id
+            )
+        ):
+            hints = self._parse_refund_webhook_correlation_hints(payload.raw_body)
+            if hints is not None:
+                await self._quarantine_contradictory_refund_webhook(
+                    payload,
+                    hints=hints,
+                    body_hash=body_hash,
+                    reason_code=(
+                        "PAYMENT_REFUND_EVIDENCE_CONFLICT"
+                        if payment_order_conflict
+                        or (
+                            payment_attempt is not None
+                            and order_transaction is not None
+                            and payment_attempt.transaction_id != order_transaction.id
+                        )
+                        else "PAYMENT_REFUND_EVIDENCE_DETECTED"
+                    ),
+                )
             return
-        if envelope.provider_order_id is None:
+        transaction: PaymentTransaction | None = None
+        if payment_attempt is not None:
+            # A signed refund's pay_ identity is the narrowest local binding.
+            # Use it even when the embedded order_id is absent or contradictory
+            # so malformed value-revoking evidence cannot bypass quarantine.
+            transaction = await self._transactions.get_for_update(payment_attempt.transaction_id)
+        elif envelope.provider_order_id is not None:
+            transaction = (
+                await self._transactions.get_for_update(order_transaction.id)
+                if order_transaction is not None
+                else None
+            )
+        if transaction is None and envelope.provider_order_id is None:
             await self._persist_unmatched_webhook(
                 payload,
                 body_hash=body_hash,
@@ -943,9 +1068,6 @@ class PaymentApplicationService:
                 provider_payment_id=envelope.provider_payment_id,
             )
             return
-        transaction = await self._transactions.get_by_provider_order_id_for_update(
-            envelope.provider_order_id
-        )
         if transaction is None:
             # The Order may exist at Razorpay before its ID is durably attached
             # to the local transaction. Ingress cannot call the provider to map
@@ -958,6 +1080,170 @@ class PaymentApplicationService:
             body_hash=body_hash,
             transaction=transaction,
         )
+
+    async def _quarantine_contradictory_refund_webhook(
+        self,
+        payload: VerifiedWebhookPayload,
+        *,
+        hints: _RefundWebhookCorrelationHints,
+        body_hash: str,
+        reason_code: str = "PAYMENT_REFUND_EVIDENCE_CONFLICT",
+        _retrying: bool = False,
+    ) -> None:
+        """Quarantine every local payment named by malformed signed refund evidence."""
+        existing = await self._webhooks.get_by_provider_event_id(payload.provider_event_id)
+        if existing is not None:
+            if not compare_digest(existing.raw_body_hash, body_hash):
+                raise PaymentIntegrityError(
+                    "A Razorpay event ID was reused with different signed content",
+                    "PAYMENT_WEBHOOK_EVENT_INTEGRITY_FAILED",
+                )
+
+        transaction_ids: set[str] = set()
+        for provider_payment_id in hints.provider_payment_ids:
+            attempt = await self._attempts.get_by_provider_payment_id(provider_payment_id)
+            if attempt is not None:
+                transaction_ids.add(attempt.transaction_id)
+        for provider_order_id in hints.provider_order_ids:
+            transaction = await self._transactions.get_by_provider_order_id(provider_order_id)
+            if transaction is not None:
+                transaction_ids.add(transaction.id)
+        if not transaction_ids:
+            return
+
+        transactions: list[PaymentTransaction] = []
+        for transaction_id in sorted(transaction_ids):
+            transaction = await self._transactions.get_for_update(transaction_id)
+            if transaction is not None:
+                transactions.append(transaction)
+        if not transactions:
+            await self._session.rollback()
+            return
+
+        # Recheck after taking every aggregate lock. A concurrent delivery may
+        # already have atomically persisted the one immutable webhook row.
+        existing = await self._webhooks.get_by_provider_event_id(payload.provider_event_id)
+        if existing is not None:
+            if not compare_digest(existing.raw_body_hash, body_hash):
+                raise PaymentIntegrityError(
+                    "A Razorpay event ID was reused with different signed content",
+                    "PAYMENT_WEBHOOK_EVENT_INTEGRITY_FAILED",
+                )
+
+        standard_event = await self._events.get_by_idempotency_key(
+            f"webhook:{payload.provider_event_id}"
+        )
+        missing_transactions: list[PaymentTransaction] = []
+        for transaction in transactions:
+            if standard_event is not None and standard_event.transaction_id == transaction.id:
+                continue
+            event_key = f"webhook:{payload.provider_event_id}:refund-integrity:{transaction.id}"
+            existing_event = await self._events.get_by_idempotency_key(event_key)
+            if existing_event is not None:
+                if existing_event.transaction_id != transaction.id:
+                    raise PaymentIntegrityError(
+                        "Refund quarantine audit evidence references a different transaction",
+                        "PAYMENT_WEBHOOK_EVENT_INTEGRITY_FAILED",
+                    )
+                continue
+            missing_transactions.append(transaction)
+        if not missing_transactions:
+            await self._session.rollback()
+            return
+
+        correlated_ids = [transaction.id for transaction in transactions]
+        provider_order_id = (
+            hints.provider_order_ids[0] if len(hints.provider_order_ids) == 1 else None
+        )
+        provider_payment_id = (
+            hints.provider_payment_ids[0] if len(hints.provider_payment_ids) == 1 else None
+        )
+        webhook = existing or RazorpayWebhookEvent(
+            id=new_razorpay_webhook_event_id(),
+            provider_event_id=payload.provider_event_id,
+            provider_event_type=hints.event_type,
+            raw_body_hash=body_hash,
+            provider_created_at=hints.provider_created_at or self._as_utc(payload.received_at),
+            received_at=payload.received_at,
+            processed_at=self._processed_at(payload.received_at),
+            processing_status=WebhookProcessingStatus.RECONCILIATION_REQUIRED,
+            processing_reason_code=reason_code,
+            provider_order_id=provider_order_id,
+            provider_payment_id=provider_payment_id,
+            transaction_id=(transactions[0].id if len(transactions) == 1 else None),
+        )
+        webhook_is_new = existing is None
+        desired_transaction_ids = {transaction.id for transaction in missing_transactions}
+        updates: list[tuple[PaymentTransaction, PaymentTransactionEvent]] = []
+        for index, transaction in enumerate(missing_transactions):
+            self._verify_transaction_integrity(transaction)
+            prior = PaymentTransactionState(transaction.transaction_state)
+            next_state = (
+                PaymentTransactionState.PAID
+                if prior is PaymentTransactionState.PAID
+                else PaymentTransactionState.RECONCILIATION_REQUIRED
+            )
+            transaction.transaction_state = next_state
+            occurred_at = self._reconciliation_time(transaction)
+            transaction.last_reconciled_at = occurred_at
+            updates.append(
+                (
+                    transaction,
+                    self._event(
+                        transaction,
+                        event_type=PaymentTransactionEventType.RECONCILIATION_REQUIRED,
+                        actor_type=PaymentEventActorType.PROVIDER_WEBHOOK,
+                        actor_id=payload.provider_event_id,
+                        prior_state=prior,
+                        resulting_state=next_state,
+                        reason_code=reason_code,
+                        metadata={
+                            "provider_order_ids": list(hints.provider_order_ids),
+                            "provider_payment_ids": list(hints.provider_payment_ids),
+                            "correlated_transaction_ids": correlated_ids,
+                            "webhook_evidence_id": webhook.id,
+                        },
+                        source_webhook_event_id=(
+                            webhook.id if webhook_is_new and index == 0 else None
+                        ),
+                        idempotency_key=(
+                            f"webhook:{payload.provider_event_id}:refund-integrity:{transaction.id}"
+                        ),
+                        occurred_at=occurred_at,
+                    ),
+                )
+            )
+        try:
+            await self._transactions.update_many_with_events(
+                updates,
+                webhook_event=webhook if webhook_is_new else None,
+            )
+        except IntegrityError:
+            await self._session.rollback()
+            existing = await self._webhooks.get_by_provider_event_id(payload.provider_event_id)
+            if existing is None or not compare_digest(existing.raw_body_hash, body_hash):
+                raise PaymentIntegrityError(
+                    "A Razorpay event ID was reused with different signed content",
+                    "PAYMENT_WEBHOOK_EVENT_INTEGRITY_FAILED",
+                ) from None
+            if not _retrying:
+                await self._quarantine_contradictory_refund_webhook(
+                    payload,
+                    hints=hints,
+                    body_hash=body_hash,
+                    reason_code=reason_code,
+                    _retrying=True,
+                )
+                return
+            standard_event = await self._events.get_by_idempotency_key(
+                f"webhook:{payload.provider_event_id}"
+            )
+            for transaction_id in desired_transaction_ids:
+                if standard_event is not None and standard_event.transaction_id == transaction_id:
+                    continue
+                event_key = f"webhook:{payload.provider_event_id}:refund-integrity:{transaction_id}"
+                if await self._events.get_by_idempotency_key(event_key) is None:
+                    raise
 
     async def _quarantine_locked_value_revoking_webhook(
         self,
@@ -1738,10 +2024,10 @@ class PaymentApplicationService:
             event_type = PaymentTransactionEventType(event.event_type)
             if event_type is PaymentTransactionEventType.RECONCILIATION_REQUIRED:
                 unresolved = event.transaction_revision
-                requires_manual_resolution = requires_manual_resolution or event.reason_code in {
-                    "PAYMENT_REFUND_EVIDENCE_DETECTED",
-                    "PAYMENT_MULTIPLE_CAPTURES_DETECTED",
-                }
+                requires_manual_resolution = (
+                    requires_manual_resolution
+                    or event.reason_code in _MANUAL_RECONCILIATION_REASON_CODES
+                )
                 continue
             resolved_revision = event.event_metadata.get("resolved_reconciliation_revision")
             if (
@@ -1763,10 +2049,10 @@ class PaymentApplicationService:
             event_type = PaymentTransactionEventType(event.event_type)
             if event_type is PaymentTransactionEventType.RECONCILIATION_REQUIRED:
                 unresolved = event.transaction_revision
-                requires_manual_resolution = requires_manual_resolution or event.reason_code in {
-                    "PAYMENT_REFUND_EVIDENCE_DETECTED",
-                    "PAYMENT_MULTIPLE_CAPTURES_DETECTED",
-                }
+                requires_manual_resolution = (
+                    requires_manual_resolution
+                    or event.reason_code in _MANUAL_RECONCILIATION_REASON_CODES
+                )
                 continue
             resolved_revision = event.event_metadata.get("resolved_reconciliation_revision")
             if (
@@ -1998,6 +2284,10 @@ class PaymentApplicationService:
             )
         attempts = await self._attempts.list_for_transaction(transaction.id)
         state = PaymentTransactionState(transaction.transaction_state)
+        recovery = await self._compensation_reads.projection_for_transaction(
+            transaction.id,
+            payment_state=state,
+        )
         checkout: RazorpayCheckoutConfiguration | None = None
         if (
             self._settings.payments_enabled
@@ -2051,6 +2341,9 @@ class PaymentApplicationService:
                 )
                 for attempt in attempts
             ],
+            compensation_summary=recovery.compensation_summary,
+            refund_summary=recovery.refund_summary,
+            commerce_outcome=recovery.commerce_outcome,
             checkout=checkout,
             created_at=transaction.created_at,
             paid_at=transaction.paid_at,
@@ -2140,6 +2433,70 @@ class PaymentApplicationService:
             provider_created_at=provider_created_at,
             provider_order_id=payment_order_id or order_id,
             provider_payment_id=payment_id or refund_payment_id,
+        )
+
+    @staticmethod
+    def _parse_refund_webhook_correlation_hints(
+        raw_body: bytes,
+    ) -> _RefundWebhookCorrelationHints | None:
+        """Extract only valid correlation IDs; never treat the payload as evidence."""
+        try:
+            raw = json.loads(raw_body)
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            return None
+        if not isinstance(raw, Mapping):
+            return None
+        event_type = raw.get("event")
+        if event_type not in _VALUE_REVOKING_WEBHOOK_EVENTS:
+            return None
+        provider_created_at: datetime | None = None
+        created_at = raw.get("created_at")
+        if type(created_at) is int and 0 <= created_at <= (1 << 53) - 1:
+            try:
+                provider_created_at = datetime.fromtimestamp(created_at, tz=UTC)
+            except (OSError, OverflowError, ValueError):
+                pass
+        body_payload = raw.get("payload")
+        if not isinstance(body_payload, Mapping):
+            return _RefundWebhookCorrelationHints(event_type, provider_created_at, (), ())
+
+        def entity(name: str) -> Mapping[str, object] | None:
+            wrapper = body_payload.get(name)
+            if not isinstance(wrapper, Mapping):
+                return None
+            value = wrapper.get("entity")
+            return value if isinstance(value, Mapping) else None
+
+        payment = entity("payment")
+        refund = entity("refund")
+        order = entity("order")
+        payment_ids: list[str] = []
+        order_ids: list[str] = []
+        for candidate in (
+            payment.get("id") if payment is not None else None,
+            refund.get("payment_id") if refund is not None else None,
+        ):
+            try:
+                validate_provider_payment_id(candidate)  # type: ignore[arg-type]
+            except ValueError:
+                continue
+            if candidate not in payment_ids:
+                payment_ids.append(candidate)  # type: ignore[arg-type]
+        for candidate in (
+            payment.get("order_id") if payment is not None else None,
+            order.get("id") if order is not None else None,
+        ):
+            try:
+                validate_provider_order_id(candidate)  # type: ignore[arg-type]
+            except ValueError:
+                continue
+            if candidate not in order_ids:
+                order_ids.append(candidate)  # type: ignore[arg-type]
+        return _RefundWebhookCorrelationHints(
+            event_type=event_type,
+            provider_created_at=provider_created_at,
+            provider_order_ids=tuple(order_ids),
+            provider_payment_ids=tuple(payment_ids),
         )
 
     @staticmethod

@@ -7,6 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.domain.enums import (
+    CompensationEventType,
+    FulfillmentEventType,
+    PaymentTransactionEventType,
+)
 from app.domain.exceptions import EntitlementConflictError, FulfillmentRetryableError
 from app.providers.fulfillment import MerchantFulfillmentResult, MerchantFulfillmentRetryableError
 from app.services.entitlements import EntitlementApplicationService
@@ -39,6 +44,25 @@ class StaticRepository:
 
     async def get_by_entitlement_id(self, *_: object) -> object | None:
         return self.value
+
+    async def get_by_entitlement_id_for_update(self, *_: object) -> object | None:
+        return self.value
+
+    async def get_by_transaction_id(self, *_: object) -> object | None:
+        return self.value
+
+
+class EventRepository:
+    def __init__(self, *events: object) -> None:
+        self.events = list(events)
+
+    async def list_for_transaction(self, *_: object) -> list[object]:
+        return self.events
+
+
+class EmptyOutboxRepository:
+    async def get_by_deduplication_key(self, *_: object) -> None:
+        return None
 
 
 class MutablePaymentEligibility:
@@ -116,6 +140,7 @@ async def test_later_payment_anomaly_blocks_capability_until_resolved(
     application._merchants = StaticRepository(merchant)  # type: ignore[assignment]  # noqa: SLF001
     application._services = StaticRepository(service)  # type: ignore[assignment]  # noqa: SLF001
     application._executions = StaticRepository(None)  # type: ignore[assignment]  # noqa: SLF001
+    application._compensation_cases = StaticRepository(None)  # type: ignore[assignment]  # noqa: SLF001
     monkeypatch.setattr(
         EntitlementApplicationService,
         "verify_integrity",
@@ -148,6 +173,144 @@ async def test_later_payment_anomaly_blocks_capability_until_resolved(
     assert eligibility.calls == [(entitlement.transaction_id, True)] * 3
     assert capabilities.calls == 2
     assert session.commits == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("quarantine_source", ["case", "execution"])
+async def test_compensation_evidence_blocks_capability_with_stable_reason(
+    quarantine_source: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = RecordingSession()
+    eligibility = MutablePaymentEligibility()
+    capabilities = RecordingCapabilityIssuer()
+    entitlement = SimpleNamespace(
+        id="ent_00000000000000000000000000",
+        account_id="acct_00000000000000000000000000",
+        transaction_id="txn_00000000000000000000000000",
+        merchant_id="mrc_00000000000000000000000000",
+        service_id="svc_00000000000000000000000000",
+        expires_at=NOW + timedelta(minutes=10),
+    )
+    merchant = SimpleNamespace(id=entitlement.merchant_id)
+    service = SimpleNamespace(id=entitlement.service_id, merchant_id=merchant.id)
+    application = EntitlementApplicationService(
+        session,  # type: ignore[arg-type]
+        eligibility,  # type: ignore[arg-type]
+        capabilities,  # type: ignore[arg-type]
+        entitlement_ttl=timedelta(minutes=10),
+        clock=lambda: NOW,
+    )
+    application._entitlements = StaticRepository(entitlement)  # type: ignore[assignment]  # noqa: SLF001
+    application._merchants = StaticRepository(merchant)  # type: ignore[assignment]  # noqa: SLF001
+    application._services = StaticRepository(service)  # type: ignore[assignment]  # noqa: SLF001
+    application._compensation_cases = StaticRepository(  # type: ignore[assignment]  # noqa: SLF001
+        SimpleNamespace(id="cmp_00000000000000000000000000")
+        if quarantine_source == "case"
+        else None
+    )
+    application._executions = StaticRepository(  # type: ignore[assignment]  # noqa: SLF001
+        SimpleNamespace(
+            execution_state="permanent_failure",
+            compensation_required=True,
+        )
+        if quarantine_source == "execution"
+        else None
+    )
+    monkeypatch.setattr(
+        EntitlementApplicationService,
+        "verify_integrity",
+        staticmethod(lambda _: None),
+    )
+
+    with pytest.raises(EntitlementConflictError) as blocked:
+        await application.issue_capability(
+            entitlement.id,
+            account_id=entitlement.account_id,
+        )
+
+    assert blocked.value.reason_code == "CAPABILITY_COMPENSATION_QUARANTINED"
+    assert capabilities.calls == 0
+    assert session.commits == 0
+    assert eligibility.calls == [(entitlement.transaction_id, True)]
+
+
+@pytest.mark.asyncio
+async def test_entitlement_timeline_includes_compensation_events() -> None:
+    session = RecordingSession()
+    application = EntitlementApplicationService(
+        session,  # type: ignore[arg-type]
+        MutablePaymentEligibility(),  # type: ignore[arg-type]
+        RecordingCapabilityIssuer(),  # type: ignore[arg-type]
+        entitlement_ttl=timedelta(minutes=10),
+        clock=lambda: NOW,
+    )
+    transaction_id = "txn_00000000000000000000000000"
+    account_id = "acct_00000000000000000000000000"
+    application._transactions = StaticRepository(  # type: ignore[assignment]  # noqa: SLF001
+        SimpleNamespace(id=transaction_id, account_id=account_id)
+    )
+
+    def timeline_event(event_type: object, reason_code: str, seconds: int) -> object:
+        return SimpleNamespace(
+            event_type=event_type,
+            reason_code=reason_code,
+            occurred_at=NOW + timedelta(seconds=seconds),
+        )
+
+    application._payment_events = EventRepository(  # type: ignore[assignment]  # noqa: SLF001
+        timeline_event(PaymentTransactionEventType.PAYMENT_CAPTURED, "PAYMENT_CAPTURED", 0)
+    )
+    application._fulfillment_events = EventRepository(  # type: ignore[assignment]  # noqa: SLF001
+        timeline_event(FulfillmentEventType.ENTITLEMENT_ISSUED, "ENTITLEMENT_ISSUED", 1),
+        timeline_event(FulfillmentEventType.FULFILLMENT_FAILED, "FULFILLMENT_FAILED", 2),
+        timeline_event(
+            FulfillmentEventType.COMPENSATION_REQUIRED,
+            "COMPENSATION_REQUIRED",
+            3,
+        ),
+    )
+    application._compensation_events = EventRepository(  # type: ignore[assignment]  # noqa: SLF001
+        timeline_event(
+            CompensationEventType.COMPENSATION_APPROVED,
+            "COMPENSATION_FULL_REFUND_FULFILLMENT_FAILED",
+            4,
+        ),
+        timeline_event(CompensationEventType.REFUND_REQUESTED, "REFUND_REQUESTED", 5),
+        timeline_event(
+            CompensationEventType.RAZORPAY_REFUND_CREATED,
+            "RAZORPAY_REFUND_CREATED",
+            6,
+        ),
+        timeline_event(CompensationEventType.REFUND_COMPLETED, "REFUND_COMPLETED", 7),
+        timeline_event(
+            CompensationEventType.COMPENSATION_CLOSED,
+            "COMPENSATION_CLOSED_REFUNDED",
+            8,
+        ),
+    )
+    application._outbox = EmptyOutboxRepository()  # type: ignore[assignment]  # noqa: SLF001
+    application._entitlements = StaticRepository(None)  # type: ignore[assignment]  # noqa: SLF001
+
+    timeline = await application.timeline_for_transaction(
+        transaction_id,
+        account_id=account_id,
+    )
+
+    assert [(entry.event_type, entry.reason_code) for entry in timeline] == [
+        ("PAYMENT_CAPTURED", "PAYMENT_CAPTURED"),
+        ("ENTITLEMENT_ISSUED", "ENTITLEMENT_ISSUED"),
+        ("FULFILLMENT_FAILED", "FULFILLMENT_FAILED"),
+        ("COMPENSATION_REQUIRED", "COMPENSATION_REQUIRED"),
+        (
+            "COMPENSATION_APPROVED",
+            "COMPENSATION_FULL_REFUND_FULFILLMENT_FAILED",
+        ),
+        ("REFUND_REQUESTED", "REFUND_REQUESTED"),
+        ("RAZORPAY_REFUND_CREATED", "RAZORPAY_REFUND_CREATED"),
+        ("REFUND_COMPLETED", "REFUND_COMPLETED"),
+        ("COMMERCE_COMPENSATED", "COMPENSATION_CLOSED_REFUNDED"),
+    ]
 
 
 @pytest.mark.asyncio

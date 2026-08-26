@@ -14,6 +14,48 @@ type DisplayFailure = {
   message: string;
 };
 
+export type CommerceOutcome =
+  | "payment_pending"
+  | "paid"
+  | "fulfillment_pending"
+  | "fulfilled"
+  | "compensation_pending"
+  | "manual_review"
+  | "refunded";
+
+export type CompensationSummary = {
+  compensation_id: string;
+  decision_state:
+    | "pending"
+    | "approved"
+    | "rejected"
+    | "executing"
+    | "completed"
+    | "manual_review";
+  recommended_action: string;
+  approved_refund_amount: number | null;
+  decision_reason_code: string;
+  failure_code: string;
+  fulfillment_execution_id: string;
+};
+
+export type RefundSummary = {
+  refund_id: string;
+  provider_payment_id: string;
+  provider_refund_id: string | null;
+  amount: number;
+  currency: string;
+  state:
+    | "refund_pending"
+    | "refund_processing"
+    | "refunded"
+    | "refund_failed"
+    | "refund_uncertain"
+    | "reconciliation_required";
+  provider_status: string | null;
+  reconciliation_reason_code: string | null;
+};
+
 type EntitlementParty = {
   id: string;
   slug: string;
@@ -95,6 +137,19 @@ const timestampFormatter = new Intl.DateTimeFormat("en", {
   dateStyle: "medium",
   timeStyle: "medium",
 });
+const recoveryPollableOutcomes = new Set<CommerceOutcome>([
+  "paid",
+  "fulfillment_pending",
+  "compensation_pending",
+  "manual_review",
+]);
+const capabilityQuarantineCodes = new Set([
+  "ENTITLEMENT_COMPENSATION_QUARANTINED",
+  "CAPABILITY_COMPENSATION_QUARANTINED",
+  "FULFILLMENT_COMPENSATION_REQUIRED",
+  "REFUND_RECONCILIATION_REQUIRED",
+  "PAYMENT_REFUND_EVIDENCE_DETECTED",
+]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -412,6 +467,14 @@ function failureFrom(error: unknown): DisplayFailure {
   };
 }
 
+function isCapabilityQuarantineFailure(error: unknown): boolean {
+  return (
+    error instanceof ApiRequestFailure &&
+    (capabilityQuarantineCodes.has(error.code) ||
+      error.code.includes("COMPENSATION_QUARANTINED"))
+  );
+}
+
 function formatAmount(amount: number, currency: string): string {
   if (currency === "INR") {
     const rupees = Math.trunc(amount / 100);
@@ -446,9 +509,15 @@ function FailureNotice({ failure }: { failure: DisplayFailure }) {
 export function PaidResourceAccess({
   apiBaseEndpoint,
   transactionId,
+  commerceOutcome,
+  compensationSummary,
+  refundSummary,
 }: {
   apiBaseEndpoint: string;
   transactionId: string;
+  commerceOutcome: CommerceOutcome;
+  compensationSummary: CompensationSummary | null;
+  refundSummary: RefundSummary | null;
 }) {
   const { requestAuthenticated } = useAccountSession();
   const [lookup, setLookup] = useState<EntitlementLookup | null>(null);
@@ -460,9 +529,17 @@ export function PaidResourceAccess({
   const [capability, setCapability] = useState<CapabilityMetadata | null>(null);
   const [paymentChallenge, setPaymentChallenge] = useState<Record<string, unknown> | null>(null);
   const [execution, setExecution] = useState<ResourceExecution | null>(null);
+  const [quarantineObserved, setQuarantineObserved] = useState(false);
   const capabilityTokenRef = useRef<string | null>(null);
   const operationControllerRef = useRef<AbortController | null>(null);
   const transactionIdValid = transactionIdPattern.test(transactionId);
+  const summaryRequiresQuarantine =
+    compensationSummary !== null ||
+    refundSummary !== null ||
+    commerceOutcome === "compensation_pending" ||
+    commerceOutcome === "manual_review" ||
+    commerceOutcome === "refunded";
+  const accessQuarantined = summaryRequiresQuarantine || quarantineObserved;
 
   useEffect(() => {
     return () => {
@@ -470,6 +547,14 @@ export function PaidResourceAccess({
       operationControllerRef.current?.abort();
     };
   }, []);
+
+  useEffect(() => {
+    if (!summaryRequiresQuarantine) {
+      return;
+    }
+    capabilityTokenRef.current = null;
+    operationControllerRef.current?.abort();
+  }, [summaryRequiresQuarantine]);
 
   useEffect(() => {
     if (!transactionIdValid) {
@@ -504,7 +589,10 @@ export function PaidResourceAccess({
         setLookup(parsed);
         setLookupFailure(null);
         failureCount = 0;
-        if (parsed.state === "pending") {
+        if (
+          parsed.state === "pending" ||
+          recoveryPollableOutcomes.has(commerceOutcome)
+        ) {
           schedule(1_500);
         }
       } catch (error: unknown) {
@@ -527,6 +615,7 @@ export function PaidResourceAccess({
     };
   }, [
     apiBaseEndpoint,
+    commerceOutcome,
     refreshCycle,
     requestAuthenticated,
     transactionId,
@@ -551,7 +640,12 @@ export function PaidResourceAccess({
   const entitlement = lookup?.state === "ready" ? lookup.entitlement : null;
 
   const generateCapability = useCallback(async () => {
-    if (!entitlement || entitlement.state !== "active" || operation !== "idle") {
+    if (
+      !entitlement ||
+      entitlement.state !== "active" ||
+      operation !== "idle" ||
+      accessQuarantined
+    ) {
       return;
     }
     operationControllerRef.current?.abort();
@@ -579,6 +673,12 @@ export function PaidResourceAccess({
       );
     } catch (error: unknown) {
       if (!controller.signal.aborted) {
+        if (isCapabilityQuarantineFailure(error)) {
+          capabilityTokenRef.current = null;
+          setCapability(null);
+          setQuarantineObserved(true);
+          setRefreshCycle((current) => current + 1);
+        }
         setOperationFailure(failureFrom(error));
       }
     } finally {
@@ -589,11 +689,17 @@ export function PaidResourceAccess({
         setOperation("idle");
       }
     }
-  }, [apiBaseEndpoint, entitlement, operation, requestAuthenticated]);
+  }, [
+    accessQuarantined,
+    apiBaseEndpoint,
+    entitlement,
+    operation,
+    requestAuthenticated,
+  ]);
 
   const callProtectedResource = useCallback(
     async (kind: "challenge" | "execute" | "replay") => {
-      if (!entitlement || operation !== "idle") {
+      if (!entitlement || operation !== "idle" || accessQuarantined) {
         return;
       }
       const token = kind === "challenge" ? undefined : capabilityTokenRef.current;
@@ -682,6 +788,12 @@ export function PaidResourceAccess({
         );
       } catch (error: unknown) {
         if (!controller.signal.aborted) {
+          if (isCapabilityQuarantineFailure(error)) {
+            capabilityTokenRef.current = null;
+            setCapability(null);
+            setQuarantineObserved(true);
+            setRefreshCycle((current) => current + 1);
+          }
           setOperationFailure(failureFrom(error));
         }
       } finally {
@@ -693,26 +805,75 @@ export function PaidResourceAccess({
         }
       }
     },
-    [apiBaseEndpoint, entitlement, operation],
+    [accessQuarantined, apiBaseEndpoint, entitlement, operation],
   );
 
   const preparing = !lookup || lookup.state === "pending";
   const ready = lookup?.state === "ready";
   const blocked = lookup?.state === "blocked";
+  const fulfillmentSucceeded =
+    execution !== null ||
+    lookup?.timeline.some((event) => event.event_type === "FULFILLMENT_SUCCEEDED") ===
+      true;
+  const fulfillmentRetryPending =
+    !fulfillmentSucceeded &&
+    lookup?.timeline.some(
+      (event) => event.event_type === "FULFILLMENT_RETRY_SCHEDULED",
+    ) === true;
+  const refundConfirmed =
+    commerceOutcome === "refunded" && refundSummary?.state === "refunded";
+  const recoveryLabel = refundConfirmed
+    ? "Refund completed"
+    : commerceOutcome === "manual_review" ||
+        refundSummary?.state === "refund_uncertain" ||
+        refundSummary?.state === "reconciliation_required" ||
+        refundSummary?.state === "refund_failed"
+      ? "Manual review"
+      : refundSummary
+        ? "Refund processing"
+        : "Compensation required";
 
   return (
-    <section className="mt-4 rounded-2xl border border-emerald-300/20 bg-emerald-300/[0.035] p-4">
+    <section
+      className={`mt-4 rounded-2xl border p-4 ${
+        accessQuarantined
+          ? "border-amber-300/20 bg-amber-300/[0.035]"
+          : "border-emerald-300/20 bg-emerald-300/[0.035]"
+      }`}
+    >
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-emerald-200/75">
+          <p
+            className={`text-[10px] font-semibold uppercase tracking-[0.18em] ${
+              accessQuarantined ? "text-amber-200/75" : "text-emerald-200/75"
+            }`}
+          >
             PAID RESOURCE ACCESS
           </p>
           <h6 className="mt-2 text-base font-semibold text-white">
-            Payment-bound OrbitIntel result
+            {accessQuarantined
+              ? "Payment preserved · access quarantined"
+              : fulfillmentSucceeded
+                ? "Payment-bound OrbitIntel result"
+                : fulfillmentRetryPending
+                  ? "Entitlement ready · fulfillment retry pending"
+                  : "Entitlement ready · fulfillment not yet completed"}
           </h6>
         </div>
-        <span className="rounded-full border border-emerald-300/25 bg-emerald-300/[0.08] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-emerald-100">
-          Server verified
+        <span
+          className={`rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] ${
+            accessQuarantined
+              ? "border-amber-300/25 bg-amber-300/[0.08] text-amber-100"
+              : "border-emerald-300/25 bg-emerald-300/[0.08] text-emerald-100"
+          }`}
+        >
+          {accessQuarantined
+            ? recoveryLabel
+            : fulfillmentSucceeded
+              ? "Result verified"
+              : fulfillmentRetryPending
+                ? "Retry pending"
+                : "Entitlement verified"}
         </span>
       </div>
 
@@ -735,7 +896,7 @@ export function PaidResourceAccess({
         </li>
         <li
           className={`rounded-xl border px-3 py-2.5 ${
-            blocked
+            blocked || accessQuarantined
               ? "border-rose-300/25 bg-rose-300/[0.08] text-rose-100"
               : ready
                 ? "border-emerald-300/25 bg-emerald-300/[0.08] text-emerald-100"
@@ -743,9 +904,25 @@ export function PaidResourceAccess({
           }`}
         >
           <span className="block text-[9px] opacity-60">
-            03 · {blocked ? "Blocked" : ready ? "Complete" : "Waiting"}
+            03 · {accessQuarantined
+              ? "Quarantined"
+              : blocked
+                ? "Blocked"
+                : fulfillmentSucceeded
+                  ? "Complete"
+                  : fulfillmentRetryPending
+                    ? "Retry pending"
+                    : ready
+                      ? "Ready"
+                      : "Waiting"}
           </span>
-          Access ready
+          {accessQuarantined
+            ? "Access stopped"
+            : fulfillmentSucceeded
+              ? "Result delivered"
+              : fulfillmentRetryPending
+                ? "Fulfillment retry"
+                : "Awaiting execution"}
         </li>
       </ol>
 
@@ -755,7 +932,7 @@ export function PaidResourceAccess({
             Durable commerce timeline
           </p>
           <ol className="mt-3 grid gap-2">
-            {lookup.timeline.slice(-10).map((event, index) => (
+            {lookup.timeline.slice(-50).map((event, index) => (
               <li
                 key={`${event.occurred_at}:${event.event_type}:${index}`}
                 className="flex flex-wrap items-baseline justify-between gap-2 border-l border-cyan-300/20 pl-3 text-[10px]"
@@ -769,6 +946,46 @@ export function PaidResourceAccess({
               </li>
             ))}
           </ol>
+        </div>
+      ) : null}
+
+      {fulfillmentRetryPending && !accessQuarantined ? (
+        <div
+          role="status"
+          className="mt-4 rounded-xl border border-amber-300/20 bg-amber-300/[0.055] px-3 py-3"
+        >
+          <p className="text-sm font-semibold text-amber-100">
+            FULFILLMENT RETRY PENDING
+          </p>
+          <p className="mt-2 text-xs leading-5 text-amber-50/80">
+            OrbitIntel has not delivered a result yet. Retry with the same
+            capability; MeterGate will reuse the existing logical fulfillment
+            execution rather than create another purchase.
+          </p>
+          <p className="mt-2 text-[10px] leading-4 text-amber-100/65">
+            Compensation and refund processing begin only if fulfillment becomes
+            permanently failed or its configured attempts are exhausted.
+          </p>
+        </div>
+      ) : null}
+
+      {accessQuarantined ? (
+        <div
+          role="status"
+          className="mt-4 rounded-xl border border-amber-300/20 bg-amber-300/[0.055] px-3 py-3"
+        >
+          <p className="text-sm font-semibold text-amber-100">
+            ACCESS QUARANTINED · {recoveryLabel.toUpperCase()}
+          </p>
+          <p className="mt-2 text-xs leading-5 text-amber-50/80">
+            The immutable entitlement and paid transaction remain in the audit trail,
+            but MeterGate will not issue, execute, or replay a capability while
+            compensation or refund evidence is active.
+          </p>
+          <p className="mt-2 text-[10px] leading-4 text-amber-100/65">
+            TEST MODE — NO REAL MONEY MOVED. Refund completion is shown only after
+            authoritative backend confirmation.
+          </p>
         </div>
       ) : null}
 
@@ -820,9 +1037,19 @@ export function PaidResourceAccess({
         <div className="mt-4 rounded-xl border border-emerald-300/20 bg-black/20 px-3 py-3">
           <div className="flex flex-wrap items-start justify-between gap-2">
             <div>
-              <p className="text-sm font-semibold text-emerald-100">ACCESS READY</p>
+              <p className="text-sm font-semibold text-emerald-100">
+                {accessQuarantined
+                  ? "ENTITLEMENT PRESERVED"
+                  : "ENTITLEMENT READY"}
+              </p>
               <p className="mt-1 text-xs text-slate-400">
-                Immutable entitlement verified by MeterGate
+                {accessQuarantined
+                  ? "Immutable evidence retained; paid access is not releasable"
+                  : fulfillmentSucceeded
+                    ? "Immutable entitlement and delivered result verified by MeterGate"
+                    : fulfillmentRetryPending
+                      ? "Immutable entitlement verified; fulfillment retry remains pending"
+                      : "Immutable entitlement verified; no delivered result is claimed yet"}
               </p>
             </div>
             <span className={`rounded-full border px-2 py-1 text-[9px] font-semibold uppercase tracking-[0.12em] ${
@@ -893,7 +1120,7 @@ export function PaidResourceAccess({
           <div className="mt-4 grid gap-2 sm:grid-cols-2">
             <button
               type="button"
-              disabled={operation !== "idle"}
+              disabled={operation !== "idle" || accessQuarantined}
               onClick={() => void callProtectedResource("challenge")}
               className="rounded-xl border border-amber-300/20 bg-amber-300/[0.055] px-3 py-2.5 text-xs font-semibold text-amber-100 transition hover:border-amber-300/35 hover:bg-amber-300/[0.09] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-200 disabled:cursor-wait disabled:opacity-50"
             >
@@ -903,7 +1130,11 @@ export function PaidResourceAccess({
             </button>
             <button
               type="button"
-              disabled={operation !== "idle" || entitlement.state !== "active"}
+              disabled={
+                operation !== "idle" ||
+                entitlement.state !== "active" ||
+                accessQuarantined
+              }
               onClick={() => void generateCapability()}
               className="rounded-xl border border-cyan-300/20 bg-cyan-300/[0.065] px-3 py-2.5 text-xs font-semibold text-cyan-100 transition hover:border-cyan-300/35 hover:bg-cyan-300/[0.1] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-200 disabled:cursor-wait disabled:opacity-50"
             >
@@ -915,17 +1146,24 @@ export function PaidResourceAccess({
             </button>
             <button
               type="button"
-              disabled={operation !== "idle" || !capability}
+              disabled={operation !== "idle" || !capability || accessQuarantined}
               onClick={() => void callProtectedResource("execute")}
               className="rounded-xl border border-emerald-300/20 bg-emerald-300/[0.065] px-3 py-2.5 text-xs font-semibold text-emerald-100 transition hover:border-emerald-300/35 hover:bg-emerald-300/[0.1] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-200 disabled:cursor-wait disabled:opacity-50"
             >
               {operation === "execute"
                 ? "Executing protected resource…"
-                : "3 · Execute with capability"}
+                : fulfillmentRetryPending
+                  ? "3 · Retry fulfillment with capability"
+                  : "3 · Execute with capability"}
             </button>
             <button
               type="button"
-              disabled={operation !== "idle" || !capability || !execution}
+              disabled={
+                operation !== "idle" ||
+                !capability ||
+                !execution ||
+                accessQuarantined
+              }
               onClick={() => void callProtectedResource("replay")}
               className="rounded-xl border border-violet-300/20 bg-violet-300/[0.055] px-3 py-2.5 text-xs font-semibold text-violet-100 transition hover:border-violet-300/35 hover:bg-violet-300/[0.09] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-violet-200 disabled:cursor-wait disabled:opacity-50"
             >
@@ -935,11 +1173,14 @@ export function PaidResourceAccess({
             </button>
           </div>
 
-          {capability ? (
+          {capability && !accessQuarantined ? (
             <div role="status" className="mt-3 rounded-xl border border-cyan-300/15 bg-cyan-300/[0.04] px-3 py-3">
               <p className="text-xs font-semibold text-cyan-100">Capability held in volatile memory</p>
               <p className="mt-1 text-[10px] leading-4 text-slate-400">
-                Expires {formatTimestamp(capability.expires_at)} · maximum executions {capability.maximum_executions}. The bearer token is deliberately hidden and is never written to browser storage, URLs, or logs.
+                Expires {formatTimestamp(capability.expires_at)} · maximum logical
+                merchant executions {capability.maximum_executions}. Safe fulfillment
+                retries reuse that logical execution. The bearer token is deliberately
+                hidden and is never written to browser storage, URLs, or logs.
               </p>
             </div>
           ) : null}
@@ -956,11 +1197,15 @@ export function PaidResourceAccess({
       {paymentChallenge ? (
         <div className="mt-4 rounded-xl border border-amber-300/20 bg-amber-300/[0.045] px-3 py-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <p className="text-xs font-semibold text-amber-100">HTTP 402 · PAYMENT REQUIRED</p>
+            <p className="text-xs font-semibold text-amber-100">
+              HISTORICAL HTTP 402 · PAYMENT REQUIRED
+            </p>
             <span className="font-mono text-[9px] text-amber-200/65">metergate/1</span>
           </div>
           <p className="mt-2 text-[10px] leading-4 text-slate-400">
-            This is the real machine-readable challenge returned before any capability was presented.
+            This diagnostic challenge was returned before any capability was
+            presented. It is retained for protocol inspection and is not the current
+            fulfillment response.
           </p>
           <pre className="mt-3 max-h-80 overflow-auto rounded-lg bg-black/35 p-3 text-[10px] leading-4 text-amber-50/80">
             {prettyJson(paymentChallenge)}

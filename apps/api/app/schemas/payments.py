@@ -8,6 +8,7 @@ from pydantic import Field, StrictInt, StringConstraints
 from app.domain.enums import PaymentAttemptStatus, PaymentTransactionState, PurchaseType
 from app.schemas.approvals import AuthorizationId, AuthorizationParty
 from app.schemas.common import APIModel, CurrencyCode
+from app.schemas.compensations import CommerceOutcome, CompensationSummary, RefundSummary
 
 PaymentTransactionId = Annotated[
     str,
@@ -76,6 +77,9 @@ class PaymentTransactionResponse(APIModel):
     provider_order_id: ProviderOrderId | None
     provider_order_status: Literal["created", "attempted", "paid"] | None
     attempts: list[PaymentAttemptResponse]
+    compensation_summary: CompensationSummary | None
+    refund_summary: RefundSummary | None
+    commerce_outcome: CommerceOutcome
     checkout: RazorpayCheckoutConfiguration | None
     created_at: datetime
     paid_at: datetime | None

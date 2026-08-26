@@ -6,6 +6,7 @@ from app.api.v1.approval_identities import router as approval_identities_router
 from app.api.v1.approvals import router as approvals_router
 from app.api.v1.auth import router as auth_router
 from app.api.v1.catalog import router as catalog_router
+from app.api.v1.compensations import router as compensations_router
 from app.api.v1.entitlements import router as entitlements_router
 from app.api.v1.merchants import router as merchants_router
 from app.api.v1.payments import router as payments_router
@@ -26,5 +27,6 @@ router.include_router(quotes_router)
 router.include_router(policies_router)
 router.include_router(policy_evaluations_router)
 router.include_router(payments_router)
+router.include_router(compensations_router)
 router.include_router(entitlements_router)
 router.include_router(resources_router)

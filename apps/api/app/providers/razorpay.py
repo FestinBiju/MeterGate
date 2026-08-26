@@ -13,6 +13,7 @@ from typing import Protocol
 from app.domain.hashing import MAX_CANONICAL_INTEGER
 from app.providers.base import (
     CreateProviderOrder,
+    CreateProviderRefund,
     PaymentProviderError,
     PaymentProviderRejectedError,
     PaymentProviderResponseError,
@@ -20,15 +21,18 @@ from app.providers.base import (
     PaymentProviderUnavailableError,
     ProviderOrder,
     ProviderPayment,
+    ProviderRefund,
     validate_provider_order_id,
     validate_provider_payment_id,
     validate_provider_receipt,
+    validate_provider_refund_id,
 )
 
 _TEST_KEY_ID_PATTERN = re.compile(r"^rzp_test_[A-Za-z0-9]{8,64}$")
 _MAX_COLLECTION_ITEMS = 100
 _ORDER_STATUSES = {"created", "attempted", "paid"}
 _PAYMENT_STATUSES = {"created", "authorized", "captured", "refunded", "failed"}
+_REFUND_STATUSES = {"pending", "processed", "failed"}
 
 
 class _ClosableSession(Protocol):
@@ -77,6 +81,27 @@ class _RazorpayPaymentResource(Protocol):
         self,
         payment_id: str,
         data: dict[str, object],
+        **kwargs: object,
+    ) -> object: ...
+
+    def refund(
+        self,
+        payment_id: str,
+        data: dict[str, object],
+        **kwargs: object,
+    ) -> object: ...
+
+    def fetch_multiple_refund(
+        self,
+        payment_id: str,
+        data: dict[str, object],
+        **kwargs: object,
+    ) -> object: ...
+
+    def fetch_refund_id(
+        self,
+        payment_id: str,
+        refund_id: str,
         **kwargs: object,
     ) -> object: ...
 
@@ -271,6 +296,97 @@ class RazorpayPaymentProvider:
             )
         return payment
 
+    async def create_refund(self, request: CreateProviderRefund) -> ProviderRefund:
+        if not isinstance(request, CreateProviderRefund):
+            raise ValueError("A validated provider-refund request is required")
+        data: dict[str, object] = {
+            "amount": request.amount,
+            "speed": "normal",
+            "receipt": request.receipt,
+            "notes": dict(request.notes),
+        }
+        raw = await self._execute(
+            "create_refund",
+            lambda client: client.payment.refund(
+                request.payment_id,
+                data,
+                headers={"X-Refund-Idempotency": request.receipt},
+                timeout=self._timeout,
+            ),
+        )
+        refund = self._normalize_refund(raw, operation="create_refund")
+        if (
+            refund.payment_id != request.payment_id
+            or refund.amount != request.amount
+            or refund.receipt != request.receipt
+            or (refund.currency is not None and refund.currency != request.currency)
+        ):
+            raise PaymentProviderResponseError(
+                "create_refund",
+                "Razorpay created a refund with different payment terms",
+            )
+        return refund
+
+    async def fetch_refund(
+        self,
+        provider_payment_id: str,
+        provider_refund_id: str,
+    ) -> ProviderRefund:
+        validate_provider_payment_id(provider_payment_id)
+        validate_provider_refund_id(provider_refund_id)
+        raw = await self._execute(
+            "fetch_refund",
+            lambda client: client.payment.fetch_refund_id(
+                provider_payment_id,
+                provider_refund_id,
+                timeout=self._timeout,
+            ),
+        )
+        refund = self._normalize_refund(raw, operation="fetch_refund")
+        if refund.id != provider_refund_id or refund.payment_id != provider_payment_id:
+            raise PaymentProviderResponseError(
+                "fetch_refund",
+                "Razorpay returned a different refund",
+            )
+        return refund
+
+    async def fetch_refunds_for_payment(
+        self,
+        provider_payment_id: str,
+    ) -> tuple[ProviderRefund, ...]:
+        validate_provider_payment_id(provider_payment_id)
+        raw = await self._execute(
+            "fetch_refunds_for_payment",
+            lambda client: client.payment.fetch_multiple_refund(
+                provider_payment_id,
+                {"count": _MAX_COLLECTION_ITEMS},
+                timeout=self._timeout,
+            ),
+        )
+        items = self._normalize_collection(raw, operation="fetch_refunds_for_payment")
+        refunds = tuple(
+            self._normalize_refund(item, operation="fetch_refunds_for_payment") for item in items
+        )
+        if len(refunds) == _MAX_COLLECTION_ITEMS:
+            # Razorpay's collection is paginated.  One full page does not prove
+            # that the payment has no further refunds, so exact-receipt recovery
+            # must fail closed instead of searching an incomplete result set.
+            raise PaymentProviderResponseError(
+                "fetch_refunds_for_payment",
+                "Razorpay refund collection may be incomplete",
+            )
+        if len({refund.id for refund in refunds}) != len(refunds):
+            raise PaymentProviderResponseError(
+                "fetch_refunds_for_payment",
+                "Razorpay returned duplicate refunds for one payment",
+            )
+        if any(refund.payment_id != provider_payment_id for refund in refunds):
+            raise PaymentProviderResponseError(
+                "fetch_refunds_for_payment",
+                "Razorpay returned a refund bound to a different payment",
+            )
+        return refunds
+
     async def _execute(
         self,
         operation: str,
@@ -354,6 +470,21 @@ class RazorpayPaymentProvider:
             and error_name in {"Timeout", "ConnectTimeout", "ReadTimeout"}
         ):
             return PaymentProviderTimeoutError(operation, "Razorpay request timed out")
+        if (
+            operation == "create_refund"
+            and error_module.startswith("razorpay")
+            and error_name == "BadRequestError"
+        ):
+            # The official SDK discards the HTTP status and provider error code
+            # when constructing BadRequestError.  That makes a definite 4xx
+            # rejection indistinguishable here from duplicate-receipt or
+            # concurrent-operation conflicts after a successful side effect.
+            # Preserve ambiguity so the application reconciles the stable
+            # receipt and never treats this as proof that no refund exists.
+            return PaymentProviderResponseError(
+                operation,
+                "Razorpay refund creation outcome requires reconciliation",
+            )
         if error_module.startswith("razorpay") and error_name == "BadRequestError":
             return PaymentProviderRejectedError(operation, "Razorpay rejected the request")
         if error_module.startswith("razorpay") and error_name in {
@@ -439,6 +570,39 @@ class RazorpayPaymentProvider:
             raise PaymentProviderResponseError(
                 operation,
                 "Razorpay returned an invalid payment",
+            ) from error
+
+    @classmethod
+    def _normalize_refund(cls, raw: object, *, operation: str) -> ProviderRefund:
+        try:
+            value = cls._mapping(raw)
+            cls._expect_literal(value, "entity", "refund")
+            status = cls._string(value, "status")
+            if status not in _REFUND_STATUSES:
+                raise ValueError("unsupported refund status")
+            raw_currency = value.get("currency")
+            currency = (
+                None
+                if raw_currency is None or raw_currency == ""
+                else cls._string(value, "currency")
+            )
+            raw_receipt = value.get("receipt")
+            receipt = (
+                None if raw_receipt is None or raw_receipt == "" else cls._string(value, "receipt")
+            )
+            return ProviderRefund(
+                id=cls._string(value, "id"),
+                payment_id=cls._string(value, "payment_id"),
+                amount=cls._integer(value, "amount", positive=True),
+                currency=currency,
+                receipt=receipt,
+                status=status,  # type: ignore[arg-type]
+                created_at=cls._timestamp(value, "created_at"),
+            )
+        except (KeyError, TypeError, ValueError, OverflowError, OSError) as error:
+            raise PaymentProviderResponseError(
+                operation,
+                "Razorpay returned an invalid refund",
             ) from error
 
     @classmethod

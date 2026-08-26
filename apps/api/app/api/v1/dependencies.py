@@ -17,7 +17,7 @@ from app.domain.exceptions import (
     AuthenticationForbiddenError,
     AuthenticationUnauthorizedError,
 )
-from app.providers import PaymentProvider
+from app.providers import PaymentProvider, RefundProvider
 from app.providers.fulfillment import FulfillmentProvider, UnavailableFulfillmentProvider
 from app.repositories.accounts import AccountRepository
 from app.repositories.approval_identities import ApprovalIdentityRepository
@@ -32,6 +32,7 @@ from app.services.approvals import ApprovalApplicationService
 from app.services.auth import AuthenticationApplicationService, ResolvedAuthSession
 from app.services.capabilities import CapabilityTokenService
 from app.services.catalog import CatalogApplicationService
+from app.services.compensations import CompensationApplicationService, RefundApplicationService
 from app.services.entitlements import EntitlementApplicationService
 from app.services.fulfillments import FulfillmentApplicationService
 from app.services.merchants import MerchantApplicationService
@@ -234,6 +235,21 @@ def get_payment_application_service(
     provider: PaymentProviderDependency,
 ) -> PaymentApplicationService:
     return PaymentApplicationService(session, provider, settings)
+
+
+def get_compensation_application_service(
+    session: SessionDependency,
+) -> CompensationApplicationService:
+    return CompensationApplicationService(session)
+
+
+def get_refund_application_service(
+    session: SessionDependency,
+    settings: SettingsDependency,
+    provider: PaymentProviderDependency,
+) -> RefundApplicationService:
+    refund_provider = provider if isinstance(provider, RefundProvider) else None
+    return RefundApplicationService(session, refund_provider, settings)
 
 
 def _capability_token_service(settings: Settings) -> CapabilityTokenService:
@@ -506,6 +522,14 @@ ApprovalApplicationDependency = Annotated[
 PaymentApplicationDependency = Annotated[
     PaymentApplicationService,
     Depends(get_payment_application_service),
+]
+CompensationApplicationDependency = Annotated[
+    CompensationApplicationService,
+    Depends(get_compensation_application_service),
+]
+RefundApplicationDependency = Annotated[
+    RefundApplicationService,
+    Depends(get_refund_application_service),
 ]
 EntitlementApplicationDependency = Annotated[
     EntitlementApplicationService,

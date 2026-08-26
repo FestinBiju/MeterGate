@@ -24,18 +24,22 @@ def test_migrations_upgrade_and_downgrade_with_injected_connection() -> None:
             "approval_identities",
             "buyer_policies",
             "commerce_outbox_events",
+            "compensation_cases",
+            "compensation_events",
             "entitlements",
             "fulfillment_events",
             "fulfillment_executions",
             "merchants",
             "passkey_credentials",
             "payment_attempts",
+            "payment_refunds",
             "payment_transaction_events",
             "payment_transactions",
             "policy_evaluations",
             "purchase_authorizations",
             "quotes",
             "razorpay_webhook_events",
+            "refund_outbox_events",
             "service_fulfillment_configs",
             "services",
         }
@@ -497,6 +501,143 @@ def test_migrations_upgrade_and_downgrade_with_injected_connection() -> None:
         assert {"transaction_id", "entitlement_id", "execution_id"} <= fulfillment_event_columns
         assert inspector.get_columns("fulfillment_events")[1]["nullable"] is False
 
+        assert {column["name"] for column in inspector.get_columns("compensation_cases")} == {
+            "id",
+            "account_id",
+            "transaction_id",
+            "payment_attempt_id",
+            "entitlement_id",
+            "fulfillment_execution_id",
+            "quote_id",
+            "quote_hash",
+            "merchant_id",
+            "service_id",
+            "amount_paid",
+            "currency",
+            "failure_code",
+            "failure_evidence_version",
+            "failure_evidence_hash",
+            "recommended_action",
+            "decision_state",
+            "decision_provenance",
+            "approved_refund_amount",
+            "decision_reason_code",
+            "created_at",
+            "decided_at",
+            "closed_at",
+            "revision",
+        }
+        assert "uq_compensation_cases_fulfillment_execution_id" in {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("compensation_cases")
+        }
+        assert {
+            foreign_key["referred_table"]
+            for foreign_key in inspector.get_foreign_keys("compensation_cases")
+        } == {
+            "accounts",
+            "entitlements",
+            "fulfillment_executions",
+            "merchants",
+            "payment_attempts",
+            "payment_transactions",
+            "quotes",
+            "services",
+        }
+
+        assert {column["name"] for column in inspector.get_columns("payment_refunds")} == {
+            "id",
+            "compensation_case_id",
+            "transaction_id",
+            "payment_attempt_id",
+            "provider",
+            "provider_payment_id",
+            "provider_refund_id",
+            "amount",
+            "currency",
+            "refund_state",
+            "provider_status",
+            "provider_receipt",
+            "created_at",
+            "requested_at",
+            "processed_at",
+            "failed_at",
+            "last_reconciled_at",
+            "reconciliation_required_at",
+            "reconciliation_reason_code",
+            "revision",
+        }
+        assert {
+            "uq_payment_refunds_provider_refund_id",
+            "uq_payment_refunds_provider_receipt",
+        } <= {
+            constraint["name"] for constraint in inspector.get_unique_constraints("payment_refunds")
+        }
+        assert "uq_payment_refunds_one_active_per_case" in {
+            index["name"] for index in inspector.get_indexes("payment_refunds")
+        }
+        refund_checks = {
+            constraint["name"]: constraint["sqltext"]
+            for constraint in inspector.get_check_constraints("payment_refunds")
+        }
+        terminal_provider_evidence = refund_checks["ck_payment_refunds_terminal_provider_evidence"]
+        assert "refund_state <> 'refunded' OR provider_status = 'processed'" in (
+            terminal_provider_evidence
+        )
+        assert "provider_refund_id IS NULL AND provider_status IS NULL" in (
+            terminal_provider_evidence
+        )
+        assert "provider_refund_id IS NOT NULL AND provider_status = 'failed'" in (
+            terminal_provider_evidence
+        )
+        assert {
+            "ck_payment_refunds_reconciliation_overlay_pair",
+            "ck_payment_refunds_reconciliation_required_after_request",
+            "ck_payment_refunds_reconciliation_reason_code_valid",
+        } <= set(refund_checks)
+
+        compensation_event_checks = {
+            constraint["name"]: constraint["sqltext"]
+            for constraint in inspector.get_check_constraints("compensation_events")
+        }
+        assert (
+            "refund_reconciliation_resolved"
+            in compensation_event_checks["ck_compensation_events_event_type"]
+        )
+        assert (
+            "refund_reconciliation_resolved"
+            in compensation_event_checks["ck_compensation_events_event_binding"]
+        )
+
+        assert {
+            "sequence",
+            "case_revision",
+            "refund_revision",
+            "metadata",
+            "idempotency_key",
+        } <= {column["name"] for column in inspector.get_columns("compensation_events")}
+        assert {
+            "uq_compensation_events_case_sequence",
+            "uq_compensation_events_idempotency_key",
+        } <= {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("compensation_events")
+        }
+
+        assert {
+            "lease_generation",
+            "lease_expires_at",
+            "processing_started_at",
+            "processed_at",
+        } <= {column["name"] for column in inspector.get_columns("refund_outbox_events")}
+        assert {
+            "uq_refund_outbox_events_case_id",
+            "uq_refund_outbox_events_dedup_key",
+        } <= {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("refund_outbox_events")
+        }
+
         reverified_event_id = "pte_00000000000000000000000001"
         connection.exec_driver_sql(
             """
@@ -540,9 +681,13 @@ def test_migrations_upgrade_and_downgrade_with_injected_connection() -> None:
         command.downgrade(config, "20260825_0006")
         assert {
             "commerce_outbox_events",
+            "compensation_cases",
+            "compensation_events",
             "entitlements",
             "fulfillment_events",
             "fulfillment_executions",
+            "payment_refunds",
+            "refund_outbox_events",
             "service_fulfillment_configs",
         }.isdisjoint(inspect(connection).get_table_names())
         event_after_downgrade = connection.exec_driver_sql(

@@ -274,7 +274,7 @@ async def test_signed_value_revoking_refund_accepts_dashboard_replay_window(
     ("event_type", "created_at"),
     [
         ("refund.processed", FIXED_NOW - timedelta(days=15, seconds=1)),
-        ("refund.failed", FIXED_NOW - timedelta(seconds=301)),
+        ("refund.failed", FIXED_NOW - timedelta(days=15, seconds=1)),
         ("refund.created", FIXED_NOW + timedelta(seconds=61)),
     ],
 )

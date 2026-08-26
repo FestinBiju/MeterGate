@@ -13,10 +13,13 @@ from app.domain.hashing import MAX_CANONICAL_INTEGER
 
 ProviderOrderStatus = Literal["created", "attempted", "paid"]
 ProviderPaymentStatus = Literal["created", "authorized", "captured", "refunded", "failed"]
+ProviderRefundStatus = Literal["pending", "processed", "failed"]
 
 _CURRENCY_PATTERN = re.compile(r"^[A-Z]{3}$")
 _ORDER_ID_PATTERN = re.compile(r"^order_[A-Za-z0-9]{1,58}$")
 _PAYMENT_ID_PATTERN = re.compile(r"^pay_[A-Za-z0-9]{1,60}$")
+_REFUND_ID_PATTERN = re.compile(r"^rfnd_[A-Za-z0-9]{1,59}$")
+_LOCAL_REFUND_RECEIPT_PATTERN = re.compile(r"^rfd_[0-7][0-9A-HJKMNP-TV-Z]{25}$")
 
 
 class PaymentProviderError(RuntimeError):
@@ -74,6 +77,17 @@ def validate_provider_payment_id(value: str) -> None:
         raise ValueError("Provider payment ID is invalid")
 
 
+def validate_provider_refund_id(value: str) -> None:
+    if not isinstance(value, str) or _REFUND_ID_PATTERN.fullmatch(value) is None:
+        raise ValueError("Provider refund ID is invalid")
+
+
+def validate_local_refund_receipt(value: str) -> None:
+    """Validate the MeterGate refund ID reused as Razorpay's stable receipt/key."""
+    if not isinstance(value, str) or _LOCAL_REFUND_RECEIPT_PATTERN.fullmatch(value) is None:
+        raise ValueError("Provider refund receipt must be a MeterGate rfd_ identifier")
+
+
 def validate_provider_receipt(value: str) -> None:
     if (
         not isinstance(value, str)
@@ -109,6 +123,42 @@ class CreateProviderOrder:
         validate_provider_receipt(self.receipt)
         if self.partial_payment is not False:
             raise ValueError("MeterGate does not permit partial provider payments")
+        if not isinstance(self.notes, Mapping) or len(self.notes) > 15:
+            raise ValueError("Provider notes may contain at most 15 entries")
+        normalized: dict[str, str] = {}
+        for key, value in self.notes.items():
+            if (
+                not isinstance(key, str)
+                or not isinstance(value, str)
+                or not 1 <= len(key) <= 256
+                or len(value) > 256
+                or key != key.strip()
+                or any(ord(character) < 0x20 for character in key)
+                or any(ord(character) < 0x20 for character in value)
+            ):
+                raise ValueError("Provider notes contain an invalid key or value")
+            normalized[key] = value
+        object.__setattr__(self, "notes", MappingProxyType(normalized))
+
+
+@dataclass(frozen=True, slots=True)
+class CreateProviderRefund:
+    """Exact, server-derived material for one idempotent normal refund."""
+
+    payment_id: str
+    amount: int
+    currency: str
+    receipt: str
+    notes: Mapping[str, str]
+    speed: Literal["normal"] = "normal"
+
+    def __post_init__(self) -> None:
+        validate_provider_payment_id(self.payment_id)
+        _validate_positive_amount(self.amount)
+        _validate_currency(self.currency)
+        validate_local_refund_receipt(self.receipt)
+        if self.speed != "normal":
+            raise ValueError("MeterGate permits only normal provider refunds")
         if not isinstance(self.notes, Mapping) or len(self.notes) > 15:
             raise ValueError("Provider notes may contain at most 15 entries")
         normalized: dict[str, str] = {}
@@ -210,6 +260,35 @@ class ProviderPayment:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderRefund:
+    """Validated trust-relevant subset of one provider refund."""
+
+    id: str
+    payment_id: str
+    amount: int
+    currency: str | None
+    receipt: str | None
+    status: ProviderRefundStatus
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        validate_provider_refund_id(self.id)
+        validate_provider_payment_id(self.payment_id)
+        _validate_positive_amount(self.amount)
+        if self.currency is not None:
+            _validate_currency(self.currency)
+        if self.receipt is not None:
+            validate_provider_receipt(self.receipt)
+        if self.status not in {"pending", "processed", "failed"}:
+            raise ValueError("Provider refund status is unsupported")
+        object.__setattr__(
+            self,
+            "created_at",
+            _validate_aware_datetime(self.created_at, field="created_at"),
+        )
+
+
 @runtime_checkable
 class PaymentProvider(Protocol):
     """Async provider surface; network SDK details never cross this boundary."""
@@ -232,3 +311,21 @@ class PaymentProvider(Protocol):
     ) -> tuple[ProviderPayment, ...]: ...
 
     async def fetch_payment(self, provider_payment_id: str) -> ProviderPayment: ...
+
+
+@runtime_checkable
+class RefundProvider(Protocol):
+    """Refund-only provider surface kept separate from payment-order fakes."""
+
+    async def create_refund(self, request: CreateProviderRefund) -> ProviderRefund: ...
+
+    async def fetch_refund(
+        self,
+        provider_payment_id: str,
+        provider_refund_id: str,
+    ) -> ProviderRefund: ...
+
+    async def fetch_refunds_for_payment(
+        self,
+        provider_payment_id: str,
+    ) -> tuple[ProviderRefund, ...]: ...

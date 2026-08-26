@@ -79,6 +79,9 @@ class StaticRepository:
     async def get_by_service_id_for_update(self, *_: object) -> object:
         return self.value
 
+    async def get_by_transaction_id(self, *_: object) -> object:
+        return self.value
+
 
 class RecordingExecutionRepository:
     def __init__(self, execution: FulfillmentExecution | None = None) -> None:
@@ -163,6 +166,21 @@ class EligiblePayment:
         assert transaction_id == "txn_00000000000000000000000000"
         assert for_update is True
         return SimpleNamespace(id=transaction_id)
+
+
+class RecordingCompensationService:
+    def __init__(self) -> None:
+        self.executions: list[FulfillmentExecution] = []
+
+    async def stage_for_permanent_failure(
+        self,
+        execution: FulfillmentExecution,
+        *,
+        occurred_at: datetime,
+    ) -> object:
+        assert occurred_at == NOW
+        self.executions.append(execution)
+        return SimpleNamespace(id="cmp_00000000000000000000000000")
 
 
 class SequencedProvider:
@@ -325,6 +343,8 @@ def build_harness(
     application._quotes = StaticRepository(quote)  # noqa: SLF001
     application._services = StaticRepository(catalog_service)  # noqa: SLF001
     application._configs = StaticRepository(config)  # noqa: SLF001
+    application._compensation_cases = StaticRepository(None)  # noqa: SLF001
+    application._compensations = RecordingCompensationService()  # noqa: SLF001
     application._executions = executions  # noqa: SLF001
     return Harness(
         application,
@@ -443,8 +463,94 @@ async def test_retry_exhaustion_is_terminal_and_requires_compensation() -> None:
 
     with pytest.raises(FulfillmentPermanentError) as replayed:
         await execute(harness)
-    assert replayed.value.reason_code == "FULFILLMENT_COMPENSATION_REQUIRED"
+    assert replayed.value.reason_code == "ENTITLEMENT_COMPENSATION_QUARANTINED"
     assert len(harness.provider.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_existing_compensation_case_blocks_before_fulfillment_claim() -> None:
+    harness = build_harness(
+        MerchantFulfillmentResult(
+            result_content_type="application/json",
+            result={"norad_id": 25_544},
+        )
+    )
+    harness.service._compensation_cases = StaticRepository(  # noqa: SLF001
+        SimpleNamespace(id="cmp_00000000000000000000000000")
+    )
+
+    with pytest.raises(FulfillmentPermanentError) as blocked:
+        await execute(harness)
+
+    assert blocked.value.reason_code == "ENTITLEMENT_COMPENSATION_QUARANTINED"
+    assert harness.executions.execution is None
+    assert harness.provider.requests == []
+
+
+@pytest.mark.asyncio
+async def test_compensation_case_committed_before_dispatch_blocks_merchant_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = build_harness(
+        MerchantFulfillmentResult(
+            result_content_type="application/json",
+            result={"norad_id": 25_544},
+        )
+    )
+    compensation_cases = StaticRepository(None)
+    harness.service._compensation_cases = compensation_cases  # noqa: SLF001
+    eligibility = harness.service._payment_eligibility  # noqa: SLF001
+    original_verify = eligibility.verify_transaction_for_value_release
+
+    async def verify_then_quarantine(transaction_id: str) -> object:
+        proof = await original_verify(transaction_id)
+        compensation_cases.value = SimpleNamespace(id="cmp_00000000000000000000000000")
+        return proof
+
+    monkeypatch.setattr(
+        eligibility,
+        "verify_transaction_for_value_release",
+        verify_then_quarantine,
+    )
+
+    with pytest.raises(FulfillmentPermanentError) as blocked:
+        await execute(harness)
+
+    assert blocked.value.reason_code == "ENTITLEMENT_COMPENSATION_QUARANTINED"
+    assert harness.provider.requests == []
+    assert harness.executions.execution is not None
+    assert harness.executions.execution.result_json is None
+
+
+@pytest.mark.asyncio
+async def test_compensation_case_committed_during_merchant_call_blocks_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = build_harness(
+        MerchantFulfillmentResult(
+            result_content_type="application/json",
+            result={"norad_id": 25_544},
+        )
+    )
+    compensation_cases = StaticRepository(None)
+    harness.service._compensation_cases = compensation_cases  # noqa: SLF001
+    original_execute = harness.provider.execute
+
+    async def execute_then_quarantine(*args: object, **kwargs: object) -> object:
+        result = await original_execute(*args, **kwargs)  # type: ignore[arg-type]
+        compensation_cases.value = SimpleNamespace(id="cmp_00000000000000000000000000")
+        return result
+
+    monkeypatch.setattr(harness.provider, "execute", execute_then_quarantine)
+
+    with pytest.raises(FulfillmentPermanentError) as blocked:
+        await execute(harness)
+
+    assert blocked.value.reason_code == "ENTITLEMENT_COMPENSATION_QUARANTINED"
+    assert len(harness.provider.requests) == 1
+    assert harness.executions.execution is not None
+    assert harness.executions.execution.result_json is None
+    assert harness.executions.execution.completed_at is None
 
 
 @pytest.mark.asyncio
@@ -1291,6 +1397,7 @@ async def test_expiry_finalizer_closes_retryable_execution_with_compensation() -
         clock=harness.clock,
     )
     finalizer._executions = harness.executions  # noqa: SLF001
+    finalizer._compensations = RecordingCompensationService()  # noqa: SLF001
 
     finalized = await finalizer.finalize_one()
 

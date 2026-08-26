@@ -62,6 +62,11 @@ class Settings(BaseSettings):
     razorpay_read_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
     razorpay_provider_max_concurrency: int = Field(default=4, ge=1, le=32)
     razorpay_order_recovery_age_seconds: int = Field(default=15, ge=5, le=300)
+    refunds_enabled: bool = False
+    refund_worker_poll_seconds: float = Field(default=1.0, gt=0, le=60)
+    refund_outbox_lease_seconds: int = Field(default=30, ge=5, le=900)
+    refund_outbox_retry_base_seconds: int = Field(default=5, ge=1, le=300)
+    refund_outbox_retry_max_seconds: int = Field(default=300, ge=1, le=3_600)
     fulfillment_enabled: bool = False
     entitlement_ttl_seconds: int = Field(default=600, ge=60, le=86_400)
     entitlement_token_ttl_seconds: int = Field(default=300, ge=30, le=600)
@@ -341,6 +346,24 @@ class Settings(BaseSettings):
                 "ENTITLEMENT_OUTBOX_RETRY_BASE_SECONDS cannot exceed "
                 "ENTITLEMENT_OUTBOX_RETRY_MAX_SECONDS"
             )
+        if self.refund_outbox_retry_base_seconds > self.refund_outbox_retry_max_seconds:
+            raise ValueError(
+                "REFUND_OUTBOX_RETRY_BASE_SECONDS cannot exceed REFUND_OUTBOX_RETRY_MAX_SECONDS"
+            )
+        if self.refunds_enabled and not self.payments_enabled:
+            raise ValueError("REFUNDS_ENABLED requires PAYMENTS_ENABLED=true")
+        if self.refunds_enabled:
+            provider_operation_budget = (
+                self.razorpay_connect_timeout_seconds + self.razorpay_read_timeout_seconds + 1.0
+            )
+            # A fresh refund performs an exact-receipt lookup before creation,
+            # so the fenced lease must cover both bounded provider operations.
+            minimum_refund_lease = math.ceil(2 * provider_operation_budget + 2.0)
+            if self.refund_outbox_lease_seconds < minimum_refund_lease:
+                raise ValueError(
+                    "REFUND_OUTBOX_LEASE_SECONDS must cover the bounded Razorpay "
+                    f"refund operation budget ({minimum_refund_lease} seconds)"
+                )
         if self.payments_enabled and self.fulfillment_enabled:
             provider_operation_budget = (
                 self.razorpay_connect_timeout_seconds + self.razorpay_read_timeout_seconds + 1.0

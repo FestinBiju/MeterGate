@@ -30,7 +30,7 @@ The goal is to help merchants become **discoverable, understandable, payable, an
 
 ## Current Milestone
 
-Milestone 7 extends the verified Razorpay Test Mode payment gate through value release and real digital-service fulfillment. A durable paid-transition outbox drives fresh server-side payment re-verification, one immutable `ent_…` entitlement, a short-lived exact-resource capability, and one durable `ful_…` merchant execution. The protected resource uses a machine-readable HTTP `402` challenge, and the independent OrbitIntel reference merchant returns current CelesTrak-backed results. Payment capture and fulfillment completion remain distinct states. Test Mode does not move real money, and this milestone does not implement refunds, subscriptions, MCP, or autonomous-agent orchestration.
+Milestone 8 closes the verified commerce loop after fulfillment failure. The Milestone 7 payment, entitlement, HTTP `402`, capability, and real OrbitIntel fulfillment boundaries remain intact; a permanent paid failure with no delivered value can now create an audited `cmp_…` compensation case and a backend-controlled Razorpay Test Mode `rfd_…` refund flow. A captured payment remains historical paid evidence rather than being rewritten as unpaid. Commerce completes only through trusted fulfillment success or trusted provider `processed` refund evidence, and value stays quarantined while compensation or refund state is ambiguous. Test Mode does not move real money. Subscriptions, MCP, and autonomous-agent orchestration remain outside this milestone.
 
 ## Domain Model
 
@@ -47,13 +47,15 @@ Milestone 7 extends the verified Razorpay Test Mode payment gate through value r
 - A **commerce outbox event** is the durable, deduplicated handoff from the first paid transition to asynchronous entitlement issuance.
 - An **entitlement** is immutable, short-lived, exact-resource evidence derived only from freshly reverified paid state; it permits one logical merchant execution.
 - A **fulfillment execution** is the stateful, append-only-audited attempt to deliver that resource. Its terminal success stores a bounded integrity-hashed result for safe replay.
+- A **compensation case** is the immutable-binding decision record produced from a terminal paid fulfillment failure and the quote's snapshotted refund policy.
+- A **payment refund** is a separate monotonic aggregate for one server-derived partial or full Razorpay refund; it never rewrites the payment transaction's captured history.
 - Merchant slugs are globally unique. Service slugs are unique within their merchant. Public removal is lifecycle-based; there are no hard-delete endpoints.
 
 ## Local Development
 
 Prerequisites: Docker Desktop with Docker Compose, Python 3.13, [`uv`](https://docs.astral.sh/uv/), Node.js 20.9 or newer, and npm.
 
-1. Copy `.env.example` to the repository-root `.env` and replace the local-only `change-me` password in both PostgreSQL values. Payment support is safely disabled by default; keep its Razorpay placeholders empty unless following the Test Mode setup below. This root file is the single dotenv source for Docker Compose and FastAPI.
+1. Copy `.env.example` to the repository-root `.env` and replace the local-only `change-me` password in both PostgreSQL values. Payment and refund execution are safely disabled by default; keep Razorpay placeholders empty unless following the Test Mode setup below, and keep `REFUNDS_ENABLED=false` unless deliberately exercising compensation. This root file is the single dotenv source for Docker Compose and FastAPI.
 2. Start PostgreSQL and Redis from the repository root:
 
    ```powershell
@@ -143,12 +145,13 @@ Redis contains only ephemeral ceremony and session state. PostgreSQL remains aut
 
 ## Razorpay Test Mode
 
-MeterGate uses the official Razorpay Python SDK for Orders and Payment reads. It has no live-mode switch: `PAYMENTS_ENABLED=true` requires `RAZORPAY_MODE=test`, a Key ID beginning with `rzp_test_`, a Key Secret, and a dedicated webhook secret. Startup validation rejects incomplete or live-mode credentials. Secrets are server-only `SecretStr` settings; the browser receives only the public Test Mode Key ID and its exact server-created Order configuration.
+MeterGate uses the official Razorpay Python SDK for Orders, Payment reads, and backend-controlled idempotent refunds. It has no live-mode switch: `PAYMENTS_ENABLED=true` requires `RAZORPAY_MODE=test`, a Key ID beginning with `rzp_test_`, a Key Secret, and a dedicated webhook secret. Startup validation rejects incomplete or live-mode credentials. Secrets are server-only `SecretStr` settings; the browser receives only the public Test Mode Key ID and its exact server-created Order configuration.
 
 Set these values in the repository-root `.env`, never in `apps/web` or a `NEXT_PUBLIC_*` variable:
 
 ```dotenv
 PAYMENTS_ENABLED=true
+REFUNDS_ENABLED=false
 RAZORPAY_MODE=test
 RAZORPAY_KEY_ID=rzp_test_replace_me
 RAZORPAY_KEY_SECRET=replace_me
@@ -157,7 +160,7 @@ RAZORPAY_WEBHOOK_SECRET=replace_with_a_dedicated_test_webhook_secret
 RAZORPAY_PREVIOUS_WEBHOOK_SECRET=
 ```
 
-Restart the API and worker after credential changes. Test Mode exercises Razorpay's real API and Checkout integration against simulated rails; it does not charge real money.
+Restart the API and workers after credential changes. Test Mode exercises Razorpay's real API and Checkout integration against simulated rails; it does not charge real money.
 
 To run the explicitly side-effecting provider acceptance (it creates one genuine
 ₹5.00 Razorpay Test Mode Order, then fetches it directly and by receipt):
@@ -172,6 +175,28 @@ Remove-Item Env:RUN_RAZORPAY_TEST_MODE
 The ordinary test suite skips this check so local and CI runs never create
 provider objects unexpectedly.
 
+## Razorpay Test Refunds
+
+`REFUNDS_ENABLED` is an independent fail-closed execution switch and defaults to `false`. Enabling it requires `PAYMENTS_ENABLED=true`, valid Razorpay Test Mode credentials, and a refund-worker lease long enough to cover the bounded exact-receipt preflight plus create-operation budget. No browser, buyer API, capability, or AI output can choose a refund amount or invoke the Razorpay refund API directly. Keep the switch off for ordinary payment and fulfillment development; set it to `true` only when deliberately running the refund worker against Test Mode.
+
+Each provider request uses the local `rfd_…` refund ID as both Razorpay's receipt and the `X-Refund-Idempotency` value, always sends the exact server-derived amount, and requests normal-speed processing. The ordinary suite uses fakes and performs no provider refund. To run the explicitly side-effecting acceptance against a captured Test Mode Payment supplied by the operator:
+
+```powershell
+Set-Location apps/api
+$env:RUN_RAZORPAY_REFUND_TEST_MODE = "1"
+$env:RAZORPAY_REFUND_TEST_PAYMENT_ID = "pay_replace_with_captured_test_payment"
+uv run pytest -q -s tests/test_razorpay_refund_test_mode_integration.py
+Remove-Item Env:RUN_RAZORPAY_REFUND_TEST_MODE
+Remove-Item Env:RAZORPAY_REFUND_TEST_PAYMENT_ID
+```
+
+The test refuses non-Test credentials, never hardcodes a payment ID, prints a warning before the side effect, and is skipped unless the explicit run flag is set; that opted-in run then requires the Payment ID. Running it creates a real Razorpay Test Mode refund against the configured payment, polls boundedly until the refund is `processed`, and fails if it remains pending or becomes failed. Ordinary automated test results do not constitute proof that this manual acceptance was performed.
+
+The completed 26 August 2026 Test Mode failure-to-refund acceptance, including
+the actual Razorpay `rfnd_…` identifier, fresh provider read, local aggregate
+states, and ordered audit evidence, is preserved in
+[`docs/evidence/2026-08-26-razorpay-test-mode-refund.md`](docs/evidence/2026-08-26-razorpay-test-mode-refund.md).
+
 ## Payment Boundary
 
 `POST /api/v1/payment-transactions` accepts only an `authorization_id`. Under the authenticated Account lock, MeterGate reloads the authorization, resolves ownership through its ApprovalIdentity, recomputes authorization, policy, quote, and evaluation integrity, requires a still-active one-time authorization, and derives merchant, service, integer minor-unit amount, and currency exclusively from PostgreSQL. A unique `authorization_id` constraint makes repeated or concurrent calls return the same transaction.
@@ -182,13 +207,13 @@ The authorization-to-transaction claim commits before any network call. The tran
 
 Standard Checkout opens only after a user action and receives its order configuration from the API. Its handler sends only the `razorpay_payment_id`, `razorpay_order_id`, and `razorpay_signature` to the owning, Origin- and CSRF-protected verification route. MeterGate compares the returned order ID but computes HMAC over the order ID stored in PostgreSQL. A valid callback signature proves binding, not payment success: MeterGate fetches Razorpay's Order and Payment and reports `paid` only for exact matching captured/paid provider evidence. `authorized` is pending, and one failed attempt does not kill the Order.
 
-Payment is not fulfillment. Milestone 6B stopped at **VERIFIED PAYMENT CAPTURED**; Milestone 7 adds the separately audited entitlement and fulfillment stages, and still never initiates a refund.
+Payment is not fulfillment. **VERIFIED PAYMENT CAPTURED** is durable payment history, not a claim that the merchant delivered value or that commerce is complete. Milestone 7 adds separately audited entitlement and fulfillment stages; Milestone 8 adds separate compensation and refund evidence for a qualifying terminal failure without changing the transaction from `paid`.
 
 ## Webhook Worker
 
-Razorpay calls the public `POST /api/v1/webhooks/razorpay` route without a buyer cookie or CSRF token. MeterGate reads a bounded raw body exactly once, requires one event ID and signature, and verifies HMAC with the current dedicated webhook secret—or an explicitly configured previous secret during a bounded rotation overlap—before JSON parsing. Ordinary value-granting events retain the configurable 300-second baseline replay age. Signed `refund.created`, `refund.processed`, and `refund.speed_changed` notices may be admitted for up to Razorpay's 15-day dashboard replay horizon because they can only close value release, never grant it. Invalid signatures, future-dated events, stale value-granting events, and refund events older than that horizon are rejected.
+Razorpay calls the public `POST /api/v1/webhooks/razorpay` route without a buyer cookie or CSRF token. MeterGate reads a bounded raw body exactly once, requires one event ID and signature, and verifies HMAC with the current dedicated webhook secret—or an explicitly configured previous secret during a bounded rotation overlap—before JSON parsing. Ordinary value-granting events retain the configurable 300-second baseline replay age. Signed refund notices may be admitted for up to Razorpay's 15-day dashboard replay horizon because they can only quarantine or close value release, never grant it. Invalid signatures, future-dated events, stale value-granting events, and refund events older than that horizon are rejected.
 
-Before acknowledging a correlatable signed refund notice, ingress atomically marks the transaction `reconciliation_required` and stores sticky `PAYMENT_REFUND_EVIDENCE_DETECTED` evidence; an unmatched event remains available for the worker's receipt-based recovery rather than being terminally consumed. This is refund **detection and quarantine only**: MeterGate never calls a Razorpay refund API in Milestone 7. After that admission fence, the verified body is appended to `metergate:razorpay:webhooks:v1`. Local Redis runs with AOF `appendfsync=always` and `noeviction`; PostgreSQL remains the normalized audit authority. If the queue write fails after quarantine, Razorpay receives a retryable failure while value release stays closed.
+Before acknowledging a correlatable signed refund notice, ingress atomically closes value release and stores sticky refund evidence; an unmatched event remains available for the worker's receipt-based recovery rather than being terminally consumed. After that admission fence, the verified body is appended to `metergate:razorpay:webhooks:v1`. Local Redis runs with AOF `appendfsync=always` and `noeviction`; PostgreSQL remains the normalized audit authority. If the queue write fails after quarantine, Razorpay receives a retryable failure while value release stays closed. The queued worker strictly validates the signed refund identity, Payment and Order bindings, amount, currency, and cumulative refunded total. A validated entity status of `processed` can complete compensation; the webhook event name by itself cannot.
 
 Run the independent consumer from `apps/api`:
 
@@ -196,11 +221,32 @@ Run the independent consumer from `apps/api`:
 uv run python -m app.workers.razorpay_webhooks
 ```
 
-The worker uses a consumer group, recovers abandoned pending entries, and acknowledges an item only after an atomic PostgreSQL commit. `x-razorpay-event-id` is unique in the append-only normalized event table, so redelivery is harmless. Raw payloads remain ephemeral in Redis; PostgreSQL retains only the body hash, event/Order/Payment IDs, timestamps, safe processing outcome, attempts, and transaction audit events. Webhooks are reconciliation triggers rather than trusted state assignments, so duplicates and out-of-order `payment.authorized`, `payment.captured`, `payment.failed`, and `order.paid` events cannot regress captured success.
+The worker uses a consumer group, recovers abandoned pending entries, and acknowledges an item only after an atomic PostgreSQL commit. `x-razorpay-event-id` is unique in the append-only normalized event table, so redelivery is harmless. Raw payloads remain ephemeral in Redis; PostgreSQL retains only the body hash, event/Order/Payment/refund IDs, timestamps, safe processing outcome, attempts, and audit events. Webhooks are reconciliation triggers rather than trusted state assignments, so duplicates and out-of-order delivery cannot regress captured payment or processed refund evidence.
+
+## Refund Webhooks
+
+In the Razorpay Dashboard's **Test Mode**, MeterGate requires exactly these payment and refund events:
+
+- `payment.authorized`
+- `payment.captured`
+- `payment.failed`
+- `order.paid`
+- `refund.created`
+- `refund.processed`
+- `refund.failed`
+- `refund.speed_changed`
+
+These are the four supported payment events and all four official Razorpay refund events used by MeterGate; do not configure or synthesize a `refund.completed` event. Every refund event must carry a refund entity bound to the same Payment, exact local refund identity, captured payment total, currency, and cumulative refunded amount. MeterGate treats its signed entity status—`pending`, `processed`, or `failed`—as normalized evidence; worker and explicit reconciliation paths additionally inspect the complete bounded payment-scoped refund collection. In particular, `refund.created` can already contain `status=processed`, while `refund.processed` delivery may be duplicated or late.
 
 ## Payment Reconciliation
 
 The owning account can call `POST /api/v1/payment-transactions/{transaction_id}/reconcile` with its normal Origin and CSRF protections. MeterGate fetches the stored Razorpay Order and all its Payment attempts, verifies order ID, receipt, amount, currency, and each payment binding, and monotonically rebuilds local state. This repairs a lost browser callback, delayed webhook, temporary worker outage, or ambiguous Order-creation response. No client-provided provider status is accepted.
+
+## Refund Reconciliation
+
+A refund timeout, unavailable response, or malformed create response is ambiguous because Razorpay may have accepted the request. MeterGate records `refund_uncertain` and never blindly creates another refund. The refund worker resumes from the same durable `refund:<compensation_case_id>` handoff and searches the captured Payment's bounded refund collection for the exact stable `rfd_…` receipt or known `rfnd_…` binding. A full provider page is treated as incomplete rather than as proof of absence. Zero matches after an attempted create remain quarantined for a later retry; unreserved, duplicate, cross-payment, aggregate-total, amount, receipt, or currency conflicts enter `reconciliation_required`.
+
+Only a validated provider refund with `status=processed` may move the `PaymentRefund` to `refunded` and close its `CompensationCase`. `pending` remains in progress, and `failed` is durable failure evidence. Provider reads, webhook deliveries, and worker retries are monotonic: late or out-of-order evidence cannot regress terminal facts or create a second provider refund. Contradictory terminal evidence opens an orthogonal reconciliation overlay and append-only audit event, projects `manual_review`, and clears only after an exact authoritative API read confirms the stored terminal fact.
 
 ### Local Test Mode webhooks with zrok
 
@@ -210,7 +256,7 @@ Razorpay cannot deliver webhooks to `localhost`, and its documentation recommend
 zrok share public localhost:8000
 ```
 
-In the Razorpay Dashboard's **Test Mode**, configure the resulting HTTPS URL plus `/api/v1/webhooks/razorpay`, use the same dedicated secret as `RAZORPAY_WEBHOOK_SECRET`, and subscribe to `payment.authorized`, `payment.captured`, `payment.failed`, `order.paid`, `refund.created`, `refund.processed`, and `refund.speed_changed`. The refund events are observation-only quarantine signals. Start PostgreSQL, Redis, the webhook worker, API, and frontend before the payment. A deployed HTTPS staging API can be used instead; do not use a tunnel hostname currently blocked by Razorpay.
+In the Razorpay Dashboard's **Test Mode**, configure the resulting HTTPS URL plus `/api/v1/webhooks/razorpay`, use the same dedicated secret as `RAZORPAY_WEBHOOK_SECRET`, and subscribe to the exact eight events listed under **Refund Webhooks**. Start PostgreSQL, Redis, the webhook worker, refund worker, API, and frontend before exercising compensation. A deployed HTTPS staging API can be used instead; do not use a tunnel hostname currently blocked by Razorpay.
 
 ### Manual Milestone 6B Windows Hello payment acceptance
 
@@ -334,11 +380,29 @@ Remove-Item Env:RUN_CELESTRAK_INTEGRATION
 
 Network/upstream failures and other explicitly retryable merchant errors enter `retryable_failure`; a later exact request resumes the same `ful_…` execution and idempotency key within the configured attempt bound. Invalid merchant responses fail closed into reconciliation-required evidence. A permanent merchant error, stale-execution retry exhaustion, or exhausted retryable failure enters `permanent_failure`, releases no result, and records `compensation_required=true` plus an append-only `COMPENSATION_REQUIRED` event. Fulfillment failure does not rewrite the valid captured payment as unpaid and never returns fake success.
 
-`ORBITINTEL_DEV_FAULT_MODE=retryable|permanent` provides configuration-controlled acceptance testing only when `ORBITINTEL_ENVIRONMENT` is `development` or `test`; production startup rejects it. Milestone 7 records the compensation obligation but does not call Razorpay's refund API. Refund execution and recovery are Milestone 8 work. Subscriptions, MCP, and autonomous-agent orchestration are also outside this milestone.
+`ORBITINTEL_DEV_FAULT_MODE=retryable|permanent` provides configuration-controlled acceptance testing only when `ORBITINTEL_ENVIRONMENT` is `development` or `test`; production startup rejects it. Milestone 8 consumes the permanent-failure obligation through the compensation boundary below. Subscriptions, MCP, and autonomous-agent orchestration remain outside this milestone.
+
+## Compensation
+
+A permanent failure is eligible for compensation only when the transaction is historically `paid`, one exact captured Payment backs it, no result was delivered, and the transaction, attempt, entitlement, fulfillment, and immutable quote bindings agree. The deterministic policy reads `refund_on_fulfillment_failure` from that purchased quote snapshot, never from a later mutable Service or from AI output. An eligible true flag creates one automatically approved full-refund `CompensationCase`; a false flag or contradictory/integrity evidence enters `manual_review`. Unpaid, retryable, successful, or value-delivered executions do not receive an automatic case.
+
+The case and its append-only evidence preserve why compensation was recommended, approved, rejected, or closed. They are related to—but separate from—the immutable entitlement, terminal fulfillment evidence, and paid transaction. Repeated failure finalization resolves to the same case instead of authorizing another refund.
+
+## Refund Policy
+
+Refund authority is backend-only. The browser never submits an amount and there is no public refund-creation route. Current automatic compensation derives a full refund from the exact captured integer minor-unit amount. The model also permits a partial refund only when a future explicit deterministic policy derives it; every amount must be positive, currency-bound, and the sum of active, uncertain, reconciliation-required, and processed reservations must never exceed the captured amount.
+
+Approval atomically creates a durable `refund:<compensation_case_id>` outbox handoff. The independent refund worker claims it with a fenced lease, performs no provider I/O while holding a long database transaction, and records every state change as append-only evidence. A provider API success response is not enough to close compensation: only trusted `processed` evidence is terminal success.
+
+Compensation is a value quarantine. Once compensation is required or a refund is approved, pending, uncertain, or reconciliation-required, MeterGate denies new capabilities and merchant execution. The protected-resource path also reloads current server state, so a previously issued bearer capability cannot bypass the quarantine. MeterGate does not mutate the entitlement or erase captured payment history.
+
+## Commerce Outcomes
+
+Buyer-facing transaction reads derive one commerce outcome across payment, fulfillment, compensation, and refund evidence: `payment_pending`, `paid`, `fulfillment_pending`, `fulfilled`, `compensation_pending`, `manual_review`, or `refunded`. `fulfilled` requires durable merchant success. `compensation_pending` covers approved or in-progress compensation and ambiguous refund states. `refunded` requires both a provider refund normalized as `processed` and a completed compensation case. These outcomes supplement the payment state; even a compensated transaction remains historically `paid`.
 
 ## Exact Local Commands
 
-Start from the repository root. If `.env` does not exist, create it from the committed placeholder file, replace both local database passwords, configure the three Razorpay Test Mode values, and set `PAYMENTS_ENABLED=true` and `FULFILLMENT_ENABLED=true`:
+Start from the repository root. If `.env` does not exist, create it from the committed placeholder file, replace both local database passwords, configure the three Razorpay Test Mode values, and set `PAYMENTS_ENABLED=true` and `FULFILLMENT_ENABLED=true`. Leave `REFUNDS_ENABLED=false` for ordinary development; set it to `true` only for a deliberate Test Mode compensation run:
 
 ```powershell
 Copy-Item .env.example .env
@@ -387,6 +451,13 @@ Set-Location apps/api
 uv run python -m app.workers.entitlements
 ```
 
+Refund outbox worker:
+
+```powershell
+Set-Location apps/api
+uv run python -m app.workers.refunds
+```
+
 Private OrbitIntel merchant:
 
 ```powershell
@@ -404,7 +475,7 @@ $env:NEXT_PUBLIC_API_URL = "http://localhost:8000"
 npm run dev
 ```
 
-Razorpay cannot reach localhost directly. For real Test Mode webhook acceptance, keep the existing zrok setup above active and point the Test Mode webhook to `/api/v1/webhooks/razorpay`. The API, webhook worker, entitlement worker, OrbitIntel, PostgreSQL, and Redis must all stay available while the payment converges and value release runs.
+Razorpay cannot reach localhost directly. For real Test Mode webhook acceptance, keep the existing zrok setup above active and point the Test Mode webhook to `/api/v1/webhooks/razorpay`. The API, webhook worker, entitlement worker, refund worker, OrbitIntel, PostgreSQL, and Redis must all stay available while payment, value release, compensation, and refund reconciliation run.
 
 Run each local quality-check block from a fresh repository-root terminal:
 

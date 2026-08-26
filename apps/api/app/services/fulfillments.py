@@ -58,6 +58,7 @@ from app.providers.fulfillment import (
     MerchantFulfillmentRetryableError,
 )
 from app.repositories import (
+    CompensationCaseRepository,
     EntitlementRepository,
     FulfillmentExecutionRepository,
     MerchantRepository,
@@ -66,6 +67,7 @@ from app.repositories import (
     ServiceRepository,
 )
 from app.services.capabilities import CapabilityTokenService
+from app.services.compensations import CompensationApplicationService
 from app.services.entitlements import EntitlementApplicationService
 from app.services.payments import PaymentValueReleaseEligibility
 
@@ -128,6 +130,7 @@ class FulfillmentExpiryFinalizer:
         self._session = session
         self._clock = clock
         self._executions = FulfillmentExecutionRepository(session)
+        self._compensations = CompensationApplicationService(session, clock=clock)
 
     async def finalize_one(self) -> FulfillmentExecution | None:
         now = self._read_clock()
@@ -166,6 +169,10 @@ class FulfillmentExpiryFinalizer:
             occurred_at=now,
         )
         self._session.add(failed_event)
+        await self._compensations.stage_for_permanent_failure(
+            execution,
+            occurred_at=now,
+        )
         return await self._executions.update_with_event(
             execution,
             event=compensation_event,
@@ -239,6 +246,8 @@ class FulfillmentApplicationService:
         self._default_maximum_attempts = default_maximum_attempts
         self._clock = clock
         self._entitlements = EntitlementRepository(session)
+        self._compensation_cases = CompensationCaseRepository(session)
+        self._compensations = CompensationApplicationService(session, clock=clock)
         self._executions = FulfillmentExecutionRepository(session)
         self._merchants = MerchantRepository(session)
         self._quotes = QuoteRepository(session)
@@ -378,6 +387,7 @@ class FulfillmentApplicationService:
             entitlement.transaction_id,
             for_update=True,
         )
+        await self._require_no_compensation_quarantine(entitlement.transaction_id)
         claimed = await self._claim_execution(
             entitlement,
             maximum_attempts=maximum_attempts,
@@ -723,6 +733,11 @@ class FulfillmentApplicationService:
                     "FULFILLMENT_INTEGRITY_FAILED",
                 )
 
+        await self._require_no_compensation_quarantine(
+            entitlement.transaction_id,
+            execution=execution,
+        )
+
         state = FulfillmentExecutionState(execution.execution_state)
         if state is FulfillmentExecutionState.SUCCEEDED:
             return self._stored_result(execution, replayed=True)
@@ -812,6 +827,10 @@ class FulfillmentApplicationService:
                     },
                 )
             )
+            await self._compensations.stage_for_permanent_failure(
+                execution,
+                occurred_at=now,
+            )
             await self._executions.update_with_event(execution, event=failed_event)
             raise FulfillmentPermanentError(
                 "Fulfillment retries are exhausted and compensation is required",
@@ -875,6 +894,10 @@ class FulfillmentApplicationService:
                 "The fulfillment execution was not found",
                 "FULFILLMENT_NOT_FOUND",
             )
+        await self._require_no_compensation_quarantine(
+            execution.transaction_id,
+            execution=locked,
+        )
         now = self._read_clock()
         if (
             FulfillmentExecutionState(locked.execution_state)
@@ -947,6 +970,10 @@ class FulfillmentApplicationService:
                 "The fulfillment execution was not found",
                 "FULFILLMENT_NOT_FOUND",
             )
+        await self._require_no_compensation_quarantine(
+            entitlement.transaction_id,
+            execution=execution,
+        )
         if FulfillmentExecutionState(execution.execution_state) is (
             FulfillmentExecutionState.SUCCEEDED
         ):
@@ -1003,6 +1030,20 @@ class FulfillmentApplicationService:
             event=success_event,
         )
         return self._stored_result(execution, replayed=False)
+
+    async def _require_no_compensation_quarantine(
+        self,
+        transaction_id: str,
+        *,
+        execution: FulfillmentExecution | None = None,
+    ) -> None:
+        case = await self._compensation_cases.get_by_transaction_id(transaction_id)
+        if case is None and (execution is None or not execution.compensation_required):
+            return
+        raise FulfillmentPermanentError(
+            "Compensation evidence quarantines paid entitlement access",
+            "ENTITLEMENT_COMPENSATION_QUARANTINED",
+        )
 
     async def _record_failure(
         self,
@@ -1068,6 +1109,11 @@ class FulfillmentApplicationService:
             metadata=metadata,
         )
         self._session.add(failed_event)
+        if terminal:
+            await self._compensations.stage_for_permanent_failure(
+                execution,
+                occurred_at=now,
+            )
         await self._executions.update_with_event(execution, event=recovery_event)
         return terminal
 
