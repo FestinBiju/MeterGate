@@ -111,6 +111,90 @@ class PaymentTimeoutError(PaymentError):
     """A read-only provider operation exceeded its bounded timeout."""
 
 
+class EntitlementError(DomainError):
+    """Fail-closed paid-access failure with a stable public code."""
+
+    def __init__(self, detail: str, reason_code: str) -> None:
+        self.reason_code = reason_code
+        super().__init__(detail)
+
+
+class EntitlementNotFoundError(EntitlementError):
+    """An entitlement or its paid transaction could not be found."""
+
+
+class EntitlementForbiddenError(EntitlementError):
+    """The authenticated account does not own the entitlement."""
+
+
+class EntitlementExpiredError(EntitlementError):
+    """The short-lived paid entitlement is no longer active."""
+
+
+class EntitlementConflictError(EntitlementError):
+    """Payment or fulfillment state cannot currently release value."""
+
+
+class EntitlementIntegrityError(EntitlementError):
+    """Stored entitlement or parent commerce evidence failed verification."""
+
+
+class EntitlementUnavailableError(EntitlementError):
+    """A temporary provider or worker failure prevented value release."""
+
+
+class CapabilityError(DomainError):
+    """Signed protected-resource capability failure."""
+
+    def __init__(self, detail: str, reason_code: str) -> None:
+        self.reason_code = reason_code
+        super().__init__(detail)
+
+
+class CapabilityInvalidError(CapabilityError):
+    """The bearer token is malformed, unsigned, or otherwise invalid."""
+
+
+class CapabilityExpiredError(CapabilityError):
+    """The bearer token lifetime has ended."""
+
+
+class CapabilityForbiddenError(CapabilityError):
+    """A valid capability does not bind the requested resource or input."""
+
+
+class FulfillmentError(DomainError):
+    """Protected merchant execution failure with a stable public code."""
+
+    def __init__(self, detail: str, reason_code: str) -> None:
+        self.reason_code = reason_code
+        super().__init__(detail)
+
+
+class FulfillmentConflictError(FulfillmentError):
+    """The execution is owned, exhausted, or in a conflicting terminal state."""
+
+
+class FulfillmentRetryableError(FulfillmentError):
+    """The same logical execution may be retried with its capability."""
+
+
+class FulfillmentPermanentError(FulfillmentError):
+    """The execution failed permanently and requires compensation evidence."""
+
+
+class FulfillmentIntegrityError(FulfillmentError):
+    """Stored or merchant result evidence failed validation."""
+
+
+class ResourceRequestError(DomainError):
+    """A protected-resource request body is unsafe or malformed."""
+
+    def __init__(self, detail: str, reason_code: str) -> None:
+        self.reason_code = reason_code
+        super().__init__(detail)
+
+
 class ResourceNotFoundError(DomainError):
     def __init__(self, resource: str, resource_id: str) -> None:
         self.resource = resource

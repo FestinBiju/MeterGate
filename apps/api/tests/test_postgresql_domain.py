@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 from alembic.config import Config
 from fastapi.testclient import TestClient
-from sqlalchemy import inspect, select, text
+from sqlalchemy import func, inspect, select, text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
@@ -28,9 +28,14 @@ from app.application import create_app
 from app.core.config import Settings, get_settings
 from app.db.session import Database, make_async_database_url
 from app.domain.approval_hashing import AUTHORIZATION_VERSION, calculate_authorization_hash
+from app.domain.entitlement_hashing import calculate_entitlement_hash
 from app.domain.enums import (
     AccountStatus,
     ApprovalIdentityStatus,
+    FulfillmentEventActorType,
+    FulfillmentEventType,
+    FulfillmentExecutionState,
+    FulfillmentProviderType,
     PaymentAttemptStatus,
     PaymentEventActorType,
     PaymentProvider,
@@ -45,13 +50,20 @@ from app.domain.ids import (
     new_account_id,
     new_approval_identity_id,
     new_authorization_id,
+    new_entitlement_id,
+    new_fulfillment_event_id,
+    new_fulfillment_execution_id,
+    new_merchant_id,
     new_passkey_credential_id,
     new_payment_attempt_id,
     new_payment_transaction_event_id,
     new_payment_transaction_id,
     new_policy_evaluation_id,
     new_policy_id,
+    new_quote_id,
     new_razorpay_webhook_event_id,
+    new_service_fulfillment_config_id,
+    new_service_id,
 )
 from app.domain.payment_hashing import (
     PAYMENT_BINDING_VERSION,
@@ -60,20 +72,31 @@ from app.domain.payment_hashing import (
 from app.models import (
     Account,
     ApprovalIdentity,
+    Entitlement,
+    FulfillmentEvent,
+    FulfillmentExecution,
     PasskeyCredential,
     PaymentAttempt,
     PaymentTransaction,
     PaymentTransactionEvent,
     PurchaseAuthorization,
+    Quote,
     RazorpayWebhookEvent,
+    ServiceFulfillmentConfig,
 )
+from app.providers.fulfillment import MerchantFulfillmentResult
 from app.repositories.accounts import AccountRepository
 from app.repositories.approval_identities import ApprovalIdentityRepository
 from app.repositories.authorizations import PurchaseAuthorizationRepository
+from app.repositories.entitlements import EntitlementRepository
 from app.repositories.passkey_credentials import PasskeyCredentialRepository
 from app.repositories.payment_attempts import PaymentAttemptRepository
 from app.repositories.payment_transactions import PaymentTransactionRepository
+from app.repositories.service_fulfillment_configs import ServiceFulfillmentConfigRepository
 from app.scripts.seed_dev import seed_development_data
+from app.services.capabilities import CapabilityTokenService
+from app.services.fulfillments import FulfillmentApplicationService
+from app.services.payments import PaymentApplicationService
 from app.services.readiness import ReadinessService
 
 API_ROOT = Path(__file__).resolve().parents[1]
@@ -156,6 +179,12 @@ def _alembic_downgrade_to_authenticated_accounts(connection: Any) -> None:
     config = Config(API_ROOT / "alembic.ini")
     config.attributes["connection"] = connection
     command.downgrade(config, "20260825_0005")
+
+
+def _alembic_downgrade_to_value_release(connection: Any) -> None:
+    config = Config(API_ROOT / "alembic.ini")
+    config.attributes["connection"] = connection
+    command.downgrade(config, "20260826_0007")
 
 
 async def _prepare_isolated_database() -> IsolatedDatabase:
@@ -1189,6 +1218,7 @@ def test_payment_migration_has_postgresql_constraints_and_guards(
         ("payment_attempts", "trg_payment_attempts_guard_mutation"),
         ("payment_transaction_events", "trg_payment_transaction_events_immutable"),
         ("payment_transactions", "trg_payment_transactions_guard_mutation"),
+        ("payment_transactions", "trg_payment_transactions_paid_entitlement_outbox"),
         ("payment_transactions", "trg_payment_transactions_require_audit_event"),
         ("razorpay_webhook_events", "trg_razorpay_webhook_events_immutable"),
     }
@@ -1199,6 +1229,1041 @@ def test_payment_migration_has_postgresql_constraints_and_guards(
         "metergate_reject_razorpay_webhook_event_mutation",
         "metergate_require_payment_transaction_audit_event",
     }
+
+
+def test_entitlement_fulfillment_migration_has_postgresql_guards(
+    isolated_database: IsolatedDatabase,
+) -> None:
+    async def inspect_domain() -> dict[str, Any]:
+        async with isolated_database.database.engine.connect() as connection:
+
+            def inspect_connection(sync_connection: Any) -> dict[str, Any]:
+                inspector = inspect(sync_connection)
+                return {
+                    "tables": set(inspector.get_table_names()),
+                    "entitlement_columns": {
+                        column["name"] for column in inspector.get_columns("entitlements")
+                    },
+                    "entitlement_unique": {
+                        constraint["name"]
+                        for constraint in inspector.get_unique_constraints("entitlements")
+                    },
+                    "entitlement_foreign_keys": {
+                        constraint["referred_table"]: constraint["options"].get("ondelete")
+                        for constraint in inspector.get_foreign_keys("entitlements")
+                    },
+                    "execution_unique": {
+                        constraint["name"]
+                        for constraint in inspector.get_unique_constraints("fulfillment_executions")
+                    },
+                    "execution_checks": {
+                        constraint["name"]
+                        for constraint in inspector.get_check_constraints("fulfillment_executions")
+                    },
+                }
+
+            inspected = await connection.run_sync(inspect_connection)
+            triggers = await connection.execute(
+                text(
+                    """
+                    SELECT event_object_table, trigger_name
+                    FROM information_schema.triggers
+                    WHERE event_object_schema = current_schema()
+                      AND event_object_table IN (
+                          'commerce_outbox_events', 'entitlements',
+                          'fulfillment_executions', 'fulfillment_events',
+                          'service_fulfillment_configs'
+                      )
+                    """
+                )
+            )
+            inspected["triggers"] = set(triggers.tuples().all())
+            paid_guard_result = await connection.execute(
+                text(
+                    """
+                    SELECT trigger.tgdeferrable, trigger.tginitdeferred,
+                           pg_get_triggerdef(trigger.oid) AS definition
+                    FROM pg_trigger AS trigger
+                    JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+                    WHERE relation.relnamespace = current_schema()::regnamespace
+                      AND relation.relname = 'payment_transactions'
+                      AND trigger.tgname = 'trg_payment_transactions_paid_entitlement_outbox'
+                    """
+                )
+            )
+            paid_guard = paid_guard_result.mappings().one()
+            inspected["paid_guard"] = dict(paid_guard)
+            return inspected
+
+    schema = asyncio.run(inspect_domain())
+
+    assert {
+        "commerce_outbox_events",
+        "entitlements",
+        "fulfillment_events",
+        "fulfillment_executions",
+        "service_fulfillment_configs",
+    } <= schema["tables"]
+    assert "updated_at" not in schema["entitlement_columns"]
+    assert {
+        "payment_reverification_event_id",
+        "payment_reverification_revision",
+        "provider_order_id",
+        "provider_payment_id",
+        "entitlement_hash",
+    } <= schema["entitlement_columns"]
+    assert "uq_entitlements_transaction_id" in schema["entitlement_unique"]
+    assert set(schema["entitlement_foreign_keys"].values()) == {"RESTRICT"}
+    assert "uq_fulfillment_executions_entitlement_id" in schema["execution_unique"]
+    assert {
+        "ck_fulfillment_executions_result_size_bounded",
+        "ck_fulfillment_executions_state_payload",
+    } <= schema["execution_checks"]
+    assert schema["triggers"] == {
+        ("commerce_outbox_events", "trg_commerce_outbox_events_guard"),
+        ("entitlements", "trg_entitlements_immutable"),
+        ("fulfillment_events", "trg_fulfillment_events_immutable"),
+        ("fulfillment_executions", "trg_fulfillment_executions_guard"),
+        ("service_fulfillment_configs", "trg_service_fulfillment_configs_guard"),
+    }
+    assert schema["paid_guard"]["tgdeferrable"] is True
+    assert schema["paid_guard"]["tginitdeferred"] is True
+    assert "DEFERRABLE INITIALLY DEFERRED" in schema["paid_guard"]["definition"]
+
+
+def test_postgresql_fulfillment_terminal_evidence_is_immutable(
+    isolated_database: IsolatedDatabase,
+) -> None:
+    async def exercise_guard() -> tuple[str, int]:
+        async with isolated_database.database.engine.begin() as connection:
+            await connection.execute(
+                text(
+                    """
+                    CREATE TEMP TABLE fulfillment_execution_terminal_probe
+                    (LIKE fulfillment_executions INCLUDING DEFAULTS INCLUDING CONSTRAINTS)
+                    ON COMMIT DROP
+                    """
+                )
+            )
+            await connection.execute(
+                text(
+                    """
+                    CREATE TRIGGER trg_fulfillment_execution_terminal_probe
+                    BEFORE UPDATE OR DELETE ON fulfillment_execution_terminal_probe
+                    FOR EACH ROW EXECUTE FUNCTION metergate_guard_fulfillment_execution()
+                    """
+                )
+            )
+            started_at = datetime(2026, 8, 26, 12, tzinfo=UTC)
+            terminal_at = started_at + timedelta(seconds=1)
+            await connection.execute(
+                text(
+                    """
+                    INSERT INTO fulfillment_execution_terminal_probe (
+                        id, entitlement_id, account_id, transaction_id,
+                        merchant_id, service_id, input_hash, execution_state,
+                        attempt_count, started_at, completed_at, failed_at,
+                        result_content_type, result_json, result_hash,
+                        result_size_bytes, failure_code, compensation_required,
+                        revision, lease_generation, lease_expires_at
+                    ) VALUES (
+                        :succeeded_id, :entitlement_id, :account_id, :transaction_id,
+                        :merchant_id, :service_id, :input_hash, 'succeeded',
+                        1, :started_at, :terminal_at, NULL,
+                        'application/json', CAST(:result_json AS jsonb), :result_hash,
+                        11, NULL, false, 1, 1, NULL
+                    ), (
+                        :permanent_id, :entitlement_id, :account_id, :transaction_id,
+                        :merchant_id, :service_id, :input_hash, 'permanent_failure',
+                        1, :started_at, NULL, :terminal_at,
+                        NULL, NULL, NULL, NULL, 'FULFILLMENT_FAILED', true, 1, 1, NULL
+                    ), (
+                        :reconciliation_id, :entitlement_id, :account_id, :transaction_id,
+                        :merchant_id, :service_id, :input_hash, 'reconciliation_required',
+                        1, :started_at, NULL, :terminal_at,
+                        NULL, NULL, NULL, NULL, 'FULFILLMENT_INTEGRITY_FAILED',
+                        false, 1, 1, NULL
+                    )
+                    """
+                ),
+                {
+                    "succeeded_id": "ful_00000000000000000000000000",
+                    "permanent_id": "ful_11111111111111111111111111",
+                    "reconciliation_id": "ful_22222222222222222222222222",
+                    "entitlement_id": "ent_00000000000000000000000000",
+                    "account_id": "acct_00000000000000000000000000",
+                    "transaction_id": "txn_00000000000000000000000000",
+                    "merchant_id": "mrc_00000000000000000000000000",
+                    "service_id": "svc_00000000000000000000000000",
+                    "input_hash": f"sha256:{'0' * 64}",
+                    "started_at": started_at,
+                    "terminal_at": terminal_at,
+                    "result_json": json.dumps({"ok": True}),
+                    "result_hash": f"sha256:{'1' * 64}",
+                },
+            )
+
+            async def assert_rejected(statement: str, parameters: dict[str, object]) -> None:
+                savepoint = await connection.begin_nested()
+                try:
+                    with pytest.raises(DBAPIError):
+                        await connection.execute(text(statement), parameters)
+                finally:
+                    if savepoint.is_active:
+                        await savepoint.rollback()
+
+            succeeded_id = "ful_00000000000000000000000000"
+            for assignment, value in (
+                ("result_content_type = :value", "application/problem+json"),
+                ("result_json = CAST(:value AS jsonb)", json.dumps({"ok": False})),
+                ("result_hash = :value", f"sha256:{'2' * 64}"),
+                ("result_size_bytes = :value", 12),
+                ("completed_at = :value", terminal_at + timedelta(seconds=1)),
+            ):
+                await assert_rejected(
+                    f"""
+                    UPDATE fulfillment_execution_terminal_probe
+                    SET {assignment}, revision = revision + 1
+                    WHERE id = :execution_id
+                    """,
+                    {"execution_id": succeeded_id, "value": value},
+                )
+
+            await assert_rejected(
+                """
+                UPDATE fulfillment_execution_terminal_probe
+                SET execution_state = 'executing', revision = revision + 1
+                WHERE id = :execution_id
+                """,
+                {"execution_id": succeeded_id},
+            )
+            await assert_rejected(
+                """
+                UPDATE fulfillment_execution_terminal_probe
+                SET failure_code = 'FULFILLMENT_FAILURE_REWRITTEN',
+                    revision = revision + 1
+                WHERE id = :execution_id
+                """,
+                {"execution_id": "ful_11111111111111111111111111"},
+            )
+            await assert_rejected(
+                """
+                UPDATE fulfillment_execution_terminal_probe
+                SET failure_code = 'FULFILLMENT_FAILURE_REWRITTEN',
+                    revision = revision + 1
+                WHERE id = :execution_id
+                """,
+                {"execution_id": "ful_22222222222222222222222222"},
+            )
+
+            await connection.execute(
+                text(
+                    """
+                    UPDATE fulfillment_execution_terminal_probe
+                    SET execution_state = 'executing', failed_at = NULL,
+                        failure_code = NULL, lease_generation = lease_generation + 1,
+                        lease_expires_at = :lease_expires_at, revision = revision + 1
+                    WHERE id = :execution_id
+                    """
+                ),
+                {
+                    "execution_id": "ful_22222222222222222222222222",
+                    "lease_expires_at": started_at + timedelta(minutes=5),
+                },
+            )
+            recovered = (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT execution_state, revision
+                        FROM fulfillment_execution_terminal_probe
+                        WHERE id = :execution_id
+                        """
+                    ),
+                    {"execution_id": "ful_22222222222222222222222222"},
+                )
+            ).one()
+            return str(recovered.execution_state), recovered.revision
+
+    assert asyncio.run(exercise_guard()) == (
+        FulfillmentExecutionState.EXECUTING.value,
+        2,
+    )
+
+
+def test_route_pin_migration_quarantines_ambiguous_dispatches_and_preserves_route_guard() -> None:
+    """Exercise the non-empty 0007 -> 0008 upgrade against PostgreSQL itself."""
+
+    async def exercise_upgrade() -> None:
+        isolated = await _prepare_isolated_database()
+        # Keep fixture writes slightly behind wall-clock migration time: 0008
+        # correctly preserves the table invariant ``updated_at >= created_at``.
+        now = datetime.now(UTC) - timedelta(seconds=1)
+        try:
+            account_id = new_account_id()
+            identity_id = new_approval_identity_id()
+            credential_id = new_passkey_credential_id()
+            merchant_id = new_merchant_id()
+            service_id = new_service_id()
+            quote_id = new_quote_id()
+            policy_id = new_policy_id()
+            evaluation_id = new_policy_evaluation_id()
+            config_id = new_service_fulfillment_config_id()
+            input_hash = f"sha256:{'1' * 64}"
+            policy_hash = f"sha256:{'2' * 64}"
+            quote_hash = f"sha256:{'3' * 64}"
+            endpoint_url = "http://127.0.0.1:8100/internal/v1/fulfillments"
+            execution_ids = [new_fulfillment_execution_id() for _ in range(4)]
+            entitlement_ids = [new_entitlement_id() for _ in range(4)]
+            transaction_ids = [new_payment_transaction_id() for _ in range(4)]
+            authorization_ids = [new_authorization_id() for _ in range(4)]
+            event_ids = [new_payment_transaction_event_id() for _ in range(4)]
+            attempt_ids = [new_payment_attempt_id() for _ in range(4)]
+
+            async with isolated.database.engine.connect() as connection:
+                await connection.run_sync(_alembic_downgrade_to_value_release)
+                await connection.commit()
+
+            async with isolated.database.engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO accounts (id, display_name, status, session_version)
+                        VALUES (:account_id, 'Route migration fixture', 'active', 1)
+                        """
+                    ),
+                    {"account_id": account_id},
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO approval_identities (
+                            id, account_id, subject_ref, display_name,
+                            webauthn_user_handle, status
+                        ) VALUES (
+                            :identity_id, :account_id, :account_id,
+                            'Route migration fixture', :user_handle, 'active'
+                        )
+                        """
+                    ),
+                    {
+                        "identity_id": identity_id,
+                        "account_id": account_id,
+                        "user_handle": uuid.uuid4().bytes + uuid.uuid4().bytes,
+                    },
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO passkey_credentials (
+                            id, approval_identity_id, credential_id, public_key,
+                            sign_count, transports
+                        ) VALUES (
+                            :credential_id, :identity_id, :credential_bytes,
+                            :public_key, 0, NULL
+                        )
+                        """
+                    ),
+                    {
+                        "credential_id": credential_id,
+                        "identity_id": identity_id,
+                        "credential_bytes": uuid.uuid4().bytes,
+                        "public_key": b"route-pin-migration-test-public-key",
+                    },
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO merchants (id, slug, name, description, status)
+                        VALUES (
+                            :merchant_id, 'route-pin-migration',
+                            'Route pin migration', 'Disposable migration fixture', 'active'
+                        )
+                        """
+                    ),
+                    {"merchant_id": merchant_id},
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO services (
+                            id, merchant_id, slug, name, description, status,
+                            service_type, purchase_type, currency, base_price,
+                            input_schema, output_schema, output_content_type,
+                            maximum_fulfillment_seconds, refund_on_fulfillment_failure
+                        ) VALUES (
+                            :service_id, :merchant_id, 'route-pin-service',
+                            'Route pin service', 'Disposable migration fixture', 'active',
+                            'report', 'one_time', 'INR', 500,
+                            CAST(:input_schema AS jsonb), CAST(:output_schema AS jsonb),
+                            'application/json', 30, true
+                        )
+                        """
+                    ),
+                    {
+                        "service_id": service_id,
+                        "merchant_id": merchant_id,
+                        "input_schema": json.dumps({"type": "object"}),
+                        "output_schema": json.dumps({"type": "object"}),
+                    },
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO quotes (
+                            id, merchant_id, service_id, input, input_hash,
+                            service_snapshot, amount, currency, purchase_type,
+                            maximum_fulfillment_seconds, refund_on_fulfillment_failure,
+                            issued_at, expires_at, quote_hash
+                        ) VALUES (
+                            :quote_id, :merchant_id, :service_id,
+                            CAST(:input_value AS jsonb), :input_hash,
+                            CAST(:service_snapshot AS jsonb), 500, 'INR', 'one_time',
+                            30, true, :issued_at, :expires_at, :quote_hash
+                        )
+                        """
+                    ),
+                    {
+                        "quote_id": quote_id,
+                        "merchant_id": merchant_id,
+                        "service_id": service_id,
+                        "input_value": json.dumps({"norad_id": 25544}),
+                        "input_hash": input_hash,
+                        "service_snapshot": json.dumps({"name": "Route pin service"}),
+                        "issued_at": now,
+                        "expires_at": now + timedelta(hours=1),
+                        "quote_hash": quote_hash,
+                    },
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO buyer_policies (
+                            id, subject_ref, maximum_amount, allowed_currencies,
+                            allowed_merchant_ids, allowed_service_ids,
+                            allowed_service_types, allowed_purchase_types,
+                            issued_at, expires_at, policy_version, policy_hash
+                        ) VALUES (
+                            :policy_id, :account_id, 1000, NULL, NULL, NULL, NULL, NULL,
+                            :issued_at, :expires_at, '1', :policy_hash
+                        )
+                        """
+                    ),
+                    {
+                        "policy_id": policy_id,
+                        "account_id": account_id,
+                        "issued_at": now,
+                        "expires_at": now + timedelta(hours=1),
+                        "policy_hash": policy_hash,
+                    },
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO policy_evaluations (
+                            id, policy_id, quote_id, policy_hash, quote_hash,
+                            decision, checks, evaluated_at, evaluation_version
+                        ) VALUES (
+                            :evaluation_id, :policy_id, :quote_id, :policy_hash, :quote_hash,
+                            'allow', CAST(:checks AS jsonb), :evaluated_at, '1'
+                        )
+                        """
+                    ),
+                    {
+                        "evaluation_id": evaluation_id,
+                        "policy_id": policy_id,
+                        "quote_id": quote_id,
+                        "policy_hash": policy_hash,
+                        "quote_hash": quote_hash,
+                        "checks": json.dumps([{"rule": "MIGRATION_FIXTURE"}]),
+                        "evaluated_at": now,
+                    },
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO service_fulfillment_configs (
+                            id, service_id, provider_type, endpoint_url,
+                            request_timeout_seconds, maximum_attempts, enabled, revision
+                        ) VALUES (
+                            :config_id, :service_id, 'http', :endpoint_url, 10, 3, true, 1
+                        )
+                        """
+                    ),
+                    {
+                        "config_id": config_id,
+                        "service_id": service_id,
+                        "endpoint_url": endpoint_url,
+                    },
+                )
+
+                for index, (
+                    authorization_id,
+                    transaction_id,
+                    event_id,
+                    attempt_id,
+                    entitlement_id,
+                ) in enumerate(
+                    zip(
+                        authorization_ids,
+                        transaction_ids,
+                        event_ids,
+                        attempt_ids,
+                        entitlement_ids,
+                        strict=True,
+                    ),
+                    start=4,
+                ):
+                    authorization_hash = f"sha256:{index:064x}"
+                    review_hash = f"sha256:{index + 10:064x}"
+                    challenge_hash = f"sha256:{index + 20:064x}"
+                    payment_binding_hash = f"sha256:{index + 30:064x}"
+                    entitlement_hash = f"sha256:{index + 40:064x}"
+                    provider_order_id = f"order_RouteMigration{index}"
+                    provider_payment_id = f"pay_RouteMigration{index}"
+                    await connection.execute(
+                        text(
+                            """
+                            INSERT INTO purchase_authorizations (
+                                id, approval_identity_id, passkey_credential_id,
+                                evaluation_id, policy_id, policy_hash, quote_id, quote_hash,
+                                merchant_id, service_id, subject_ref, amount, currency,
+                                purchase_type, review_hash, challenge_hash, authorized_at,
+                                expires_at, authorization_version, authorization_hash
+                            ) VALUES (
+                                :authorization_id, :identity_id, :credential_id,
+                                :evaluation_id, :policy_id, :policy_hash, :quote_id, :quote_hash,
+                                :merchant_id, :service_id, :account_id, 500, 'INR',
+                                'one_time', :review_hash, :challenge_hash, :authorized_at,
+                                :expires_at, '1', :authorization_hash
+                            )
+                            """
+                        ),
+                        {
+                            "authorization_id": authorization_id,
+                            "identity_id": identity_id,
+                            "credential_id": credential_id,
+                            "evaluation_id": evaluation_id,
+                            "policy_id": policy_id,
+                            "policy_hash": policy_hash,
+                            "quote_id": quote_id,
+                            "quote_hash": quote_hash,
+                            "merchant_id": merchant_id,
+                            "service_id": service_id,
+                            "account_id": account_id,
+                            "review_hash": review_hash,
+                            "challenge_hash": challenge_hash,
+                            "authorized_at": now,
+                            "expires_at": now + timedelta(hours=1),
+                            "authorization_hash": authorization_hash,
+                        },
+                    )
+                    await connection.execute(
+                        text(
+                            """
+                            INSERT INTO payment_transactions (
+                                id, account_id, authorization_id, authorization_hash,
+                                evaluation_id, policy_id, policy_hash, quote_id, quote_hash,
+                                merchant_id, service_id, amount, currency, purchase_type,
+                                provider, provider_receipt, provider_order_id,
+                                provider_order_status, transaction_state,
+                                order_creation_attempts, order_creation_started_at,
+                                order_created_at, paid_at, last_reconciled_at,
+                                payment_binding_version, payment_binding_hash, revision
+                            ) VALUES (
+                                :transaction_id, :account_id, :authorization_id,
+                                :authorization_hash, :evaluation_id, :policy_id, :policy_hash,
+                                :quote_id, :quote_hash, :merchant_id, :service_id, 500, 'INR',
+                                'one_time', 'razorpay', :transaction_id, :provider_order_id,
+                                'created', 'order_created', 1, :observed_at, :observed_at,
+                                NULL, :observed_at, '1', :payment_binding_hash, 1
+                            )
+                            """
+                        ),
+                        {
+                            "transaction_id": transaction_id,
+                            "account_id": account_id,
+                            "authorization_id": authorization_id,
+                            "authorization_hash": authorization_hash,
+                            "evaluation_id": evaluation_id,
+                            "policy_id": policy_id,
+                            "policy_hash": policy_hash,
+                            "quote_id": quote_id,
+                            "quote_hash": quote_hash,
+                            "merchant_id": merchant_id,
+                            "service_id": service_id,
+                            "provider_order_id": provider_order_id,
+                            "observed_at": now,
+                            "payment_binding_hash": payment_binding_hash,
+                        },
+                    )
+                    await connection.execute(
+                        text(
+                            """
+                            INSERT INTO payment_transaction_events (
+                                id, transaction_id, transaction_revision, event_type,
+                                actor_type, actor_id, prior_state, resulting_state,
+                                reason_code, metadata, payment_attempt_id,
+                                source_webhook_event_id, idempotency_key, occurred_at
+                            ) VALUES (
+                                :event_id, :transaction_id, 1,
+                                'payment_transaction_created', 'system', NULL, NULL,
+                                'order_created', 'PAYMENT_TRANSACTION_CREATED',
+                                CAST(:metadata AS jsonb), NULL, NULL,
+                                :idempotency_key, :occurred_at
+                            )
+                            """
+                        ),
+                        {
+                            "event_id": event_id,
+                            "transaction_id": transaction_id,
+                            "metadata": json.dumps({"migration_fixture": True}),
+                            "idempotency_key": f"{transaction_id}:created",
+                            "occurred_at": now,
+                        },
+                    )
+                    await connection.execute(
+                        text(
+                            """
+                            INSERT INTO payment_attempts (
+                                id, transaction_id, provider, provider_order_id,
+                                provider_payment_id, amount, currency, provider_status,
+                                method, captured, provider_created_at, first_seen_at, last_seen_at
+                            ) VALUES (
+                                :attempt_id, :transaction_id, 'razorpay', :provider_order_id,
+                                :provider_payment_id, 500, 'INR', 'created', NULL, false,
+                                :observed_at, :observed_at, :observed_at
+                            )
+                            """
+                        ),
+                        {
+                            "attempt_id": attempt_id,
+                            "transaction_id": transaction_id,
+                            "provider_order_id": provider_order_id,
+                            "provider_payment_id": provider_payment_id,
+                            "observed_at": now,
+                        },
+                    )
+                    await connection.execute(
+                        text(
+                            """
+                            INSERT INTO entitlements (
+                                id, account_id, transaction_id, payment_binding_hash,
+                                payment_reverification_event_id,
+                                payment_reverification_revision, provider_order_id,
+                                provider_payment_id, authorization_id, authorization_hash,
+                                evaluation_id, policy_id, policy_hash, quote_id, quote_hash,
+                                merchant_id, service_id, input, input_hash, amount, currency,
+                                purchase_type, maximum_executions, issued_at, expires_at,
+                                entitlement_version, entitlement_hash
+                            ) VALUES (
+                                :entitlement_id, :account_id, :transaction_id,
+                                :payment_binding_hash, :event_id, 1, :provider_order_id,
+                                :provider_payment_id, :authorization_id, :authorization_hash,
+                                :evaluation_id, :policy_id, :policy_hash, :quote_id, :quote_hash,
+                                :merchant_id, :service_id, CAST(:input_value AS jsonb),
+                                :input_hash, 500, 'INR', 'one_time', 1, :issued_at,
+                                :expires_at, '1', :entitlement_hash
+                            )
+                            """
+                        ),
+                        {
+                            "entitlement_id": entitlement_id,
+                            "account_id": account_id,
+                            "transaction_id": transaction_id,
+                            "payment_binding_hash": payment_binding_hash,
+                            "event_id": event_id,
+                            "provider_order_id": provider_order_id,
+                            "provider_payment_id": provider_payment_id,
+                            "authorization_id": authorization_id,
+                            "authorization_hash": authorization_hash,
+                            "evaluation_id": evaluation_id,
+                            "policy_id": policy_id,
+                            "policy_hash": policy_hash,
+                            "quote_id": quote_id,
+                            "quote_hash": quote_hash,
+                            "merchant_id": merchant_id,
+                            "service_id": service_id,
+                            "input_value": json.dumps({"norad_id": 25544}),
+                            "input_hash": input_hash,
+                            "issued_at": now,
+                            "expires_at": now + timedelta(hours=1),
+                            "entitlement_hash": entitlement_hash,
+                        },
+                    )
+
+                for execution_id, entitlement_id, transaction_id, execution_state in zip(
+                    execution_ids,
+                    entitlement_ids,
+                    transaction_ids,
+                    ("executing", "pending", "succeeded", "executing"),
+                    strict=True,
+                ):
+                    if execution_state == "pending":
+                        values = {
+                            "execution_id": execution_id,
+                            "entitlement_id": entitlement_id,
+                            "transaction_id": transaction_id,
+                            "account_id": account_id,
+                            "merchant_id": merchant_id,
+                            "service_id": service_id,
+                            "input_hash": input_hash,
+                            "execution_state": execution_state,
+                            "created_at": now,
+                            "updated_at": now,
+                        }
+                        await connection.execute(
+                            text(
+                                """
+                                INSERT INTO fulfillment_executions (
+                                    id, entitlement_id, account_id, transaction_id,
+                                    merchant_id, service_id, input_hash, execution_state,
+                                    attempt_count, started_at, completed_at, failed_at,
+                                    result_content_type, result_json, result_hash,
+                                    result_size_bytes, failure_code, compensation_required,
+                                    revision, lease_generation, lease_expires_at,
+                                    created_at, updated_at
+                                ) VALUES (
+                                    :execution_id, :entitlement_id, :account_id, :transaction_id,
+                                    :merchant_id, :service_id, :input_hash, :execution_state,
+                                    0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, false,
+                                    1, 0, NULL, :created_at, :updated_at
+                                )
+                                """
+                            ),
+                            values,
+                        )
+                    elif execution_state == "executing":
+                        await connection.execute(
+                            text(
+                                """
+                                INSERT INTO fulfillment_executions (
+                                    id, entitlement_id, account_id, transaction_id,
+                                    merchant_id, service_id, input_hash, execution_state,
+                                    attempt_count, started_at, completed_at, failed_at,
+                                    result_content_type, result_json, result_hash,
+                                    result_size_bytes, failure_code, compensation_required,
+                                    revision, lease_generation, lease_expires_at,
+                                    created_at, updated_at
+                                ) VALUES (
+                                    :execution_id, :entitlement_id, :account_id, :transaction_id,
+                                    :merchant_id, :service_id, :input_hash, 'executing',
+                                    1, :started_at, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                                    false, 7, 1, :lease_expires_at, :created_at, :updated_at
+                                )
+                                """
+                            ),
+                            {
+                                "execution_id": execution_id,
+                                "entitlement_id": entitlement_id,
+                                "transaction_id": transaction_id,
+                                "account_id": account_id,
+                                "merchant_id": merchant_id,
+                                "service_id": service_id,
+                                "input_hash": input_hash,
+                                "started_at": now,
+                                "lease_expires_at": now + timedelta(minutes=5),
+                                "created_at": now,
+                                "updated_at": now,
+                            },
+                        )
+                    else:
+                        await connection.execute(
+                            text(
+                                """
+                                INSERT INTO fulfillment_executions (
+                                    id, entitlement_id, account_id, transaction_id,
+                                    merchant_id, service_id, input_hash, execution_state,
+                                    attempt_count, started_at, completed_at, failed_at,
+                                    result_content_type, result_json, result_hash,
+                                    result_size_bytes, failure_code, compensation_required,
+                                    revision, lease_generation, lease_expires_at,
+                                    created_at, updated_at
+                                ) VALUES (
+                                    :execution_id, :entitlement_id, :account_id, :transaction_id,
+                                    :merchant_id, :service_id, :input_hash, 'succeeded',
+                                    1, :started_at, :completed_at, NULL, 'application/json',
+                                    CAST(:result_json AS jsonb), :result_hash, 11, NULL, false,
+                                    4, 1, NULL, :created_at, :updated_at
+                                )
+                                """
+                            ),
+                            {
+                                "execution_id": execution_id,
+                                "entitlement_id": entitlement_id,
+                                "transaction_id": transaction_id,
+                                "account_id": account_id,
+                                "merchant_id": merchant_id,
+                                "service_id": service_id,
+                                "input_hash": input_hash,
+                                "started_at": now,
+                                "completed_at": now + timedelta(seconds=1),
+                                "result_json": json.dumps({"ok": True}),
+                                "result_hash": f"sha256:{'4' * 64}",
+                                "created_at": now,
+                                "updated_at": now + timedelta(seconds=1),
+                            },
+                        )
+
+                # One audit record is compatible with the current config and the
+                # other is deliberately incomplete, proving the old dispatch is
+                # ambiguous rather than safely backfillable.
+                for metadata in (
+                    {
+                        "fulfillment_config_id": config_id,
+                        "fulfillment_config_revision": 1,
+                    },
+                    {"fulfillment_config_id": config_id},
+                ):
+                    await connection.execute(
+                        text(
+                            """
+                            INSERT INTO fulfillment_events (
+                                id, transaction_id, entitlement_id, execution_id,
+                                execution_revision, event_type, actor_type, actor_id,
+                                reason_code, metadata, idempotency_key, occurred_at
+                            ) VALUES (
+                                :event_id, :transaction_id, :entitlement_id, :execution_id,
+                                7, 'merchant_request_sent', 'system', NULL,
+                                'FULFILLMENT_REQUEST_SENT', CAST(:metadata AS jsonb),
+                                :idempotency_key, :occurred_at
+                            )
+                            """
+                        ),
+                        {
+                            "event_id": new_fulfillment_event_id(),
+                            "transaction_id": transaction_ids[0],
+                            "entitlement_id": entitlement_ids[0],
+                            "execution_id": execution_ids[0],
+                            "metadata": json.dumps(metadata),
+                            "idempotency_key": f"{execution_ids[0]}:{len(metadata)}",
+                            "occurred_at": now,
+                        },
+                    )
+
+                # Every send for this execution proves the same config revision,
+                # so 0008 can safely recover the historical endpoint snapshot.
+                for suffix in ("first", "retry"):
+                    await connection.execute(
+                        text(
+                            """
+                            INSERT INTO fulfillment_events (
+                                id, transaction_id, entitlement_id, execution_id,
+                                execution_revision, event_type, actor_type, actor_id,
+                                reason_code, metadata, idempotency_key, occurred_at
+                            ) VALUES (
+                                :event_id, :transaction_id, :entitlement_id, :execution_id,
+                                7, 'merchant_request_sent', 'system', NULL,
+                                'MERCHANT_REQUEST_SENT', CAST(:metadata AS jsonb),
+                                :idempotency_key, :occurred_at
+                            )
+                            """
+                        ),
+                        {
+                            "event_id": new_fulfillment_event_id(),
+                            "transaction_id": transaction_ids[3],
+                            "entitlement_id": entitlement_ids[3],
+                            "execution_id": execution_ids[3],
+                            "metadata": json.dumps(
+                                {
+                                    "fulfillment_config_id": config_id,
+                                    "fulfillment_config_revision": 1,
+                                }
+                            ),
+                            "idempotency_key": f"{execution_ids[3]}:{suffix}",
+                            "occurred_at": now,
+                        },
+                    )
+
+            async with isolated.database.engine.connect() as connection:
+                await connection.run_sync(_alembic_upgrade)
+                await connection.commit()
+
+            async with isolated.database.engine.begin() as connection:
+                quarantined = (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT execution_state, revision, failure_code,
+                                   compensation_required, lease_expires_at
+                            FROM fulfillment_executions WHERE id = :execution_id
+                            """
+                        ),
+                        {"execution_id": execution_ids[0]},
+                    )
+                ).one()
+                assert quarantined == (
+                    "permanent_failure",
+                    8,
+                    "FULFILLMENT_ROUTE_PROVENANCE_UNKNOWN",
+                    True,
+                    None,
+                )
+                quarantine_events = (
+                    (
+                        await connection.execute(
+                            text(
+                                """
+                            SELECT event_type, execution_revision, reason_code, metadata
+                            FROM fulfillment_events
+                            WHERE execution_id = :execution_id
+                              AND execution_revision = 8
+                            ORDER BY event_type
+                            """
+                            ),
+                            {"execution_id": execution_ids[0]},
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
+                assert [
+                    (event["event_type"], event["execution_revision"], event["reason_code"])
+                    for event in quarantine_events
+                ] == [
+                    ("compensation_required", 8, "FULFILLMENT_COMPENSATION_REQUIRED"),
+                    ("fulfillment_failed", 8, "FULFILLMENT_PERMANENT_FAILURE"),
+                ]
+                assert all(
+                    event["metadata"]["failure_code"] == "FULFILLMENT_ROUTE_PROVENANCE_UNKNOWN"
+                    for event in quarantine_events
+                )
+
+                terminal = (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT execution_state, revision, fulfillment_config_id,
+                                   result_hash, compensation_required
+                            FROM fulfillment_executions WHERE id = :execution_id
+                            """
+                        ),
+                        {"execution_id": execution_ids[2]},
+                    )
+                ).one()
+                assert terminal == ("succeeded", 4, None, f"sha256:{'4' * 64}", False)
+
+                proven_route = (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT fulfillment_config_id, fulfillment_config_revision,
+                                   provider_type, endpoint_url,
+                                   request_timeout_seconds, maximum_attempts,
+                                   execution_state, revision
+                            FROM fulfillment_executions WHERE id = :execution_id
+                            """
+                        ),
+                        {"execution_id": execution_ids[3]},
+                    )
+                ).one()
+                assert proven_route == (
+                    config_id,
+                    1,
+                    "http",
+                    endpoint_url,
+                    10,
+                    3,
+                    "executing",
+                    7,
+                )
+
+                await connection.execute(
+                    text(
+                        """
+                        UPDATE fulfillment_executions
+                        SET fulfillment_config_id = :config_id,
+                            fulfillment_config_revision = 1,
+                            provider_type = 'http', endpoint_url = :endpoint_url,
+                            request_timeout_seconds = 10, maximum_attempts = 3,
+                            revision = revision + 1, updated_at = :updated_at
+                        WHERE id = :execution_id
+                        """
+                    ),
+                    {
+                        "config_id": config_id,
+                        "endpoint_url": endpoint_url,
+                        "updated_at": now + timedelta(seconds=2),
+                        "execution_id": execution_ids[1],
+                    },
+                )
+                pinned = (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT fulfillment_config_id, fulfillment_config_revision,
+                                   provider_type, endpoint_url,
+                                   request_timeout_seconds, maximum_attempts, revision
+                            FROM fulfillment_executions WHERE id = :execution_id
+                            """
+                        ),
+                        {"execution_id": execution_ids[1]},
+                    )
+                ).one()
+                assert pinned == (config_id, 1, "http", endpoint_url, 10, 3, 2)
+
+                savepoint = await connection.begin_nested()
+                try:
+                    with pytest.raises(DBAPIError):
+                        await connection.execute(
+                            text(
+                                """
+                                UPDATE fulfillment_executions
+                                SET endpoint_url = 'http://127.0.0.1:8999/rewritten',
+                                    revision = revision + 1,
+                                    updated_at = :updated_at
+                                WHERE id = :execution_id
+                                """
+                            ),
+                            {
+                                "updated_at": now + timedelta(seconds=3),
+                                "execution_id": execution_ids[1],
+                            },
+                        )
+                finally:
+                    if savepoint.is_active:
+                        await savepoint.rollback()
+
+            # A populated downgrade restores the 0007 trigger before dropping
+            # route columns; the next upgrade safely reconstructs only the route
+            # whose complete request audit still proves the current config.
+            async with isolated.database.engine.connect() as connection:
+                await connection.run_sync(_alembic_downgrade_to_value_release)
+                await connection.commit()
+                await connection.run_sync(_alembic_upgrade)
+                await connection.commit()
+
+            async with isolated.database.engine.begin() as connection:
+                reupgraded = (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT fulfillment_config_id, endpoint_url,
+                                   execution_state, revision
+                            FROM fulfillment_executions WHERE id = :execution_id
+                            """
+                        ),
+                        {"execution_id": execution_ids[3]},
+                    )
+                ).one()
+                assert reupgraded == (config_id, endpoint_url, "executing", 7)
+                quarantined_again = (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT execution_state, revision, compensation_required
+                            FROM fulfillment_executions WHERE id = :execution_id
+                            """
+                        ),
+                        {"execution_id": execution_ids[0]},
+                    )
+                ).one()
+                assert quarantined_again == ("permanent_failure", 8, True)
+        finally:
+            await isolated.database.dispose()
+            await _drop_isolated_schema(isolated.database_url, isolated.schema)
+
+    asyncio.run(exercise_upgrade())
 
 
 def test_payment_migration_downgrades_to_accounts_and_reupgrades() -> None:
@@ -2626,6 +3691,228 @@ def test_payment_repository_commits_audited_aggregate_and_postgresql_guards(
                 {"transaction_id": transaction.id},
             )
         )
+
+    async def prepare_entitlement() -> Entitlement:
+        async with isolated_database.database.session() as session:
+            payment_repository = PaymentTransactionRepository(session)
+            locked = await payment_repository.get_for_update(transaction.id)
+            attempt = await session.get(PaymentAttempt, first_attempt_id)
+            quote_record = await session.get(Quote, transaction.quote_id)
+            assert locked is not None
+            assert attempt is not None
+            assert quote_record is not None
+            assert locked.last_reconciled_at is not None
+            reverified_at = max(
+                datetime.now(UTC),
+                locked.last_reconciled_at + timedelta(microseconds=1),
+            )
+            proof_event = PaymentTransactionEvent(
+                id=new_payment_transaction_event_id(),
+                transaction_id=locked.id,
+                transaction_revision=locked.revision + 1,
+                event_type=PaymentTransactionEventType.PAYMENT_REVERIFIED,
+                actor_type=PaymentEventActorType.PROVIDER_API,
+                actor_id=attempt.provider_payment_id,
+                prior_state=PaymentTransactionState.PAID,
+                resulting_state=PaymentTransactionState.PAID,
+                reason_code="PAYMENT_REVERIFIED_FOR_VALUE_RELEASE",
+                event_metadata={"authoritative_snapshot": True},
+                payment_attempt_id=attempt.id,
+                idempotency_key=f"{locked.id}:concurrency-proof",
+                occurred_at=reverified_at,
+            )
+            locked.last_reconciled_at = reverified_at
+            locked = await payment_repository.update_with_event(locked, event=proof_event)
+
+            entitlement_id = new_entitlement_id()
+            issued_at = reverified_at + timedelta(microseconds=1)
+            expires_at = issued_at + timedelta(minutes=10)
+            hash_fields = {
+                "entitlement_id": entitlement_id,
+                "account_id": locked.account_id,
+                "transaction_id": locked.id,
+                "payment_binding_hash": locked.payment_binding_hash,
+                "payment_reverification_event_id": proof_event.id,
+                "payment_reverification_revision": locked.revision,
+                "provider_order_id": locked.provider_order_id,
+                "provider_payment_id": attempt.provider_payment_id,
+                "authorization_id": locked.authorization_id,
+                "authorization_hash": locked.authorization_hash,
+                "evaluation_id": locked.evaluation_id,
+                "policy_id": locked.policy_id,
+                "policy_hash": locked.policy_hash,
+                "quote_id": locked.quote_id,
+                "quote_hash": locked.quote_hash,
+                "merchant_id": locked.merchant_id,
+                "service_id": locked.service_id,
+                "input_value": quote_record.input,
+                "input_hash": quote_record.input_hash,
+                "amount": locked.amount,
+                "currency": locked.currency,
+                "purchase_type": locked.purchase_type,
+                "maximum_executions": 1,
+                "issued_at": issued_at,
+                "expires_at": expires_at,
+                "entitlement_version": "1",
+            }
+            entitlement = Entitlement(
+                id=entitlement_id,
+                account_id=locked.account_id,
+                transaction_id=locked.id,
+                payment_binding_hash=locked.payment_binding_hash,
+                payment_reverification_event_id=proof_event.id,
+                payment_reverification_revision=locked.revision,
+                provider_order_id=locked.provider_order_id,
+                provider_payment_id=attempt.provider_payment_id,
+                authorization_id=locked.authorization_id,
+                authorization_hash=locked.authorization_hash,
+                evaluation_id=locked.evaluation_id,
+                policy_id=locked.policy_id,
+                policy_hash=locked.policy_hash,
+                quote_id=locked.quote_id,
+                quote_hash=locked.quote_hash,
+                merchant_id=locked.merchant_id,
+                service_id=locked.service_id,
+                input=quote_record.input,
+                input_hash=quote_record.input_hash,
+                amount=locked.amount,
+                currency=locked.currency,
+                purchase_type=locked.purchase_type,
+                maximum_executions=1,
+                issued_at=issued_at,
+                expires_at=expires_at,
+                entitlement_version="1",
+                entitlement_hash=calculate_entitlement_hash(**hash_fields),
+                created_at=issued_at,
+            )
+            issuance_event = FulfillmentEvent(
+                id=new_fulfillment_event_id(),
+                transaction_id=locked.id,
+                entitlement_id=entitlement.id,
+                execution_id=None,
+                execution_revision=None,
+                event_type=FulfillmentEventType.ENTITLEMENT_ISSUED,
+                actor_type=FulfillmentEventActorType.ENTITLEMENT_WORKER,
+                actor_id=None,
+                reason_code="ENTITLEMENT_ISSUED",
+                event_metadata={},
+                idempotency_key=f"{locked.id}:concurrency-entitlement",
+                occurred_at=issued_at,
+            )
+            entitlement = await EntitlementRepository(session).create_with_event(
+                entitlement,
+                event=issuance_event,
+            )
+            await ServiceFulfillmentConfigRepository(session).create(
+                ServiceFulfillmentConfig(
+                    service_id=locked.service_id,
+                    provider_type=FulfillmentProviderType.HTTP,
+                    endpoint_url="http://127.0.0.1:8100/internal/v1/fulfillments",
+                    request_timeout_seconds=10,
+                    maximum_attempts=3,
+                    enabled=True,
+                    revision=1,
+                )
+            )
+            return entitlement
+
+    entitlement = asyncio.run(prepare_entitlement())
+
+    class BlockingFulfillmentProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def execute(
+            self,
+            request: object,
+            *,
+            endpoint_path: str,
+        ) -> MerchantFulfillmentResult:
+            del request
+            assert endpoint_path == "/internal/v1/fulfillments"
+            self.calls += 1
+            self.started.set()
+            await self.release.wait()
+            return MerchantFulfillmentResult(
+                result_content_type="application/json",
+                result={"data_source": "CelesTrak", "norad_id": 25544},
+            )
+
+    class ConcurrencyPaymentEligibility:
+        def __init__(self, session: object) -> None:
+            self._payments = PaymentApplicationService(
+                session,  # type: ignore[arg-type]
+                None,
+                domain_client.app.state.settings,
+            )
+
+        async def verify_transaction_for_value_release(self, transaction_id: str) -> object:
+            # Provider-proof behavior is covered separately; this PostgreSQL test
+            # isolates the row-lock/unique-key execution race.
+            return await self._payments.require_local_value_release_eligibility(transaction_id)
+
+        async def require_local_value_release_eligibility(
+            self,
+            transaction_id: str,
+            *,
+            for_update: bool = False,
+        ) -> object:
+            return await self._payments.require_local_value_release_eligibility(
+                transaction_id,
+                for_update=for_update,
+            )
+
+    async def run_concurrent_execution() -> tuple[int, int, int, bool, bool, int]:
+        provider = BlockingFulfillmentProvider()
+        capability_service = CapabilityTokenService(
+            "postgresql-concurrency-capability-secret-32-bytes",
+            ttl=timedelta(minutes=5),
+        )
+        token = capability_service.issue(entitlement).token
+
+        async def invoke() -> object:
+            async with isolated_database.database.session() as session:
+                return await FulfillmentApplicationService(
+                    session,
+                    capability_service,
+                    provider,
+                    payment_eligibility=ConcurrencyPaymentEligibility(session),
+                    provider_base_url="http://127.0.0.1:8100",
+                    execution_lease=timedelta(seconds=30),
+                    maximum_result_bytes=262_144,
+                    default_maximum_attempts=3,
+                ).execute(
+                    merchant_slug=merchant["slug"],
+                    service_slug=service["slug"],
+                    input_value={"norad_id": 25544},
+                    token=token,
+                )
+
+        first_task = asyncio.create_task(invoke())
+        await provider.started.wait()
+        concurrent = await invoke()
+        provider.release.set()
+        first = await first_task
+        replay = await invoke()
+        async with isolated_database.database.session() as session:
+            execution_count = await session.scalar(
+                select(func.count(FulfillmentExecution.id)).where(
+                    FulfillmentExecution.entitlement_id == entitlement.id
+                )
+            )
+        assert execution_count is not None
+        return (
+            first.status_code,
+            concurrent.status_code,
+            replay.status_code,
+            first.result.replayed_result,
+            replay.result.replayed_result,
+            execution_count,
+        )
+
+    assert asyncio.run(run_concurrent_execution()) == (200, 202, 200, False, True, 1)
 
 
 def test_policy_rows_enforce_json_constraints_foreign_keys_and_immutability(

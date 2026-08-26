@@ -113,6 +113,7 @@ class RazorpayPaymentProvider:
         key_secret: str,
         connect_timeout_seconds: float = 2.0,
         read_timeout_seconds: float = 5.0,
+        operation_timeout_seconds: float | None = None,
         max_concurrency: int = 8,
         client_factory: RazorpayClientFactory | None = None,
     ) -> None:
@@ -127,12 +128,23 @@ class RazorpayPaymentProvider:
             raise ValueError("Razorpay key secret is invalid")
         self._validate_timeout(connect_timeout_seconds, field="connect timeout", maximum=30)
         self._validate_timeout(read_timeout_seconds, field="read timeout", maximum=60)
+        effective_operation_timeout = (
+            float(connect_timeout_seconds) + float(read_timeout_seconds) + 1.0
+            if operation_timeout_seconds is None
+            else operation_timeout_seconds
+        )
+        self._validate_timeout(
+            effective_operation_timeout,
+            field="operation timeout",
+            maximum=120,
+        )
         if type(max_concurrency) is not int or not 1 <= max_concurrency <= 32:
             raise ValueError("Razorpay concurrency must be between one and 32")
 
         self._key_id = key_id
         self._key_secret = key_secret
         self._timeout = (float(connect_timeout_seconds), float(read_timeout_seconds))
+        self._operation_timeout = float(effective_operation_timeout)
         self._client_factory = client_factory or _default_client_factory
         self._semaphore = asyncio.Semaphore(max_concurrency)
 
@@ -264,13 +276,47 @@ class RazorpayPaymentProvider:
         operation: str,
         callback: Callable[[RazorpaySDKClient], object],
     ) -> object:
-        async with self._semaphore:
-            try:
-                return await asyncio.to_thread(self._execute_sync, callback)
-            except PaymentProviderError:
-                raise
-            except Exception as error:
-                raise self._map_error(operation, error) from error
+        try:
+            await asyncio.wait_for(
+                self._semaphore.acquire(),
+                timeout=self._operation_timeout,
+            )
+        except TimeoutError as error:
+            raise PaymentProviderTimeoutError(
+                operation,
+                "Razorpay operation timed out before an execution slot was available",
+            ) from error
+
+        worker = asyncio.create_task(asyncio.to_thread(self._execute_sync, callback))
+        release_immediately = True
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(worker),
+                timeout=self._operation_timeout,
+            )
+        except TimeoutError as error:
+            if not worker.done():
+                release_immediately = False
+                worker.add_done_callback(self._release_after_abandoned_worker)
+            raise PaymentProviderTimeoutError(operation, "Razorpay operation timed out") from error
+        except asyncio.CancelledError:
+            if not worker.done():
+                release_immediately = False
+                worker.add_done_callback(self._release_after_abandoned_worker)
+            raise
+        except PaymentProviderError:
+            raise
+        except Exception as error:
+            raise self._map_error(operation, error) from error
+        finally:
+            if release_immediately:
+                self._semaphore.release()
+
+    def _release_after_abandoned_worker(self, worker: asyncio.Task[object]) -> None:
+        """Release capacity only when a timed-out synchronous call actually exits."""
+        with contextlib.suppress(BaseException):
+            worker.result()
+        self._semaphore.release()
 
     def _execute_sync(self, callback: Callable[[RazorpaySDKClient], object]) -> object:
         client = self._client_factory(self._key_id, self._key_secret)

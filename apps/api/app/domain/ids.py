@@ -10,7 +10,12 @@ IdPrefix = Literal[
     "aid_",
     "ach_",
     "aut_",
+    "cap_",
+    "ent_",
+    "ful_",
+    "fve_",
     "mrc_",
+    "obx_",
     "pmt_",
     "pkc_",
     "pol_",
@@ -18,6 +23,7 @@ IdPrefix = Literal[
     "pye_",
     "qte_",
     "rwe_",
+    "sfc_",
     "svc_",
     "txn_",
 ]
@@ -26,7 +32,12 @@ ACCOUNT_ID_PREFIX: IdPrefix = "acct_"
 APPROVAL_IDENTITY_ID_PREFIX: IdPrefix = "aid_"
 APPROVAL_CHALLENGE_ID_PREFIX: IdPrefix = "ach_"
 AUTHORIZATION_ID_PREFIX: IdPrefix = "aut_"
+CAPABILITY_ID_PREFIX: IdPrefix = "cap_"
+ENTITLEMENT_ID_PREFIX: IdPrefix = "ent_"
+FULFILLMENT_EXECUTION_ID_PREFIX: IdPrefix = "ful_"
+FULFILLMENT_EVENT_ID_PREFIX: IdPrefix = "fve_"
 MERCHANT_ID_PREFIX: IdPrefix = "mrc_"
+COMMERCE_OUTBOX_EVENT_ID_PREFIX: IdPrefix = "obx_"
 PAYMENT_ATTEMPT_ID_PREFIX: IdPrefix = "pmt_"
 PASSKEY_CREDENTIAL_ID_PREFIX: IdPrefix = "pkc_"
 POLICY_ID_PREFIX: IdPrefix = "pol_"
@@ -34,6 +45,7 @@ PAYMENT_TRANSACTION_EVENT_ID_PREFIX: IdPrefix = "pte_"
 POLICY_EVALUATION_ID_PREFIX: IdPrefix = "pye_"
 QUOTE_ID_PREFIX: IdPrefix = "qte_"
 RAZORPAY_WEBHOOK_EVENT_ID_PREFIX: IdPrefix = "rwe_"
+SERVICE_FULFILLMENT_CONFIG_ID_PREFIX: IdPrefix = "sfc_"
 SERVICE_ID_PREFIX: IdPrefix = "svc_"
 PAYMENT_TRANSACTION_ID_PREFIX: IdPrefix = "txn_"
 
@@ -53,7 +65,12 @@ def generate_id(prefix: IdPrefix) -> str:
         APPROVAL_IDENTITY_ID_PREFIX,
         APPROVAL_CHALLENGE_ID_PREFIX,
         AUTHORIZATION_ID_PREFIX,
+        CAPABILITY_ID_PREFIX,
+        ENTITLEMENT_ID_PREFIX,
+        FULFILLMENT_EXECUTION_ID_PREFIX,
+        FULFILLMENT_EVENT_ID_PREFIX,
         MERCHANT_ID_PREFIX,
+        COMMERCE_OUTBOX_EVENT_ID_PREFIX,
         PAYMENT_ATTEMPT_ID_PREFIX,
         PASSKEY_CREDENTIAL_ID_PREFIX,
         POLICY_ID_PREFIX,
@@ -61,6 +78,7 @@ def generate_id(prefix: IdPrefix) -> str:
         POLICY_EVALUATION_ID_PREFIX,
         QUOTE_ID_PREFIX,
         RAZORPAY_WEBHOOK_EVENT_ID_PREFIX,
+        SERVICE_FULFILLMENT_CONFIG_ID_PREFIX,
         SERVICE_ID_PREFIX,
         PAYMENT_TRANSACTION_ID_PREFIX,
     }:
@@ -87,8 +105,28 @@ def new_authorization_id() -> str:
     return generate_id(AUTHORIZATION_ID_PREFIX)
 
 
+def new_capability_id() -> str:
+    return generate_id(CAPABILITY_ID_PREFIX)
+
+
+def new_entitlement_id() -> str:
+    return generate_id(ENTITLEMENT_ID_PREFIX)
+
+
+def new_fulfillment_execution_id() -> str:
+    return generate_id(FULFILLMENT_EXECUTION_ID_PREFIX)
+
+
+def new_fulfillment_event_id() -> str:
+    return generate_id(FULFILLMENT_EVENT_ID_PREFIX)
+
+
 def new_merchant_id() -> str:
     return generate_id(MERCHANT_ID_PREFIX)
+
+
+def new_commerce_outbox_event_id() -> str:
+    return generate_id(COMMERCE_OUTBOX_EVENT_ID_PREFIX)
 
 
 def new_payment_attempt_id() -> str:
@@ -117,6 +155,10 @@ def new_quote_id() -> str:
 
 def new_razorpay_webhook_event_id() -> str:
     return generate_id(RAZORPAY_WEBHOOK_EVENT_ID_PREFIX)
+
+
+def new_service_fulfillment_config_id() -> str:
+    return generate_id(SERVICE_FULFILLMENT_CONFIG_ID_PREFIX)
 
 
 def new_service_id() -> str:

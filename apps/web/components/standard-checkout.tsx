@@ -4,6 +4,7 @@ import Script from "next/script";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useAccountSession } from "@/components/account-session";
+import { PaidResourceAccess } from "@/components/paid-resource-access";
 import { ApiRequestFailure } from "@/lib/api-client";
 import {
   createRazorpayCheckout,
@@ -1143,19 +1144,11 @@ export function StandardCheckout({
         />
       ) : null}
 
-      {paymentVerified ? (
-        <div className="mt-4 rounded-xl border border-emerald-300/25 bg-emerald-300/[0.075] px-4 py-3">
-          <p className="text-sm font-semibold text-emerald-100">
-            VERIFIED PAYMENT CAPTURED
-          </p>
-          <p className="mt-1 font-mono text-[10px] text-emerald-200/75">
-            PAYMENT_VERIFIED
-          </p>
-          <p className="mt-2 text-xs leading-5 text-emerald-50/85">
-            MeterGate has verified captured payment from backend evidence. Payment
-            does not itself claim entitlement or fulfillment.
-          </p>
-        </div>
+      {paymentVerified && transaction ? (
+        <PaidResourceAccess
+          apiBaseEndpoint={apiBaseEndpoint}
+          transactionId={transaction.transaction_id}
+        />
       ) : null}
     </section>
   );

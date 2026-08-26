@@ -26,6 +26,7 @@ from app.providers import webhook_signature_digest
 from app.services.payment_webhooks import RazorpayWebhookIngressService
 
 WEBHOOK_SECRET = "test-webhook-secret"
+PREVIOUS_WEBHOOK_SECRET = "previous-webhook-secret"
 EVENT_ID = "evt_test_delivery_001"
 ENDPOINT = "/api/v1/webhooks/razorpay"
 FIXED_NOW = datetime(2026, 8, 25, 12, tzinfo=UTC)
@@ -236,6 +237,127 @@ async def test_injected_clock_rejects_signed_stale_event_before_enqueue() -> Non
 
     assert error_info.value.reason_code == "PAYMENT_WEBHOOK_EVENT_STALE"
     assert queue.payloads == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event_type",
+    ["refund.created", "refund.processed", "refund.speed_changed"],
+)
+async def test_signed_value_revoking_refund_accepts_dashboard_replay_window(
+    event_type: str,
+) -> None:
+    queue = RecordingQueue()
+    ingress = RazorpayWebhookIngressService(
+        queue,  # type: ignore[arg-type]
+        webhook_secret=WEBHOOK_SECRET,
+        maximum_age=timedelta(seconds=300),
+        clock=lambda: FIXED_NOW,
+    )
+    body = webhook_body(
+        created_at=FIXED_NOW - timedelta(days=14, hours=23),
+        event_type=event_type,
+    )
+
+    await ingress.accept(
+        raw_body=body,
+        signature=signed_headers(body)["X-Razorpay-Signature"],
+        provider_event_id=EVENT_ID,
+    )
+
+    assert len(queue.payloads) == 1
+    assert queue.payloads[0].raw_body == body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_type", "created_at"),
+    [
+        ("refund.processed", FIXED_NOW - timedelta(days=15, seconds=1)),
+        ("refund.failed", FIXED_NOW - timedelta(seconds=301)),
+        ("refund.created", FIXED_NOW + timedelta(seconds=61)),
+    ],
+)
+async def test_refund_replay_window_rejects_expired_or_future_events(
+    event_type: str,
+    created_at: datetime,
+) -> None:
+    queue = RecordingQueue()
+    ingress = RazorpayWebhookIngressService(
+        queue,  # type: ignore[arg-type]
+        webhook_secret=WEBHOOK_SECRET,
+        maximum_age=timedelta(seconds=300),
+        clock=lambda: FIXED_NOW,
+    )
+    body = webhook_body(created_at=created_at, event_type=event_type)
+
+    with pytest.raises(PaymentVerificationError) as error_info:
+        await ingress.accept(
+            raw_body=body,
+            signature=signed_headers(body)["X-Razorpay-Signature"],
+            provider_event_id=EVENT_ID,
+        )
+
+    assert error_info.value.reason_code == "PAYMENT_WEBHOOK_EVENT_STALE"
+    assert queue.payloads == []
+
+
+@pytest.mark.asyncio
+async def test_webhook_rotation_accepts_previous_secret_during_overlap() -> None:
+    queue = RecordingQueue()
+    ingress = RazorpayWebhookIngressService(
+        queue,  # type: ignore[arg-type]
+        webhook_secret=WEBHOOK_SECRET,
+        previous_webhook_secret=PREVIOUS_WEBHOOK_SECRET,
+        maximum_age=timedelta(seconds=300),
+        clock=lambda: FIXED_NOW,
+    )
+    body = webhook_body(created_at=FIXED_NOW)
+    signature = webhook_signature_digest(
+        raw_body=body,
+        webhook_secret=PREVIOUS_WEBHOOK_SECRET,
+    )
+
+    await ingress.accept(
+        raw_body=body,
+        signature=signature,
+        provider_event_id=EVENT_ID,
+    )
+
+    assert len(queue.payloads) == 1
+    assert queue.payloads[0].raw_body == body
+
+
+@pytest.mark.asyncio
+async def test_verified_hook_runs_before_durable_queue_admission() -> None:
+    order: list[str] = []
+
+    class OrderedQueue(RecordingQueue):
+        async def enqueue(self, payload: VerifiedWebhookPayload) -> str:
+            assert order == ["quarantined"]
+            order.append("enqueued")
+            return await super().enqueue(payload)
+
+    async def quarantine(_payload: VerifiedWebhookPayload) -> None:
+        order.append("quarantined")
+
+    queue = OrderedQueue()
+    ingress = RazorpayWebhookIngressService(
+        queue,  # type: ignore[arg-type]
+        webhook_secret=WEBHOOK_SECRET,
+        maximum_age=timedelta(seconds=300),
+        clock=lambda: FIXED_NOW,
+    )
+    body = webhook_body(created_at=FIXED_NOW)
+
+    await ingress.accept(
+        raw_body=body,
+        signature=signed_headers(body)["X-Razorpay-Signature"],
+        provider_event_id=EVENT_ID,
+        before_enqueue=quarantine,
+    )
+
+    assert order == ["quarantined", "enqueued"]
 
 
 def test_disabled_payments_rejects_webhook_with_injected_secret_and_queue(

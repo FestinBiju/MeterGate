@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hmac import compare_digest
-from typing import Any
+from typing import Any, Protocol
 
 from redis.asyncio import Redis
 from sqlalchemy.exc import IntegrityError
@@ -39,6 +39,9 @@ from app.domain.enums import (
 )
 from app.domain.exceptions import (
     AuthenticationForbiddenError,
+    EntitlementConflictError,
+    EntitlementIntegrityError,
+    EntitlementUnavailableError,
     PaymentConflictError,
     PaymentExpiredError,
     PaymentIntegrityError,
@@ -47,7 +50,7 @@ from app.domain.exceptions import (
     PaymentUnavailableError,
     PaymentVerificationError,
 )
-from app.domain.hashing import sha256_bytes
+from app.domain.hashing import canonical_utc_datetime, sha256_bytes, sha256_json
 from app.domain.ids import (
     new_payment_attempt_id,
     new_payment_transaction_event_id,
@@ -112,8 +115,20 @@ from app.services.policy_evaluations import PolicyEvaluationApplicationService
 from app.workers.razorpay_webhooks import RazorpayWebhookWorker
 
 Clock = Callable[[], datetime]
-_SUPPORTED_WEBHOOK_EVENTS = frozenset(
-    {"payment.authorized", "payment.captured", "payment.failed", "order.paid"}
+_VALUE_REVOKING_WEBHOOK_EVENTS = frozenset(
+    {"refund.created", "refund.processed", "refund.speed_changed"}
+)
+_SUPPORTED_WEBHOOK_EVENTS = (
+    frozenset(
+        {
+            "payment.authorized",
+            "payment.captured",
+            "payment.failed",
+            "order.paid",
+            "refund.failed",
+        }
+    )
+    | _VALUE_REVOKING_WEBHOOK_EVENTS
 )
 
 
@@ -127,6 +142,34 @@ class PaymentOperationResult:
 
     response: PaymentTransactionResponse
     status_code: int
+
+
+@dataclass(frozen=True, slots=True)
+class PaymentValueReleaseProof:
+    """Fresh provider evidence fenced to one payment aggregate revision."""
+
+    transaction_id: str
+    transaction_revision: int
+    payment_reverification_event_id: str
+    provider_order_id: str
+    provider_payment_id: str
+    verified_at: datetime
+
+
+class PaymentValueReleaseEligibility(Protocol):
+    """Payment gates shared by every post-payment value release."""
+
+    async def require_local_value_release_eligibility(
+        self,
+        transaction_id: str,
+        *,
+        for_update: bool = False,
+    ) -> PaymentTransaction: ...
+
+    async def verify_transaction_for_value_release(
+        self,
+        transaction_id: str,
+    ) -> PaymentValueReleaseProof: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -323,6 +366,222 @@ class PaymentApplicationService:
         transaction = await self._get_owned_transaction(transaction_id, account_id=account_id)
         return await self._response(transaction)
 
+    async def require_local_value_release_eligibility(
+        self,
+        transaction_id: str,
+        *,
+        for_update: bool = False,
+    ) -> PaymentTransaction:
+        """Require locally durable paid evidence without contacting the provider."""
+        transaction = (
+            await self._transactions.get_for_update(transaction_id)
+            if for_update
+            else await self._transactions.get(transaction_id)
+        )
+        if transaction is None:
+            raise EntitlementConflictError(
+                "The payment transaction was not found",
+                "ENTITLEMENT_TRANSACTION_NOT_PAID",
+            )
+        try:
+            self._verify_transaction_integrity(transaction)
+        except PaymentIntegrityError as error:
+            raise EntitlementIntegrityError(
+                "The payment transaction failed integrity verification",
+                "ENTITLEMENT_PAYMENT_INTEGRITY_FAILED",
+            ) from error
+        state = PaymentTransactionState(transaction.transaction_state)
+        if state is not PaymentTransactionState.PAID:
+            raise EntitlementConflictError(
+                "The payment transaction is not paid",
+                (
+                    "ENTITLEMENT_RECONCILIATION_REQUIRED"
+                    if state is PaymentTransactionState.RECONCILIATION_REQUIRED
+                    else "ENTITLEMENT_TRANSACTION_NOT_PAID"
+                ),
+            )
+        if await self._unresolved_reconciliation_revision(transaction.id) is not None:
+            raise EntitlementConflictError(
+                "Payment reconciliation evidence must be explicitly resolved before value release",
+                "ENTITLEMENT_RECONCILIATION_REQUIRED",
+            )
+        return transaction
+
+    async def verify_transaction_for_value_release(
+        self,
+        transaction_id: str,
+    ) -> PaymentValueReleaseProof:
+        """Reverify an already-paid transaction and return a revision-fenced proof.
+
+        Provider I/O deliberately happens without a PostgreSQL row lock. The final
+        PAYMENT_REVERIFIED event is appended under the aggregate lock; entitlement
+        issuance must then require that exact revision before committing value.
+        """
+        try:
+            self._require_enabled()
+        except PaymentUnavailableError as error:
+            raise EntitlementUnavailableError(
+                "Payment re-verification is disabled or unavailable",
+                "ENTITLEMENT_PAYMENT_REVERIFICATION_FAILED",
+            ) from error
+        transaction = await self.require_local_value_release_eligibility(transaction_id)
+        if transaction.provider_order_id is None:
+            raise EntitlementIntegrityError(
+                "The paid transaction has no provider order binding",
+                "ENTITLEMENT_PAYMENT_INTEGRITY_FAILED",
+            )
+        provider_order_id = transaction.provider_order_id
+        await self._session.commit()
+
+        try:
+            provider = self._require_provider()
+        except PaymentUnavailableError as error:
+            raise EntitlementUnavailableError(
+                "Payment provider re-verification is temporarily unavailable",
+                "ENTITLEMENT_PAYMENT_REVERIFICATION_FAILED",
+            ) from error
+        try:
+            order, payments = await asyncio.gather(
+                provider.fetch_order(provider_order_id),
+                provider.fetch_payments_for_order(provider_order_id),
+            )
+        except (PaymentProviderTimeoutError, PaymentProviderUnavailableError) as error:
+            raise EntitlementUnavailableError(
+                "Payment provider re-verification is temporarily unavailable",
+                "ENTITLEMENT_PAYMENT_REVERIFICATION_FAILED",
+            ) from error
+        except (PaymentProviderRejectedError, PaymentProviderResponseError) as error:
+            await self._mark_reconciliation_required(
+                transaction_id,
+                reason_code="PAYMENT_PROVIDER_RESPONSE_MISMATCH",
+                actor_type=PaymentEventActorType.PROVIDER_API,
+                actor_id=provider_order_id,
+                metadata={"value_release_reverification": True},
+            )
+            raise EntitlementConflictError(
+                "Payment provider re-verification returned inconsistent evidence",
+                "ENTITLEMENT_RECONCILIATION_REQUIRED",
+            ) from error
+
+        captured_payment = self._validate_value_release_evidence(
+            transaction,
+            order=order,
+            payments=payments,
+        )
+        if captured_payment is None:
+            await self._mark_reconciliation_required(
+                transaction_id,
+                reason_code="PAYMENT_VALUE_RELEASE_EVIDENCE_INVALID",
+                actor_type=PaymentEventActorType.PROVIDER_API,
+                actor_id=provider_order_id,
+                metadata={"value_release_reverification": True},
+            )
+            raise EntitlementConflictError(
+                "Payment provider evidence cannot release merchant value",
+                "ENTITLEMENT_RECONCILIATION_REQUIRED",
+            )
+
+        # Normalize the same full snapshot into the existing payment-attempt audit
+        # stream before recording the stronger value-release observation.
+        snapshot_key = (
+            f"value-release-snapshot:{transaction_id}:{transaction.revision + 1}:"
+            f"{captured_payment.id}:{captured_payment.status}:"
+            f"{captured_payment.amount_refunded}"
+        )
+        normalized = await self._apply_provider_evidence(
+            transaction_id,
+            order=order,
+            payments=payments,
+            actor_type=PaymentEventActorType.PROVIDER_API,
+            actor_id=captured_payment.id,
+            idempotency_key=snapshot_key,
+            authoritative_snapshot=True,
+        )
+        normalized_event = await self._events.get_by_idempotency_key(snapshot_key)
+        if (
+            normalized_event is None
+            or normalized_event.transaction_revision != normalized.revision
+            or PaymentTransactionEventType(normalized_event.event_type)
+            is PaymentTransactionEventType.RECONCILIATION_REQUIRED
+            or normalized_event.event_metadata.get("authoritative_snapshot") is not True
+        ):
+            raise EntitlementConflictError(
+                "Payment evidence normalization detected a reconciliation anomaly",
+                "ENTITLEMENT_RECONCILIATION_REQUIRED",
+            )
+
+        try:
+            locked = await self.require_local_value_release_eligibility(
+                transaction_id,
+                for_update=True,
+            )
+        except (EntitlementConflictError, EntitlementIntegrityError):
+            await self._session.rollback()
+            raise
+        if (
+            locked.provider_order_id != order.id
+            or locked.revision != normalized_event.transaction_revision
+        ):
+            await self._session.rollback()
+            raise EntitlementConflictError(
+                "Payment state changed during re-verification",
+                "ENTITLEMENT_RECONCILIATION_REQUIRED",
+            )
+        local_attempts = await self._attempts.list_for_transaction(locked.id)
+        local_captures = [
+            attempt
+            for attempt in local_attempts
+            if attempt.provider_payment_id == captured_payment.id
+            and attempt.captured
+            and PaymentAttemptStatus(attempt.provider_status) is PaymentAttemptStatus.CAPTURED
+            and attempt.provider_order_id == captured_payment.order_id
+            and attempt.amount == captured_payment.amount
+            and attempt.currency == captured_payment.currency
+            and self._as_utc(attempt.provider_created_at) == captured_payment.created_at
+        ]
+        if len(local_captures) != 1:
+            await self._session.rollback()
+            raise EntitlementIntegrityError(
+                "Captured payment evidence was not durably normalized",
+                "ENTITLEMENT_PAYMENT_INTEGRITY_FAILED",
+            )
+
+        now = self._reconciliation_time(locked)
+        prior = PaymentTransactionState(locked.transaction_state)
+        event = self._event(
+            locked,
+            event_type=PaymentTransactionEventType.PAYMENT_REVERIFIED,
+            actor_type=PaymentEventActorType.PROVIDER_API,
+            actor_id=captured_payment.id,
+            prior_state=prior,
+            resulting_state=prior,
+            reason_code="PAYMENT_REVERIFIED_FOR_VALUE_RELEASE",
+            metadata={
+                "authoritative_snapshot": True,
+                "value_release_reverification": True,
+                "provider_order_id": order.id,
+                "provider_order_status": order.status,
+                "provider_payment_id": captured_payment.id,
+                "provider_payment_status": captured_payment.status,
+                "amount_refunded": captured_payment.amount_refunded,
+            },
+            payment_attempt_id=local_captures[0].id,
+            idempotency_key=(
+                f"value-release-proof:{locked.id}:{locked.revision + 1}:{captured_payment.id}"
+            ),
+            occurred_at=now,
+        )
+        locked.last_reconciled_at = now
+        locked = await self._transactions.update_with_event(locked, event=event)
+        return PaymentValueReleaseProof(
+            transaction_id=locked.id,
+            transaction_revision=locked.revision,
+            payment_reverification_event_id=event.id,
+            provider_order_id=order.id,
+            provider_payment_id=captured_payment.id,
+            verified_at=now,
+        )
+
     async def verify_checkout(
         self,
         transaction_id: str,
@@ -435,8 +694,9 @@ class PaymentApplicationService:
             actor_id=payment.id,
             idempotency_key=(
                 f"callback:{transaction.id}:{payment.id}:{payment.status}:"
-                f"{int(payment.captured)}:{order.status}"
+                f"{int(payment.captured)}:{payment.amount_refunded}:{order.status}"
             ),
+            authoritative_snapshot=False,
         )
         return PaymentOperationResult(
             response=await self._response(transaction),
@@ -478,6 +738,7 @@ class PaymentApplicationService:
     async def process_webhook(self, payload: VerifiedWebhookPayload) -> None:
         """Process one signed queue delivery with DB uniqueness as the effect fence."""
         self._require_enabled()
+        await self.quarantine_value_revoking_webhook(payload)
         body_hash = sha256_bytes(payload.raw_body)
         existing = await self._webhooks.get_by_provider_event_id(payload.provider_event_id)
         if existing is not None:
@@ -562,6 +823,26 @@ class PaymentApplicationService:
                 recovered_order,
             )
 
+        if envelope.event_type in _VALUE_REVOKING_WEBHOOK_EVENTS:
+            # The first ingress quarantine may have raced a local Order
+            # attachment. Once receipt recovery or a concurrent attachment has
+            # resolved this provider Order to a transaction, fence the signed
+            # refund evidence under that aggregate lock before any commit or
+            # additional provider read can expose a paid release window.
+            locked = await self._transactions.get_for_update(transaction.id)
+            if locked is None:
+                raise PaymentNotFoundError(
+                    f"Payment transaction '{transaction.id}' was not found",
+                    "PAYMENT_TRANSACTION_NOT_FOUND",
+                ) from None
+            await self._quarantine_locked_value_revoking_webhook(
+                payload,
+                envelope=envelope,
+                body_hash=body_hash,
+                transaction=locked,
+            )
+            return
+
         await self._session.commit()
         try:
             if recovered_order is None:
@@ -602,6 +883,7 @@ class PaymentApplicationService:
                 idempotency_key=f"webhook:{payload.provider_event_id}",
             )
             return
+
         webhook_id = new_razorpay_webhook_event_id()
         webhook = RazorpayWebhookEvent(
             id=webhook_id,
@@ -625,6 +907,106 @@ class PaymentApplicationService:
             actor_id=payload.provider_event_id,
             idempotency_key=f"webhook:{payload.provider_event_id}",
             webhook_event=webhook,
+            authoritative_snapshot=True,
+        )
+
+    async def quarantine_value_revoking_webhook(
+        self,
+        payload: VerifiedWebhookPayload,
+    ) -> None:
+        """Persist signed refund evidence before acknowledging its queue admission."""
+        self._require_enabled()
+        try:
+            envelope = self._parse_webhook_envelope(payload.raw_body)
+        except (TypeError, ValueError):
+            return
+        if envelope.event_type not in _VALUE_REVOKING_WEBHOOK_EVENTS:
+            return
+        body_hash = sha256_bytes(payload.raw_body)
+        existing = await self._webhooks.get_by_provider_event_id(payload.provider_event_id)
+        if existing is not None:
+            if not compare_digest(existing.raw_body_hash, body_hash):
+                raise PaymentIntegrityError(
+                    "A Razorpay event ID was reused with different signed content",
+                    "PAYMENT_WEBHOOK_EVENT_INTEGRITY_FAILED",
+                )
+            await self._session.rollback()
+            return
+        if envelope.provider_order_id is None:
+            await self._persist_unmatched_webhook(
+                payload,
+                body_hash=body_hash,
+                event_type=envelope.event_type,
+                provider_created_at=envelope.provider_created_at,
+                reason_code="PAYMENT_WEBHOOK_ORDER_MISSING",
+                status=WebhookProcessingStatus.RECONCILIATION_REQUIRED,
+                provider_payment_id=envelope.provider_payment_id,
+            )
+            return
+        transaction = await self._transactions.get_by_provider_order_id_for_update(
+            envelope.provider_order_id
+        )
+        if transaction is None:
+            # The Order may exist at Razorpay before its ID is durably attached
+            # to the local transaction. Ingress cannot call the provider to map
+            # the Order back to its receipt, so leave this event unconsumed for
+            # the queued worker's provider-backed receipt recovery path.
+            return
+        await self._quarantine_locked_value_revoking_webhook(
+            payload,
+            envelope=envelope,
+            body_hash=body_hash,
+            transaction=transaction,
+        )
+
+    async def _quarantine_locked_value_revoking_webhook(
+        self,
+        payload: VerifiedWebhookPayload,
+        *,
+        envelope: _WebhookEnvelope,
+        body_hash: str,
+        transaction: PaymentTransaction,
+    ) -> None:
+        """Commit one signed refund anomaly while its payment aggregate is locked."""
+        existing = await self._webhooks.get_by_provider_event_id(payload.provider_event_id)
+        if existing is not None:
+            if not compare_digest(existing.raw_body_hash, body_hash):
+                raise PaymentIntegrityError(
+                    "A Razorpay event ID was reused with different signed content",
+                    "PAYMENT_WEBHOOK_EVENT_INTEGRITY_FAILED",
+                )
+            # This lookup follows an aggregate row lock, so release it before
+            # Redis admission or worker return on a concurrent duplicate.
+            await self._session.rollback()
+            return
+        webhook = RazorpayWebhookEvent(
+            id=new_razorpay_webhook_event_id(),
+            provider_event_id=payload.provider_event_id,
+            provider_event_type=envelope.event_type,
+            raw_body_hash=body_hash,
+            provider_created_at=envelope.provider_created_at,
+            received_at=payload.received_at,
+            processed_at=self._processed_at(payload.received_at),
+            processing_status=WebhookProcessingStatus.RECONCILIATION_REQUIRED,
+            processing_reason_code="PAYMENT_REFUND_EVIDENCE_DETECTED",
+            provider_order_id=envelope.provider_order_id,
+            provider_payment_id=envelope.provider_payment_id,
+            transaction_id=transaction.id,
+        )
+        await self._mark_locked_reconciliation_required(
+            transaction,
+            reason_code="PAYMENT_REFUND_EVIDENCE_DETECTED",
+            actor_type=PaymentEventActorType.PROVIDER_WEBHOOK,
+            actor_id=payload.provider_event_id,
+            metadata={
+                "provider_payment_ids": (
+                    [envelope.provider_payment_id]
+                    if envelope.provider_payment_id is not None
+                    else []
+                )
+            },
+            webhook_event=webhook,
+            idempotency_key=f"webhook:{payload.provider_event_id}",
         )
 
     async def _validate_new_claim(
@@ -970,6 +1352,7 @@ class PaymentApplicationService:
             actor_type=actor_type,
             actor_id=actor_id,
             idempotency_key=idempotency_key,
+            authoritative_snapshot=True,
         )
 
     async def _apply_provider_evidence(
@@ -982,6 +1365,7 @@ class PaymentApplicationService:
         actor_id: str | None,
         idempotency_key: str,
         webhook_event: RazorpayWebhookEvent | None = None,
+        authoritative_snapshot: bool = False,
     ) -> PaymentTransaction:
         transaction = await self._transactions.get_for_update(transaction_id)
         if transaction is None:
@@ -990,6 +1374,42 @@ class PaymentApplicationService:
                 "PAYMENT_TRANSACTION_NOT_FOUND",
             )
         self._verify_transaction_integrity(transaction)
+
+        evidence_fingerprint = self._provider_evidence_fingerprint(order, payments)
+
+        async def mark_evidence_anomaly(
+            reason_code: str,
+            *,
+            metadata: dict[str, Any] | None = None,
+        ) -> PaymentTransaction:
+            # Contradictory evidence must never reuse the observation event's
+            # idempotency key: a previously clean observation with that key
+            # would otherwise roll back the anomaly on the unique constraint.
+            reconciliation_epoch = await self._reconciliation_epoch(transaction.id)
+            anomaly_digest = sha256_json(
+                {
+                    "observation_key": idempotency_key,
+                    "reason_code": reason_code,
+                    "evidence_fingerprint": evidence_fingerprint,
+                    "reconciliation_epoch": reconciliation_epoch,
+                }
+            ).removeprefix("sha256:")
+            anomaly_key = f"evidence-anomaly:{transaction.id}:{anomaly_digest}"
+            if await self._events.get_by_idempotency_key(anomaly_key) is not None:
+                await self._session.rollback()
+                current = await self._transactions.get(transaction.id)
+                assert current is not None
+                return current
+            return await self._mark_locked_reconciliation_required(
+                transaction,
+                reason_code=reason_code,
+                actor_type=actor_type,
+                actor_id=actor_id,
+                metadata=metadata,
+                webhook_event=webhook_event,
+                idempotency_key=anomaly_key,
+            )
+
         if webhook_event is not None:
             existing_webhook = await self._webhooks.get_by_provider_event_id(
                 webhook_event.provider_event_id
@@ -1004,11 +1424,22 @@ class PaymentApplicationService:
                         "PAYMENT_WEBHOOK_EVENT_INTEGRITY_FAILED",
                     )
                 return transaction
-        elif await self._events.get_by_idempotency_key(idempotency_key) is not None:
-            await self._session.commit()
-            current = await self._transactions.get(transaction_id)
-            assert current is not None
-            return current
+
+        if (
+            webhook_event is not None
+            and webhook_event.provider_event_type in _VALUE_REVOKING_WEBHOOK_EVENTS
+        ):
+            webhook_event.processing_status = WebhookProcessingStatus.RECONCILIATION_REQUIRED
+            webhook_event.processing_reason_code = "PAYMENT_REFUND_EVIDENCE_DETECTED"
+            payment_ids = (
+                [webhook_event.provider_payment_id]
+                if webhook_event.provider_payment_id is not None
+                else []
+            )
+            return await mark_evidence_anomaly(
+                "PAYMENT_REFUND_EVIDENCE_DETECTED",
+                metadata={"provider_payment_ids": payment_ids},
+            )
 
         mismatch = not self._order_matches(transaction, order)
         mismatch = mismatch or transaction.provider_order_id != order.id
@@ -1022,13 +1453,23 @@ class PaymentApplicationService:
             if webhook_event is not None:
                 webhook_event.processing_status = WebhookProcessingStatus.RECONCILIATION_REQUIRED
                 webhook_event.processing_reason_code = "PAYMENT_PROVIDER_RESPONSE_MISMATCH"
-            return await self._mark_locked_reconciliation_required(
-                transaction,
-                reason_code="PAYMENT_PROVIDER_RESPONSE_MISMATCH",
-                actor_type=actor_type,
-                actor_id=actor_id,
-                webhook_event=webhook_event,
-                idempotency_key=idempotency_key,
+            return await mark_evidence_anomaly("PAYMENT_PROVIDER_RESPONSE_MISMATCH")
+
+        stored_order_status = (
+            RazorpayOrderStatus(transaction.provider_order_status)
+            if transaction.provider_order_status is not None
+            else None
+        )
+        incoming_order_status = RazorpayOrderStatus(order.status)
+        if stored_order_status is not None and not can_transition_order_status(
+            stored_order_status, incoming_order_status
+        ):
+            if webhook_event is not None:
+                webhook_event.processing_status = WebhookProcessingStatus.RECONCILIATION_REQUIRED
+                webhook_event.processing_reason_code = "PAYMENT_PROVIDER_EVIDENCE_REGRESSED"
+            return await mark_evidence_anomaly(
+                "PAYMENT_PROVIDER_EVIDENCE_REGRESSED",
+                metadata={"evidence_kind": "order_status"},
             )
 
         now = self._reconciliation_time(transaction)
@@ -1042,6 +1483,50 @@ class PaymentApplicationService:
             for attempt in attempt_by_payment_id.values()
             if attempt.captured
         }
+        refunded_payment_ids = sorted(
+            payment.id
+            for payment in payments
+            if payment.status == "refunded" or payment.amount_refunded > 0
+        )
+        if refunded_payment_ids:
+            if webhook_event is not None:
+                webhook_event.processing_status = WebhookProcessingStatus.RECONCILIATION_REQUIRED
+                webhook_event.processing_reason_code = "PAYMENT_REFUND_EVIDENCE_DETECTED"
+            return await mark_evidence_anomaly(
+                "PAYMENT_REFUND_EVIDENCE_DETECTED",
+                metadata={"provider_payment_ids": refunded_payment_ids},
+            )
+        incoming_payment_ids = {payment.id for payment in payments}
+        missing_captured_ids = sorted(captured_ids - incoming_payment_ids)
+        if authoritative_snapshot and missing_captured_ids:
+            if webhook_event is not None:
+                webhook_event.processing_status = WebhookProcessingStatus.RECONCILIATION_REQUIRED
+                webhook_event.processing_reason_code = "PAYMENT_CAPTURE_EVIDENCE_MISSING"
+            return await mark_evidence_anomaly(
+                "PAYMENT_CAPTURE_EVIDENCE_MISSING",
+                metadata={"provider_payment_ids": missing_captured_ids},
+            )
+        regressed_attempt_ids = sorted(
+            payment.id
+            for payment in payments
+            if payment.id in attempt_by_payment_id
+            and attempt_by_payment_id[payment.id].captured
+            and not can_transition_attempt_status(
+                attempt_by_payment_id[payment.id].provider_status,
+                PaymentAttemptStatus(payment.status),
+            )
+        )
+        if regressed_attempt_ids:
+            if webhook_event is not None:
+                webhook_event.processing_status = WebhookProcessingStatus.RECONCILIATION_REQUIRED
+                webhook_event.processing_reason_code = "PAYMENT_PROVIDER_EVIDENCE_REGRESSED"
+            return await mark_evidence_anomaly(
+                "PAYMENT_PROVIDER_EVIDENCE_REGRESSED",
+                metadata={
+                    "evidence_kind": "payment_status",
+                    "provider_payment_ids": regressed_attempt_ids,
+                },
+            )
         incoming_captured_ids = {
             payment.id
             for payment in payments
@@ -1051,14 +1536,7 @@ class PaymentApplicationService:
             if webhook_event is not None:
                 webhook_event.processing_status = WebhookProcessingStatus.RECONCILIATION_REQUIRED
                 webhook_event.processing_reason_code = "PAYMENT_MULTIPLE_CAPTURES_DETECTED"
-            return await self._mark_locked_reconciliation_required(
-                transaction,
-                reason_code="PAYMENT_MULTIPLE_CAPTURES_DETECTED",
-                actor_type=actor_type,
-                actor_id=actor_id,
-                webhook_event=webhook_event,
-                idempotency_key=idempotency_key,
-            )
+            return await mark_evidence_anomaly("PAYMENT_MULTIPLE_CAPTURES_DETECTED")
 
         evidence_attempt: PaymentAttempt | None = None
         for payment in payments:
@@ -1068,28 +1546,14 @@ class PaymentApplicationService:
                         WebhookProcessingStatus.RECONCILIATION_REQUIRED
                     )
                     webhook_event.processing_reason_code = "PAYMENT_PROVIDER_RESPONSE_MISMATCH"
-                return await self._mark_locked_reconciliation_required(
-                    transaction,
-                    reason_code="PAYMENT_PROVIDER_RESPONSE_MISMATCH",
-                    actor_type=actor_type,
-                    actor_id=actor_id,
-                    webhook_event=webhook_event,
-                    idempotency_key=idempotency_key,
-                )
+                return await mark_evidence_anomaly("PAYMENT_PROVIDER_RESPONSE_MISMATCH")
             if payment.method is not None and len(payment.method) > 32:
                 if webhook_event is not None:
                     webhook_event.processing_status = (
                         WebhookProcessingStatus.RECONCILIATION_REQUIRED
                     )
                     webhook_event.processing_reason_code = "PAYMENT_PROVIDER_RESPONSE_MISMATCH"
-                return await self._mark_locked_reconciliation_required(
-                    transaction,
-                    reason_code="PAYMENT_PROVIDER_RESPONSE_MISMATCH",
-                    actor_type=actor_type,
-                    actor_id=actor_id,
-                    webhook_event=webhook_event,
-                    idempotency_key=idempotency_key,
-                )
+                return await mark_evidence_anomaly("PAYMENT_PROVIDER_RESPONSE_MISMATCH")
             attempt = attempt_by_payment_id.get(payment.id)
             if attempt is None:
                 globally_existing = await self._attempts.get_by_provider_payment_id_for_update(
@@ -1103,14 +1567,7 @@ class PaymentApplicationService:
                             WebhookProcessingStatus.RECONCILIATION_REQUIRED
                         )
                         webhook_event.processing_reason_code = "PAYMENT_PROVIDER_PAYMENT_MISMATCH"
-                    return await self._mark_locked_reconciliation_required(
-                        transaction,
-                        reason_code="PAYMENT_PROVIDER_PAYMENT_MISMATCH",
-                        actor_type=actor_type,
-                        actor_id=actor_id,
-                        webhook_event=webhook_event,
-                        idempotency_key=idempotency_key,
-                    )
+                    return await mark_evidence_anomaly("PAYMENT_PROVIDER_PAYMENT_MISMATCH")
                 attempt = PaymentAttempt(
                     id=new_payment_attempt_id(),
                     transaction_id=transaction.id,
@@ -1141,14 +1598,7 @@ class PaymentApplicationService:
                             WebhookProcessingStatus.RECONCILIATION_REQUIRED
                         )
                         webhook_event.processing_reason_code = "PAYMENT_PROVIDER_PAYMENT_MISMATCH"
-                    return await self._mark_locked_reconciliation_required(
-                        transaction,
-                        reason_code="PAYMENT_PROVIDER_PAYMENT_MISMATCH",
-                        actor_type=actor_type,
-                        actor_id=actor_id,
-                        webhook_event=webhook_event,
-                        idempotency_key=idempotency_key,
-                    )
+                    return await mark_evidence_anomaly("PAYMENT_PROVIDER_PAYMENT_MISMATCH")
                 next_status = PaymentAttemptStatus(payment.status)
                 if can_transition_attempt_status(attempt.provider_status, next_status):
                     attempt.provider_status = next_status
@@ -1166,13 +1616,17 @@ class PaymentApplicationService:
             if evidence_attempt is None or attempt.captured:
                 evidence_attempt = attempt
 
+        if (
+            webhook_event is None
+            and await self._events.get_by_idempotency_key(idempotency_key) is not None
+        ):
+            await self._session.rollback()
+            current = await self._transactions.get(transaction_id)
+            assert current is not None
+            return current
+
         prior_state = PaymentTransactionState(transaction.transaction_state)
-        current_order_status = (
-            RazorpayOrderStatus(transaction.provider_order_status)
-            if transaction.provider_order_status is not None
-            else None
-        )
-        incoming_order_status = RazorpayOrderStatus(order.status)
+        current_order_status = stored_order_status
         if can_transition_order_status(current_order_status, incoming_order_status):
             transaction.provider_order_status = incoming_order_status
         effective_order_status = RazorpayOrderStatus(transaction.provider_order_status)
@@ -1210,6 +1664,16 @@ class PaymentApplicationService:
             authorized=authorized,
             failed=failed,
         )
+        event_metadata: dict[str, Any] = {
+            "provider_order_id": order.id,
+            "provider_order_status": order.status,
+            "payment_count": len(payments),
+            "authoritative_snapshot": authoritative_snapshot,
+        }
+        if authoritative_snapshot:
+            unresolved_revision = await self._unresolved_reconciliation_revision(transaction.id)
+            if unresolved_revision is not None:
+                event_metadata["resolved_reconciliation_revision"] = unresolved_revision
         event = self._event(
             transaction,
             event_type=event_type,
@@ -1218,11 +1682,7 @@ class PaymentApplicationService:
             prior_state=prior_state,
             resulting_state=next_state,
             reason_code=reason_code,
-            metadata={
-                "provider_order_id": order.id,
-                "provider_order_status": order.status,
-                "payment_count": len(payments),
-            },
+            metadata=event_metadata,
             payment_attempt_id=evidence_attempt.id if evidence_attempt is not None else None,
             source_webhook_event_id=(webhook_event.id if webhook_event is not None else None),
             idempotency_key=idempotency_key,
@@ -1234,6 +1694,91 @@ class PaymentApplicationService:
             attempts=tuple(changed_attempts),
             webhook_event=webhook_event,
         )
+
+    @staticmethod
+    def _provider_evidence_fingerprint(
+        order: ProviderOrder,
+        payments: Sequence[ProviderPayment],
+    ) -> str:
+        """Bind idempotency decisions to every normalized trust-relevant field."""
+        return sha256_json(
+            {
+                "order": {
+                    "id": order.id,
+                    "amount": order.amount,
+                    "amount_paid": order.amount_paid,
+                    "amount_due": order.amount_due,
+                    "currency": order.currency,
+                    "receipt": order.receipt,
+                    "status": order.status,
+                    "created_at": canonical_utc_datetime(order.created_at),
+                },
+                "payments": [
+                    {
+                        "id": payment.id,
+                        "order_id": payment.order_id,
+                        "amount": payment.amount,
+                        "currency": payment.currency,
+                        "status": payment.status,
+                        "captured": payment.captured,
+                        "amount_refunded": payment.amount_refunded,
+                        "method": payment.method,
+                        "created_at": canonical_utc_datetime(payment.created_at),
+                    }
+                    for payment in sorted(payments, key=lambda candidate: candidate.id)
+                ],
+            }
+        )
+
+    async def _unresolved_reconciliation_revision(self, transaction_id: str) -> int | None:
+        """Return the latest anomaly revision not closed by trusted full-snapshot evidence."""
+        unresolved: int | None = None
+        requires_manual_resolution = False
+        for event in await self._events.list_for_transaction(transaction_id):
+            event_type = PaymentTransactionEventType(event.event_type)
+            if event_type is PaymentTransactionEventType.RECONCILIATION_REQUIRED:
+                unresolved = event.transaction_revision
+                requires_manual_resolution = requires_manual_resolution or event.reason_code in {
+                    "PAYMENT_REFUND_EVIDENCE_DETECTED",
+                    "PAYMENT_MULTIPLE_CAPTURES_DETECTED",
+                }
+                continue
+            resolved_revision = event.event_metadata.get("resolved_reconciliation_revision")
+            if (
+                unresolved is not None
+                and not requires_manual_resolution
+                and event.event_metadata.get("authoritative_snapshot") is True
+                and type(resolved_revision) is int
+                and resolved_revision == unresolved
+            ):
+                unresolved = None
+        return unresolved
+
+    async def _reconciliation_epoch(self, transaction_id: str) -> int:
+        """Return the revision of the latest trusted anomaly resolution, or zero."""
+        unresolved: int | None = None
+        requires_manual_resolution = False
+        epoch = 0
+        for event in await self._events.list_for_transaction(transaction_id):
+            event_type = PaymentTransactionEventType(event.event_type)
+            if event_type is PaymentTransactionEventType.RECONCILIATION_REQUIRED:
+                unresolved = event.transaction_revision
+                requires_manual_resolution = requires_manual_resolution or event.reason_code in {
+                    "PAYMENT_REFUND_EVIDENCE_DETECTED",
+                    "PAYMENT_MULTIPLE_CAPTURES_DETECTED",
+                }
+                continue
+            resolved_revision = event.event_metadata.get("resolved_reconciliation_revision")
+            if (
+                unresolved is not None
+                and not requires_manual_resolution
+                and event.event_metadata.get("authoritative_snapshot") is True
+                and type(resolved_revision) is int
+                and resolved_revision == unresolved
+            ):
+                unresolved = None
+                epoch = event.transaction_revision
+        return epoch
 
     async def _record_simple_transition(
         self,
@@ -1571,22 +2116,30 @@ class PaymentApplicationService:
             raise ValueError("Webhook payload is invalid")
         payment = PaymentApplicationService._webhook_entity(body_payload, "payment")
         order = PaymentApplicationService._webhook_entity(body_payload, "order")
+        refund = PaymentApplicationService._webhook_entity(body_payload, "refund")
         payment_id = payment.get("id") if payment is not None else None
         payment_order_id = payment.get("order_id") if payment is not None else None
+        refund_payment_id = refund.get("payment_id") if refund is not None else None
         order_id = order.get("id") if order is not None else None
         if payment_id is not None:
             validate_provider_payment_id(payment_id)
         if payment_order_id is not None:
             validate_provider_order_id(payment_order_id)
+        if refund_payment_id is not None:
+            validate_provider_payment_id(refund_payment_id)
         if order_id is not None:
             validate_provider_order_id(order_id)
         if payment_order_id is not None and order_id is not None and payment_order_id != order_id:
             raise ValueError("Webhook entities reference different orders")
+        if event_type.startswith("refund.") and (
+            payment_id is None or refund_payment_id is None or payment_id != refund_payment_id
+        ):
+            raise ValueError("Refund webhook entities reference different payments")
         return _WebhookEnvelope(
             event_type=event_type,
             provider_created_at=provider_created_at,
             provider_order_id=payment_order_id or order_id,
-            provider_payment_id=payment_id,
+            provider_payment_id=payment_id or refund_payment_id,
         )
 
     @staticmethod
@@ -1611,6 +2164,43 @@ class PaymentApplicationService:
             and order.amount == transaction.amount
             and order.currency == transaction.currency
         )
+
+    @classmethod
+    def _validate_value_release_evidence(
+        cls,
+        transaction: PaymentTransaction,
+        *,
+        order: ProviderOrder,
+        payments: Sequence[ProviderPayment],
+    ) -> ProviderPayment | None:
+        """Return the sole unrefunded capture only for a fully paid exact Order."""
+        if (
+            transaction.provider_order_id is None
+            or order.id != transaction.provider_order_id
+            or not cls._order_matches(transaction, order)
+            or order.status != "paid"
+            or order.amount_paid != transaction.amount
+            or order.amount_due != 0
+            or not payments
+            or len({payment.id for payment in payments}) != len(payments)
+        ):
+            return None
+        if any(not cls._payment_matches(transaction, payment) for payment in payments):
+            return None
+        captures = [
+            payment
+            for payment in payments
+            if payment.status == "captured" and payment.captured and payment.amount_refunded == 0
+        ]
+        if len(captures) != 1:
+            return None
+        # Any refund evidence is an unresolved contradiction even when a separate
+        # captured payment remains in the order response.
+        if any(
+            payment.status == "refunded" or payment.amount_refunded != 0 for payment in payments
+        ):
+            return None
+        return captures[0]
 
     @staticmethod
     def _payment_matches(

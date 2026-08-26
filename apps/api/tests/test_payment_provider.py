@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -284,6 +286,58 @@ async def test_provider_maps_timeout_and_definite_sdk_rejection_without_details(
     with pytest.raises(PaymentProviderRejectedError, match="rejected") as rejected_info:
         await rejected_adapter.fetch_order(ORDER_ID)
     assert "secret provider detail" not in str(rejected_info.value)
+
+
+@pytest.mark.asyncio
+async def test_hard_deadline_retains_capacity_until_abandoned_sdk_thread_exits() -> None:
+    release = threading.Event()
+
+    class BlockingOrderResource(FakeOrderResource):
+        def fetch(self, order_id: str, data: dict[str, object], **kwargs: object) -> object:
+            self.client.calls.append(("fetch_order", order_id, data, kwargs))
+            release.wait()
+            return order_payload()
+
+    class BlockingClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__({"fetch_order": order_payload()})
+            self.order = BlockingOrderResource(self)
+
+    class BlockingFactory:
+        def __init__(self) -> None:
+            self.clients: list[BlockingClient] = []
+
+        def __call__(self, _key_id: str, _key_secret: str) -> BlockingClient:
+            client = BlockingClient()
+            self.clients.append(client)
+            return client
+
+    factory = BlockingFactory()
+    adapter = RazorpayPaymentProvider(
+        key_id="rzp_test_12345678",
+        key_secret="super-secret",
+        connect_timeout_seconds=1,
+        read_timeout_seconds=1,
+        operation_timeout_seconds=0.02,
+        max_concurrency=1,
+        client_factory=factory,
+    )
+
+    try:
+        with pytest.raises(PaymentProviderTimeoutError):
+            await adapter.fetch_order(ORDER_ID)
+        with pytest.raises(PaymentProviderTimeoutError, match="execution slot"):
+            await adapter.fetch_order(ORDER_ID)
+        assert len(factory.clients) == 1
+    finally:
+        release.set()
+
+    for _ in range(20):
+        if not adapter._semaphore.locked():  # noqa: SLF001
+            break
+        await asyncio.sleep(0.01)
+    assert not adapter._semaphore.locked()  # noqa: SLF001
+    assert (await adapter.fetch_order(ORDER_ID)).id == ORDER_ID
 
 
 @pytest.mark.asyncio

@@ -18,6 +18,7 @@ from app.domain.exceptions import (
     AuthenticationUnauthorizedError,
 )
 from app.providers import PaymentProvider
+from app.providers.fulfillment import FulfillmentProvider, UnavailableFulfillmentProvider
 from app.repositories.accounts import AccountRepository
 from app.repositories.approval_identities import ApprovalIdentityRepository
 from app.repositories.authorizations import PurchaseAuthorizationRepository
@@ -29,7 +30,10 @@ from app.repositories.quotes import QuoteRepository
 from app.repositories.services import ServiceRepository
 from app.services.approvals import ApprovalApplicationService
 from app.services.auth import AuthenticationApplicationService, ResolvedAuthSession
+from app.services.capabilities import CapabilityTokenService
 from app.services.catalog import CatalogApplicationService
+from app.services.entitlements import EntitlementApplicationService
+from app.services.fulfillments import FulfillmentApplicationService
 from app.services.merchants import MerchantApplicationService
 from app.services.passkeys import PasskeyApplicationService
 from app.services.payment_webhooks import RazorpayWebhookIngressService
@@ -102,6 +106,19 @@ PaymentProviderDependency = Annotated[
 PaymentWebhookQueueDependency = Annotated[
     WebhookQueuePublisher | None,
     Depends(get_payment_webhook_queue),
+]
+
+
+def get_fulfillment_provider(request: Request) -> FulfillmentProvider | None:
+    provider = getattr(request.app.state, "fulfillment_provider", None)
+    if provider is not None and not isinstance(provider, FulfillmentProvider):
+        raise RuntimeError("Fulfillment provider is not configured correctly")
+    return provider
+
+
+FulfillmentProviderDependency = Annotated[
+    FulfillmentProvider | None,
+    Depends(get_fulfillment_provider),
 ]
 
 
@@ -219,6 +236,49 @@ def get_payment_application_service(
     return PaymentApplicationService(session, provider, settings)
 
 
+def _capability_token_service(settings: Settings) -> CapabilityTokenService:
+    if not settings.fulfillment_enabled or settings.entitlement_token_secret is None:
+        raise RuntimeError("Paid fulfillment is disabled")
+    return CapabilityTokenService(
+        settings.entitlement_token_secret.get_secret_value(),
+        ttl=timedelta(seconds=settings.entitlement_token_ttl_seconds),
+    )
+
+
+def get_entitlement_application_service(
+    session: SessionDependency,
+    settings: SettingsDependency,
+    payment_provider: PaymentProviderDependency,
+) -> EntitlementApplicationService:
+    payment_service = PaymentApplicationService(session, payment_provider, settings)
+    return EntitlementApplicationService(
+        session,
+        payment_service,
+        _capability_token_service(settings),
+        entitlement_ttl=timedelta(seconds=settings.entitlement_ttl_seconds),
+    )
+
+
+def get_fulfillment_application_service(
+    session: SessionDependency,
+    settings: SettingsDependency,
+    provider: FulfillmentProviderDependency,
+    payment_provider: PaymentProviderDependency,
+) -> FulfillmentApplicationService:
+    if provider is None:
+        provider = UnavailableFulfillmentProvider()
+    return FulfillmentApplicationService(
+        session,
+        _capability_token_service(settings),
+        provider,
+        payment_eligibility=PaymentApplicationService(session, payment_provider, settings),
+        provider_base_url=settings.orbitintel_base_url,
+        execution_lease=timedelta(seconds=settings.fulfillment_execution_lease_seconds),
+        maximum_result_bytes=settings.fulfillment_max_result_bytes,
+        default_maximum_attempts=settings.fulfillment_max_attempts,
+    )
+
+
 def get_razorpay_webhook_ingress_service(
     settings: SettingsDependency,
     queue: PaymentWebhookQueueDependency,
@@ -228,9 +288,15 @@ def get_razorpay_webhook_ingress_service(
         if settings.payments_enabled and settings.razorpay_webhook_secret is not None
         else None
     )
+    previous_secret = (
+        settings.razorpay_previous_webhook_secret.get_secret_value()
+        if settings.payments_enabled and settings.razorpay_previous_webhook_secret is not None
+        else None
+    )
     return RazorpayWebhookIngressService(
         queue if settings.payments_enabled else None,
         webhook_secret=secret,
+        previous_webhook_secret=previous_secret,
         maximum_age=timedelta(seconds=settings.razorpay_webhook_max_age_seconds),
     )
 
@@ -440,6 +506,14 @@ ApprovalApplicationDependency = Annotated[
 PaymentApplicationDependency = Annotated[
     PaymentApplicationService,
     Depends(get_payment_application_service),
+]
+EntitlementApplicationDependency = Annotated[
+    EntitlementApplicationService,
+    Depends(get_entitlement_application_service),
+]
+FulfillmentApplicationDependency = Annotated[
+    FulfillmentApplicationService,
+    Depends(get_fulfillment_application_service),
 ]
 RazorpayWebhookIngressDependency = Annotated[
     RazorpayWebhookIngressService,

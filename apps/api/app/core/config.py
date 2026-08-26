@@ -1,8 +1,10 @@
 """Validated environment-based configuration."""
 
 import json
+import math
 import re
 from functools import lru_cache
+from hmac import compare_digest
 from pathlib import Path
 from typing import Annotated, Literal, Self
 from urllib.parse import urlsplit
@@ -53,12 +55,28 @@ class Settings(BaseSettings):
     razorpay_key_id: SecretStr | None = None
     razorpay_key_secret: SecretStr | None = None
     razorpay_webhook_secret: SecretStr | None = None
+    razorpay_previous_webhook_secret: SecretStr | None = None
     razorpay_webhook_max_age_seconds: int = Field(default=300, ge=60, le=900)
     razorpay_webhook_max_body_bytes: int = Field(default=262_144, ge=1_024, le=1_048_576)
     razorpay_connect_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
     razorpay_read_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
     razorpay_provider_max_concurrency: int = Field(default=4, ge=1, le=32)
     razorpay_order_recovery_age_seconds: int = Field(default=15, ge=5, le=300)
+    fulfillment_enabled: bool = False
+    entitlement_ttl_seconds: int = Field(default=600, ge=60, le=86_400)
+    entitlement_token_ttl_seconds: int = Field(default=300, ge=30, le=600)
+    entitlement_token_secret: SecretStr | None = None
+    entitlement_worker_poll_seconds: float = Field(default=1.0, gt=0, le=60)
+    entitlement_outbox_lease_seconds: int = Field(default=30, ge=5, le=900)
+    entitlement_outbox_retry_base_seconds: int = Field(default=5, ge=1, le=300)
+    entitlement_outbox_retry_max_seconds: int = Field(default=300, ge=1, le=3_600)
+    fulfillment_max_attempts: int = Field(default=3, ge=1, le=10)
+    fulfillment_execution_lease_seconds: int = Field(default=30, ge=5, le=900)
+    fulfillment_max_result_bytes: int = Field(default=262_144, ge=1_024, le=1_048_576)
+    orbitintel_base_url: str = "http://127.0.0.1:8100"
+    orbitintel_shared_secret: SecretStr | None = None
+    orbitintel_connect_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
+    orbitintel_read_timeout_seconds: float = Field(default=15.0, gt=0, le=60)
     database_url: SecretStr
     redis_url: SecretStr
     cors_allowed_origins: Annotated[list[str], NoDecode] = Field(
@@ -82,6 +100,31 @@ class Settings(BaseSettings):
         if parsed.scheme not in {"redis", "rediss"} or not parsed.hostname:
             raise ValueError("REDIS_URL must be a valid Redis URL")
         return value
+
+    @field_validator("orbitintel_base_url", mode="after")
+    @classmethod
+    def validate_orbitintel_base_url(cls, value: str) -> str:
+        """Require a private-development HTTP origin or a production HTTPS origin."""
+        normalized = value.strip().rstrip("/")
+        parsed = urlsplit(normalized)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("ORBITINTEL_BASE_URL must be an explicit HTTP(S) origin")
+        if parsed.scheme == "http" and parsed.hostname not in {
+            "127.0.0.1",
+            "localhost",
+            "::1",
+            "orbitintel",
+        }:
+            raise ValueError("ORBITINTEL_BASE_URL HTTP is allowed only for private local hosts")
+        return normalized
 
     @field_validator("cors_allowed_origins", mode="before")
     @classmethod
@@ -273,6 +316,62 @@ class Settings(BaseSettings):
                 ):
                     raise ValueError(
                         f"{setting_name} must contain 8 to 256 valid characters when payments are enabled"
+                    )
+        if self.razorpay_previous_webhook_secret is not None:
+            previous_secret = self.razorpay_previous_webhook_secret.get_secret_value()
+            if (
+                not 8 <= len(previous_secret) <= 256
+                or previous_secret != previous_secret.strip()
+                or "\x00" in previous_secret
+            ):
+                raise ValueError(
+                    "RAZORPAY_PREVIOUS_WEBHOOK_SECRET must contain 8 to 256 valid characters"
+                )
+            current_secret = (
+                self.razorpay_webhook_secret.get_secret_value()
+                if self.razorpay_webhook_secret is not None
+                else None
+            )
+            if current_secret is not None and compare_digest(previous_secret, current_secret):
+                raise ValueError(
+                    "RAZORPAY_PREVIOUS_WEBHOOK_SECRET must differ from RAZORPAY_WEBHOOK_SECRET"
+                )
+        if self.entitlement_outbox_retry_base_seconds > (self.entitlement_outbox_retry_max_seconds):
+            raise ValueError(
+                "ENTITLEMENT_OUTBOX_RETRY_BASE_SECONDS cannot exceed "
+                "ENTITLEMENT_OUTBOX_RETRY_MAX_SECONDS"
+            )
+        if self.payments_enabled and self.fulfillment_enabled:
+            provider_operation_budget = (
+                self.razorpay_connect_timeout_seconds + self.razorpay_read_timeout_seconds + 1.0
+            )
+            minimum_value_release_lease = math.ceil(2 * provider_operation_budget + 2.0)
+            if self.entitlement_outbox_lease_seconds < minimum_value_release_lease:
+                raise ValueError(
+                    "ENTITLEMENT_OUTBOX_LEASE_SECONDS must cover the bounded Razorpay "
+                    f"value-release proof budget ({minimum_value_release_lease} seconds)"
+                )
+            if self.fulfillment_execution_lease_seconds < minimum_value_release_lease:
+                raise ValueError(
+                    "FULFILLMENT_EXECUTION_LEASE_SECONDS must cover the bounded Razorpay "
+                    f"value-release proof budget ({minimum_value_release_lease} seconds)"
+                )
+        if self.fulfillment_enabled:
+            for setting_name, secret in (
+                ("ENTITLEMENT_TOKEN_SECRET", self.entitlement_token_secret),
+                ("ORBITINTEL_SHARED_SECRET", self.orbitintel_shared_secret),
+            ):
+                secret_value = secret.get_secret_value() if secret is not None else ""
+                if (
+                    len(secret_value.encode("utf-8")) < 32
+                    or len(secret_value) > 512
+                    or secret_value != secret_value.strip()
+                    or "\x00" in secret_value
+                    or secret_value.lower() in {"change-me", "replace-me"}
+                ):
+                    raise ValueError(
+                        f"{setting_name} must contain at least 32 bytes of non-placeholder "
+                        "secret material when fulfillment is enabled"
                     )
         return self
 

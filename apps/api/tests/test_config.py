@@ -328,6 +328,30 @@ def test_enabled_payments_require_complete_test_mode_credentials() -> None:
     assert "rzp_test_1234567890" not in representation
 
 
+@pytest.mark.parametrize(
+    "lease_field",
+    ["entitlement_outbox_lease_seconds", "fulfillment_execution_lease_seconds"],
+)
+def test_value_release_leases_cover_the_full_provider_proof_budget(
+    lease_field: str,
+) -> None:
+    common: dict[str, object] = {
+        "payments_enabled": True,
+        "razorpay_key_id": "rzp_test_1234567890",
+        "razorpay_key_secret": "secret-value",
+        "razorpay_webhook_secret": "webhook-secret",
+        "fulfillment_enabled": True,
+        "entitlement_token_secret": "entitlement-token-secret-at-least-32-bytes",
+        "orbitintel_shared_secret": "orbitintel-shared-secret-at-least-32-bytes",
+    }
+
+    with pytest.raises(ValidationError, match="value-release proof budget"):
+        build_settings(**common, **{lease_field: 17})
+
+    settings = build_settings(**common, **{lease_field: 18})
+    assert getattr(settings, lease_field) == 18
+
+
 def test_configured_live_key_is_rejected_even_while_payments_are_disabled() -> None:
     with pytest.raises(ValidationError, match="Test Mode key"):
         build_settings(

@@ -3,6 +3,7 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from redis.asyncio import Redis
@@ -17,6 +18,7 @@ from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
 from app.db.session import Database, create_database
 from app.providers import PaymentProvider
+from app.providers.fulfillment import FulfillmentProvider, HttpMerchantFulfillmentProvider
 from app.services.payments import build_razorpay_payment_provider
 from app.services.readiness import ReadinessService, build_readiness_service
 from app.services.webauthn import PyWebAuthnBackend, WebAuthnBackend
@@ -32,6 +34,7 @@ def create_app(
     webauthn_backend: WebAuthnBackend | None = None,
     payment_provider: PaymentProvider | None = None,
     payment_webhook_queue: WebhookQueuePublisher | None = None,
+    fulfillment_provider: FulfillmentProvider | None = None,
 ) -> FastAPI:
     """Build an application with injectable durable and ephemeral infrastructure."""
     effective_settings = settings or get_settings()
@@ -60,6 +63,28 @@ def create_app(
     effective_payment_provider = payment_provider or build_razorpay_payment_provider(
         effective_settings
     )
+    fulfillment_http_client: httpx.AsyncClient | None = None
+    if fulfillment_provider is not None:
+        effective_fulfillment_provider: FulfillmentProvider | None = fulfillment_provider
+    elif effective_settings.fulfillment_enabled:
+        assert effective_settings.orbitintel_shared_secret is not None
+        fulfillment_http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                connect=effective_settings.orbitintel_connect_timeout_seconds,
+                read=effective_settings.orbitintel_read_timeout_seconds,
+                write=effective_settings.orbitintel_read_timeout_seconds,
+                pool=effective_settings.orbitintel_connect_timeout_seconds,
+            ),
+            follow_redirects=False,
+        )
+        effective_fulfillment_provider = HttpMerchantFulfillmentProvider(
+            fulfillment_http_client,
+            base_url=effective_settings.orbitintel_base_url,
+            shared_secret=effective_settings.orbitintel_shared_secret.get_secret_value(),
+            maximum_response_bytes=effective_settings.fulfillment_max_result_bytes,
+        )
+    else:
+        effective_fulfillment_provider = None
     if payment_webhook_queue is not None:
         effective_payment_webhook_queue: WebhookQueuePublisher | None = payment_webhook_queue
     elif effective_settings.payments_enabled:
@@ -81,8 +106,12 @@ def create_app(
             yield
         finally:
             try:
-                if redis_client is not None:
-                    await redis_client.aclose()
+                try:
+                    if fulfillment_http_client is not None:
+                        await fulfillment_http_client.aclose()
+                finally:
+                    if redis_client is not None:
+                        await redis_client.aclose()
             finally:
                 if owns_database:
                     await effective_database.dispose()
@@ -99,6 +128,7 @@ def create_app(
     application.state.auth_store = effective_auth_store
     application.state.webauthn_backend = effective_webauthn_backend
     application.state.payment_provider = effective_payment_provider
+    application.state.fulfillment_provider = effective_fulfillment_provider
     application.state.payment_webhook_queue = effective_payment_webhook_queue
     application.state.readiness_service = readiness_service or build_readiness_service(
         effective_settings
@@ -109,7 +139,7 @@ def create_app(
         allow_origins=effective_settings.cors_allowed_origins,
         allow_credentials=True,
         allow_methods=["GET", "POST", "PATCH"],
-        allow_headers=["Accept", "Content-Type", "X-CSRF-Token"],
+        allow_headers=["Accept", "Authorization", "Content-Type", "X-CSRF-Token"],
     )
     register_domain_exception_handlers(application)
     application.include_router(health_router)

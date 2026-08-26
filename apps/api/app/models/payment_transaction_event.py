@@ -60,7 +60,8 @@ class PaymentTransactionEvent(Base):
             "'razorpay_order_created', 'razorpay_order_creation_failed', "
             "'razorpay_order_creation_uncertain', 'checkout_signature_verified', "
             "'payment_authorized', 'payment_attempt_failed', 'payment_captured', "
-            "'order_paid', 'payment_reconciled', 'reconciliation_required')",
+            "'order_paid', 'payment_reconciled', 'payment_reverified', "
+            "'reconciliation_required')",
             name="event_type",
         ),
         CheckConstraint(

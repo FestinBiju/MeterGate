@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from datetime import datetime
 from itertools import islice
 from typing import Any
 
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import SchemaError
 from referencing.exceptions import Unresolvable
 
@@ -34,6 +36,27 @@ _SCHEMA_SINGLE_KEYWORDS = frozenset(
 )
 _SCHEMA_LIST_KEYWORDS = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
 _COMBINATOR_KEYWORDS = frozenset({"allOf", "anyOf", "oneOf"})
+_SUPPORTED_FORMATS = frozenset({"date-time"})
+_RFC3339_DATE_TIME = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$"
+)
+_FORMAT_CHECKER = FormatChecker()
+
+
+@_FORMAT_CHECKER.checks("date-time")
+def _is_rfc3339_date_time(value: object) -> bool:
+    if not isinstance(value, str):
+        return True
+    if _RFC3339_DATE_TIME.fullmatch(value) is None:
+        return False
+    normalized = value[:-1] + "+00:00" if value[-1] in {"Z", "z"} else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
 MAX_VALIDATION_ISSUES = 20
 MAX_SCHEMA_NODES = 2_048
 MAX_SCHEMA_DEPTH = 32
@@ -90,7 +113,7 @@ def validate_json_instance(
     ):
         return (JSONSchemaViolation(path=(), keyword="complexity"),)
 
-    validator = Draft202012Validator(schema)
+    validator = Draft202012Validator(schema, format_checker=_FORMAT_CHECKER)
     try:
         errors = list(islice(validator.iter_errors(instance), MAX_VALIDATION_ISSUES))
         errors.sort(key=_error_sort_key)
@@ -123,6 +146,10 @@ def _validate_schema_safety(schema: dict[str, Any]) -> None:
         dialect = value.get("$schema")
         if dialect is not None and dialect not in _SUPPORTED_DIALECTS:
             raise JSONSchemaConfigurationError("Unsupported JSON Schema dialect")
+
+        declared_format = value.get("format")
+        if declared_format is not None and declared_format not in _SUPPORTED_FORMATS:
+            raise JSONSchemaConfigurationError("Unsupported JSON Schema format")
 
         if _REGEX_KEYWORDS.intersection(value):
             raise JSONSchemaConfigurationError(

@@ -12,8 +12,12 @@ from app.domain.enums import (
     PaymentTransactionState,
     WebhookProcessingStatus,
 )
-from app.domain.exceptions import PaymentIntegrityError, PaymentTimeoutError
-from app.providers import PaymentProviderTimeoutError
+from app.domain.exceptions import (
+    EntitlementConflictError,
+    PaymentIntegrityError,
+    PaymentTimeoutError,
+)
+from app.providers import PaymentProviderTimeoutError, ProviderOrder
 from tests.test_payment_services import (
     ACCOUNT_ID,
     NOW,
@@ -36,19 +40,27 @@ def webhook_payload(
     event_type: str = "payment.captured",
     received_at: datetime = NOW,
 ) -> VerifiedWebhookPayload:
+    event_payload: dict[str, object] = {
+        "payment": {
+            "entity": {
+                "id": payment_id,
+                "order_id": order_id,
+            }
+        }
+    }
+    if event_type.startswith("refund."):
+        event_payload["refund"] = {
+            "entity": {
+                "id": "rfnd_TESTREFUND01",
+                "payment_id": payment_id,
+            }
+        }
     raw_body = json.dumps(
         {
             "entity": "event",
             "event": event_type,
             "created_at": int(NOW.timestamp()),
-            "payload": {
-                "payment": {
-                    "entity": {
-                        "id": payment_id,
-                        "order_id": order_id,
-                    }
-                }
-            },
+            "payload": event_payload,
         },
         separators=(",", ":"),
         sort_keys=True,
@@ -290,6 +302,205 @@ async def test_captured_webhook_then_late_authorized_webhook_cannot_regress() ->
     assert harness.state.attempts_by_payment_id[PAYMENT_ID].provider_status is (
         PaymentAttemptStatus.CAPTURED
     )
+
+
+@pytest.mark.asyncio
+async def test_refund_webhook_triggers_authoritative_anomaly_gate() -> None:
+    harness = make_harness()
+    await harness.create_transaction()
+    transaction = harness.transaction
+    service = harness.build_service()
+    harness.provider.fetch_order_outcome = make_provider_order(
+        receipt=transaction.id,
+        status="paid",
+    )
+    harness.provider.fetch_payments_result = (make_provider_payment(status="captured"),)
+    await service.process_webhook(
+        webhook_payload(event_id="opaque-event-captured-before-refund", order_id=ORDER_ID)
+    )
+    provider_calls = (
+        len(harness.provider.fetch_order_calls),
+        len(harness.provider.fetch_payments_calls),
+    )
+
+    harness.clock.advance()
+    # A signed refund event must block value release even while the provider's
+    # list endpoint still lags with its prior captured snapshot.
+    harness.provider.fetch_payments_result = (make_provider_payment(status="captured"),)
+    refund = webhook_payload(
+        event_id="opaque-event-refund-processed",
+        order_id=ORDER_ID,
+        event_type="refund.processed",
+    )
+    await service.process_webhook(refund)
+
+    assert transaction.transaction_state is PaymentTransactionState.PAID
+    stored = harness.state.webhooks_by_provider_event_id[refund.provider_event_id]
+    assert stored.processing_status is WebhookProcessingStatus.RECONCILIATION_REQUIRED
+    assert stored.processing_reason_code == "PAYMENT_REFUND_EVIDENCE_DETECTED"
+    anomaly = harness.state.events_by_key["webhook:opaque-event-refund-processed"]
+    assert anomaly.event_type is PaymentTransactionEventType.RECONCILIATION_REQUIRED
+    assert anomaly.reason_code == "PAYMENT_REFUND_EVIDENCE_DETECTED"
+    assert (
+        len(harness.provider.fetch_order_calls),
+        len(harness.provider.fetch_payments_calls),
+    ) == provider_calls
+
+
+@pytest.mark.asyncio
+async def test_refund_admission_quarantine_blocks_value_before_queue_worker() -> None:
+    harness = make_harness()
+    await harness.create_transaction()
+    transaction = harness.transaction
+    service = harness.build_service()
+    harness.provider.fetch_order_outcome = make_provider_order(
+        receipt=transaction.id,
+        status="paid",
+    )
+    harness.provider.fetch_payments_result = (make_provider_payment(status="captured"),)
+    await service.process_webhook(
+        webhook_payload(event_id="opaque-event-captured-before-admission", order_id=ORDER_ID)
+    )
+    provider_calls = (
+        len(harness.provider.fetch_order_calls),
+        len(harness.provider.fetch_payments_calls),
+    )
+    refund = webhook_payload(
+        event_id="opaque-event-refund-admission",
+        order_id=ORDER_ID,
+        event_type="refund.processed",
+    )
+
+    await service.quarantine_value_revoking_webhook(refund)
+
+    with pytest.raises(EntitlementConflictError) as blocked:
+        await service.require_local_value_release_eligibility(transaction.id)
+    assert blocked.value.reason_code == "ENTITLEMENT_RECONCILIATION_REQUIRED"
+    assert (
+        len(harness.provider.fetch_order_calls),
+        len(harness.provider.fetch_payments_calls),
+    ) == provider_calls
+
+
+@pytest.mark.asyncio
+async def test_unattached_order_refund_is_left_for_worker_receipt_recovery() -> None:
+    harness = await make_uncertain_harness()
+    transaction = harness.transaction
+    service = harness.build_service()
+    refund = webhook_payload(
+        event_id="opaque-event-refund-before-order-attachment",
+        order_id=ORDER_ID,
+        event_type="refund.processed",
+    )
+
+    await service.quarantine_value_revoking_webhook(refund)
+
+    assert transaction.provider_order_id is None
+    assert refund.provider_event_id not in harness.state.webhooks_by_provider_event_id
+    assert harness.provider.fetch_order_calls == []
+    assert harness.provider.fetch_payments_calls == []
+
+    harness.provider.fetch_order_outcome = make_provider_order(
+        receipt=transaction.id,
+        status="paid",
+    )
+    harness.provider.fetch_payments_result = (make_provider_payment(status="captured"),)
+
+    worker_service = harness.build_service()
+    await worker_service.process_webhook(refund)
+
+    assert transaction.provider_order_id == ORDER_ID
+    assert transaction.transaction_state is PaymentTransactionState.RECONCILIATION_REQUIRED
+    stored = harness.state.webhooks_by_provider_event_id[refund.provider_event_id]
+    assert stored.transaction_id == transaction.id
+    assert stored.processing_status is WebhookProcessingStatus.RECONCILIATION_REQUIRED
+    assert stored.processing_reason_code == "PAYMENT_REFUND_EVIDENCE_DETECTED"
+    refund_events = [
+        event
+        for event in harness.state.events_by_key.values()
+        if event.reason_code == "PAYMENT_REFUND_EVIDENCE_DETECTED"
+    ]
+    assert len(refund_events) == 1
+    provider_calls = (
+        len(harness.provider.fetch_order_calls),
+        len(harness.provider.fetch_payments_calls),
+    )
+    event_count = len(harness.state.events_by_key)
+
+    await worker_service.process_webhook(refund)
+
+    assert (
+        len(harness.provider.fetch_order_calls),
+        len(harness.provider.fetch_payments_calls),
+    ) == provider_calls
+    assert len(harness.state.events_by_key) == event_count
+
+
+@pytest.mark.asyncio
+async def test_refund_recovery_fences_concurrent_paid_attachment_before_provider_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await make_uncertain_harness()
+    transaction = harness.transaction
+    recovered_order = make_provider_order(receipt=transaction.id, status="paid")
+    captured_payment = make_provider_payment(status="captured")
+    harness.provider.fetch_order_outcome = recovered_order
+    harness.provider.fetch_payments_result = (captured_payment,)
+    refund = webhook_payload(
+        event_id="opaque-event-refund-concurrent-attachment",
+        order_id=ORDER_ID,
+        event_type="refund.processed",
+    )
+    worker_service = harness.build_service()
+    competing_service = harness.build_service()
+    original_worker_attach = worker_service._attach_provider_order  # noqa: SLF001
+    provider_calls_after_paid: tuple[int, int] | None = None
+
+    async def attach_after_competing_paid_transition(
+        transaction_id: str,
+        order: ProviderOrder,
+    ) -> object:
+        nonlocal provider_calls_after_paid
+        await competing_service._attach_provider_order(  # noqa: SLF001
+            transaction_id,
+            order,
+        )
+        await competing_service.process_webhook(
+            webhook_payload(
+                event_id="opaque-event-concurrent-captured",
+                order_id=ORDER_ID,
+            )
+        )
+        assert transaction.transaction_state is PaymentTransactionState.PAID
+        provider_calls_after_paid = (
+            len(harness.provider.fetch_order_calls),
+            len(harness.provider.fetch_payments_calls),
+        )
+        return await original_worker_attach(
+            transaction_id,
+            order,
+        )
+
+    monkeypatch.setattr(
+        worker_service,
+        "_attach_provider_order",
+        attach_after_competing_paid_transition,
+    )
+
+    await worker_service.process_webhook(refund)
+
+    assert provider_calls_after_paid == (2, 1)
+    assert (
+        len(harness.provider.fetch_order_calls),
+        len(harness.provider.fetch_payments_calls),
+    ) == provider_calls_after_paid
+    assert transaction.transaction_state is PaymentTransactionState.PAID
+    with pytest.raises(EntitlementConflictError) as blocked:
+        await harness.build_service().require_local_value_release_eligibility(transaction.id)
+    assert blocked.value.reason_code == "ENTITLEMENT_RECONCILIATION_REQUIRED"
+    stored = harness.state.webhooks_by_provider_event_id[refund.provider_event_id]
+    assert stored.transaction_id == transaction.id
+    assert stored.processing_reason_code == "PAYMENT_REFUND_EVIDENCE_DETECTED"
 
 
 @pytest.mark.asyncio

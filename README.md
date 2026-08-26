@@ -30,7 +30,7 @@ The goal is to help merchants become **discoverable, understandable, payable, an
 
 ## Current Milestone
 
-Milestone 6B adds a real Razorpay Test Mode payment gate after the passkey-first buyer-account, policy, approval, and authorization chain. MeterGate consumes one active `aut_…` into at most one durable `txn_…`, creates the Razorpay Order server-side, launches genuine Standard Checkout, verifies callback and webhook signatures, and requires captured server-side payment evidence before reporting `paid`. Test Mode does not move real money. Entitlements, fulfillment, and refunds remain intentionally out of scope.
+Milestone 7 extends the verified Razorpay Test Mode payment gate through value release and real digital-service fulfillment. A durable paid-transition outbox drives fresh server-side payment re-verification, one immutable `ent_…` entitlement, a short-lived exact-resource capability, and one durable `ful_…` merchant execution. The protected resource uses a machine-readable HTTP `402` challenge, and the independent OrbitIntel reference merchant returns current CelesTrak-backed results. Payment capture and fulfillment completion remain distinct states. Test Mode does not move real money, and this milestone does not implement refunds, subscriptions, MCP, or autonomous-agent orchestration.
 
 ## Domain Model
 
@@ -44,6 +44,9 @@ Milestone 6B adds a real Razorpay Test Mode payment gate after the passkey-first
 - A **purchase authorization** is immutable, short-lived evidence that a registered passkey confirmed one exact server-derived review. It is not a payment, order, reservation, or record of money spent.
 - A **payment transaction** is the stateful, audit-backed consumption of one authorization into one Razorpay Order. Its immutable RFC 8785 binding carries the approved terms forward after the short authorization expires.
 - A **payment attempt** is one safe normalized Razorpay `pay_…` observation. Failed attempts remain evidence and do not prevent another attempt on the same Order from being captured.
+- A **commerce outbox event** is the durable, deduplicated handoff from the first paid transition to asynchronous entitlement issuance.
+- An **entitlement** is immutable, short-lived, exact-resource evidence derived only from freshly reverified paid state; it permits one logical merchant execution.
+- A **fulfillment execution** is the stateful, append-only-audited attempt to deliver that resource. Its terminal success stores a bounded integrity-hashed result for safe replay.
 - Merchant slugs are globally unique. Service slugs are unique within their merchant. Public removal is lifecycle-based; there are no hard-delete endpoints.
 
 ## Local Development
@@ -150,6 +153,8 @@ RAZORPAY_MODE=test
 RAZORPAY_KEY_ID=rzp_test_replace_me
 RAZORPAY_KEY_SECRET=replace_me
 RAZORPAY_WEBHOOK_SECRET=replace_with_a_dedicated_test_webhook_secret
+# Optional only during a deliberate secret-rotation overlap; it must differ.
+RAZORPAY_PREVIOUS_WEBHOOK_SECRET=
 ```
 
 Restart the API and worker after credential changes. Test Mode exercises Razorpay's real API and Checkout integration against simulated rails; it does not charge real money.
@@ -177,11 +182,13 @@ The authorization-to-transaction claim commits before any network call. The tran
 
 Standard Checkout opens only after a user action and receives its order configuration from the API. Its handler sends only the `razorpay_payment_id`, `razorpay_order_id`, and `razorpay_signature` to the owning, Origin- and CSRF-protected verification route. MeterGate compares the returned order ID but computes HMAC over the order ID stored in PostgreSQL. A valid callback signature proves binding, not payment success: MeterGate fetches Razorpay's Order and Payment and reports `paid` only for exact matching captured/paid provider evidence. `authorized` is pending, and one failed attempt does not kill the Order.
 
-Payment is not fulfillment. Milestone 6B stops at **VERIFIED PAYMENT CAPTURED** and does not issue an entitlement, call a paid merchant API, unlock a resource, generate the report, or initiate a refund.
+Payment is not fulfillment. Milestone 6B stopped at **VERIFIED PAYMENT CAPTURED**; Milestone 7 adds the separately audited entitlement and fulfillment stages, and still never initiates a refund.
 
 ## Webhook Worker
 
-Razorpay calls the public `POST /api/v1/webhooks/razorpay` route without a buyer cookie or CSRF token. MeterGate reads a bounded raw body exactly once, requires one event ID and signature, verifies HMAC with the dedicated webhook secret before JSON parsing, enforces the configurable 300-second baseline replay age, and durably appends the verified body to the `metergate:razorpay:webhooks:v1` Redis Stream before returning `200`. Invalid or stale signatures never mutate payment state.
+Razorpay calls the public `POST /api/v1/webhooks/razorpay` route without a buyer cookie or CSRF token. MeterGate reads a bounded raw body exactly once, requires one event ID and signature, and verifies HMAC with the current dedicated webhook secret—or an explicitly configured previous secret during a bounded rotation overlap—before JSON parsing. Ordinary value-granting events retain the configurable 300-second baseline replay age. Signed `refund.created`, `refund.processed`, and `refund.speed_changed` notices may be admitted for up to Razorpay's 15-day dashboard replay horizon because they can only close value release, never grant it. Invalid signatures, future-dated events, stale value-granting events, and refund events older than that horizon are rejected.
+
+Before acknowledging a correlatable signed refund notice, ingress atomically marks the transaction `reconciliation_required` and stores sticky `PAYMENT_REFUND_EVIDENCE_DETECTED` evidence; an unmatched event remains available for the worker's receipt-based recovery rather than being terminally consumed. This is refund **detection and quarantine only**: MeterGate never calls a Razorpay refund API in Milestone 7. After that admission fence, the verified body is appended to `metergate:razorpay:webhooks:v1`. Local Redis runs with AOF `appendfsync=always` and `noeviction`; PostgreSQL remains the normalized audit authority. If the queue write fails after quarantine, Razorpay receives a retryable failure while value release stays closed.
 
 Run the independent consumer from `apps/api`:
 
@@ -203,9 +210,9 @@ Razorpay cannot deliver webhooks to `localhost`, and its documentation recommend
 zrok share public localhost:8000
 ```
 
-In the Razorpay Dashboard's **Test Mode**, configure the resulting HTTPS URL plus `/api/v1/webhooks/razorpay`, use the same dedicated secret as `RAZORPAY_WEBHOOK_SECRET`, and subscribe to `payment.authorized`, `payment.captured`, `payment.failed`, and `order.paid`. Start PostgreSQL, Redis, the webhook worker, API, and frontend before the payment. A deployed HTTPS staging API can be used instead; do not use a tunnel hostname currently blocked by Razorpay.
+In the Razorpay Dashboard's **Test Mode**, configure the resulting HTTPS URL plus `/api/v1/webhooks/razorpay`, use the same dedicated secret as `RAZORPAY_WEBHOOK_SECRET`, and subscribe to `payment.authorized`, `payment.captured`, `payment.failed`, `order.paid`, `refund.created`, `refund.processed`, and `refund.speed_changed`. The refund events are observation-only quarantine signals. Start PostgreSQL, Redis, the webhook worker, API, and frontend before the payment. A deployed HTTPS staging API can be used instead; do not use a tunnel hostname currently blocked by Razorpay.
 
-### Manual Windows Hello acceptance
+### Manual Milestone 6B Windows Hello payment acceptance
 
 Physical authenticator acceptance cannot be replaced by an automated fake. On a Windows development machine with Chrome or Edge and Windows Hello configured:
 
@@ -220,9 +227,211 @@ Physical authenticator acceptance cannot be replaced by an automated fake. On a 
 9. Confirm the UI shows `AUTHORIZED`, an `aut_…` ID, the exact ₹5.00 terms, an expiry and authorization hash, and **TEST MODE — NO REAL MONEY WILL BE CHARGED**.
 10. Choose **Pay ₹5.00 with Razorpay**, confirm genuine Razorpay Standard Checkout opens with the same server-derived terms, and complete one successful Test Mode payment. Confirm the browser remains in verifying/pending state until the API observes capture, then shows **VERIFIED PAYMENT CAPTURED** with durable `txn_…`, `order_…`, and `pay_…` identifiers.
 11. Repeat with a failed Test Mode attempt and confirm it is retained as a failed attempt without marking the transaction paid or preventing a later attempt on the same Order.
-12. Confirm the Dashboard deliveries or API reconciliation converge on the same `paid` result and that no entitlement, report, merchant API call, protected-resource unlock, or refund occurs.
+12. With `FULFILLMENT_ENABLED=false`, confirm the Dashboard deliveries or API reconciliation converge on the same `paid` result and that no entitlement, report, merchant API call, protected-resource unlock, or refund occurs.
 13. Sign out and request `GET /api/v1/authorizations/<aut_id>` and `GET /api/v1/payment-transactions/<txn_id>` without the session cookie; confirm `401 AUTH_SESSION_REQUIRED`.
 14. Sign back in with the same passkey and retrieve both records through the credentialed frontend flow; confirm they succeed.
 15. Use automated ownership tests to confirm a second account receives `403 AUTH_RESOURCE_OWNERSHIP_MISMATCH` for the first account's policy, evaluation, identity, challenge, authorization, or payment transaction.
 
 Windows Hello is a physical acceptance step and cannot be claimed from automated WebAuthn stubs. Record the actual browser and authenticator result when performing this checklist.
+
+## Paid Entitlements
+
+The first transition of a legitimate `PaymentTransaction` to `paid` inserts one `ENTITLEMENT_ISSUANCE_REQUESTED` outbox event in the same PostgreSQL commit. The browser is not responsible for this handoff. The entitlement worker claims due rows with a fenced lease and `FOR UPDATE SKIP LOCKED`, retries temporary failures with bounded backoff, and marks work processed only in the commit that creates or finds the entitlement. A unique `entitlement:<transaction_id>` outbox key and `UNIQUE(entitlements.transaction_id)` provide effective exactly-once issuance: one transaction can produce at most one entitlement.
+
+Before releasing value, the worker reloads the immutable transaction evidence and makes fresh Razorpay server-side reads through a hard-total-deadline, bounded-concurrency adapter. It requires the exact stored Order, receipt, integer amount, currency, paid Order totals, and exactly one captured, unrefunded Payment bound to that Order. An unavailable provider, a reconciliation-required transaction, contradictory evidence, or an integrity mismatch leaves the outbox pending and creates no entitlement. The worker runs expiry finalization even when new issuance or its provider is disabled, and it does not claim new issuance work it cannot safely process. Configuration validation requires both outbox and execution leases to cover the complete provider-proof deadline plus a database margin.
+
+An `ent_…` is immutable, RFC 8785 hash-bound evidence for one account, transaction, authorization, evaluation, policy, quote, merchant, service, normalized input, amount, currency, and provider re-verification revision. Current one-time services set `maximum_executions` to `1`, and the default entitlement lifetime is 600 seconds. The original `PurchaseAuthorization` expiry gates only the creation of a new payment transaction. Once a valid authorization has already been claimed into a durable transaction, its later expiry does not invalidate a captured payment or block entitlement issuance; paid state, transaction integrity, reconciliation state, and fresh provider verification govern issuance.
+
+Buyer-owned access is exposed through:
+
+- `GET /api/v1/payment-transactions/{transaction_id}/entitlement` — returns `202` while durable work is pending and includes the reason-coded transaction/fulfillment timeline.
+- `GET /api/v1/entitlements/{entitlement_id}` — returns the immutable entitlement snapshot.
+- `POST /api/v1/entitlements/{entitlement_id}/capability` — explicitly creates temporary bearer access after ownership, integrity, expiry, Origin, CSRF, and current local paid/reconciliation checks.
+
+The idempotent `app.scripts.backfill_entitlement_outbox` command queues eligible paid transactions created before Milestone 7 without duplicating existing work or entitlements.
+
+## HTTP 402 Resource Flow
+
+The generic paid-resource entry point is:
+
+```http
+POST /api/v1/resources/{merchant_slug}/{service_slug}/execute
+Content-Type: application/json
+
+{"norad_id": 25544}
+```
+
+Without an `Authorization` header, MeterGate reads at most 256 KiB before JSON parsing, validates and normalizes the service input, and returns `402 Payment Required` with `Cache-Control: private, no-store`. The response is a purchase recipe, not a quote or proof of payment: it identifies the active merchant and service, supplies the authoritative `POST /api/v1/quotes` request, names Razorpay as the payment provider, and declares Bearer access with one maximum execution.
+
+```json
+{
+  "type": "metergate_payment_required",
+  "protocol": "metergate/1",
+  "merchant": {"id": "mrc_...", "slug": "orbitintel", "name": "OrbitIntel"},
+  "service": {"id": "svc_...", "slug": "orbital-risk-report", "name": "Orbital Risk Report"},
+  "quote": {
+    "endpoint": "/api/v1/quotes",
+    "request": {"service_id": "svc_...", "input": {"norad_id": 25544}}
+  },
+  "payment_provider": "razorpay",
+  "access": {"scheme": "Bearer", "maximum_executions": 1}
+}
+```
+
+The client follows the existing quote → policy → passkey approval → Razorpay payment flow, polls the transaction entitlement endpoint, explicitly generates a capability, and retries the exact resource and input with `Authorization: Bearer <capability>`. A malformed credential is rejected rather than converted into another `402`; expired, tampered, wrong-resource, and wrong-input capabilities also fail closed.
+
+## Capability Tokens
+
+The capability is a short-lived HS256 JWT with fixed issuer `MeterGate` and audience `MeterGate protected resource gateway`. Its exact claim set binds a unique `cap_…` ID, account, entitlement, transaction, merchant, service, quote and quote hash, normalized input hash, `maximum_executions=1`, issue time, and expiry. Its expiry is the earlier of `ENTITLEMENT_TOKEN_TTL_SECONDS` and the entitlement expiry.
+
+A capability is a bearer credential: anyone who steals it may try to use it until it expires. The mitigations are a short lifetime, fixed audience and algorithm, exact merchant/service/input bindings, server-side entitlement integrity checks, and a durable one-execution claim. It grants no payment, refund, account-management, session, CSRF, passkey, or merchant-administration authority. The signed token alone never enforces one-time use.
+
+`ENTITLEMENT_TOKEN_SECRET` must be independent secret material of at least 32 bytes and remains server-side. The token is never written to audit metadata. The frontend keeps it only in volatile component memory, does not display it, and does not place it in `localStorage`, `sessionStorage`, URLs, analytics, or console logs. Capability responses and protected results default to `private, no-store`.
+
+## Fulfillment
+
+Payment captured is not fulfillment complete. A paid transaction authorizes the entitlement worker to prepare narrowly scoped access; commerce completes only when the merchant returns a valid result and the durable `FulfillmentExecution` reaches `succeeded`.
+
+`UNIQUE(fulfillment_executions.entitlement_id)` permits one `ful_…` aggregate per entitlement. PostgreSQL row locking atomically claims or resumes `pending`, `executing`, `retryable_failure`, `succeeded`, `permanent_failure`, or `reconciliation_required` state. Concurrent exact calls see one logical execution; a request arriving while the lease is active receives `202 FULFILLMENT_ALREADY_CLAIMED`. Every merchant retry reuses the same `ful_…` idempotency key. This is effective exactly-once value delivery across MeterGate and the merchant's idempotency boundary, not a claim that a distributed network makes exactly one HTTP attempt.
+
+The gateway verifies the immutable paid quote and entitlement bindings, canonicalizes the request against the quote's snapshotted input schema, and requires the current route merchant and service, entitlement, capability, quote, and input hash to agree. A locked local paid/anomaly gate protects both stored-result replay and claim. Every request that actually owns a dispatch lease then performs a fresh authoritative Razorpay proof; immediately before merchant I/O, one transaction locks the payment, execution, and live fulfillment configuration, rechecks the local gate and entitlement expiry, renews the generation-fenced lease, pins the configuration ID/revision, provider, endpoint, timeout, and retry bound on first dispatch, and commits `MERCHANT_REQUEST_SENT`. A disabled or missing live configuration stops dispatch, while later configuration edits cannot redirect an uncertain retry to another merchant idempotency domain.
+
+Merchant output must be a supported JSON media type (`application/json` or `application/*+json`) and match the quote's snapshotted output content type and JSON Schema before it can cross the result boundary. The generic adapter verifies execution ID, service ID, and input hash; service-specific relationships such as OrbitIntel's NORAD identity are enforced by the paid output schema and merchant contract, not hard-coded into the generic transport. Successful JSON is size-bounded, RFC 8785 canonicalized, stored with content type, byte count, completion time, and `sha256:…` result hash. A final locked payment gate prevents a refund/anomaly observed during merchant work from releasing the result. Later catalog edits do not change the purchased contract. A later exact call returns the stored result with `replayed_result=true` and does not invoke the merchant again.
+
+Append-only fulfillment events record entitlement and capability issuance, execution claims and starts, merchant request/response evidence, retry scheduling, success, failure, and compensation requirements. They contain stable IDs, safe hashes, reason codes, timestamps, and bounded metadata—never the capability, Razorpay secrets, session secrets, or passkey material.
+
+## OrbitIntel Reference Merchant
+
+`apps/orbitintel` is an independent FastAPI process, not payment or entitlement code embedded in MeterGate. MeterGate reaches only its narrow private contract:
+
+```http
+POST /internal/v1/fulfillments/{fulfillment_execution_id}
+Authorization: Bearer <ORBITINTEL_SHARED_SECRET>
+```
+
+The request supplies the service identity, validated immutable input, and input hash. The shared secret is independent of the capability and Razorpay secrets. Local development binds OrbitIntel to `127.0.0.1:8100`; production must use a private network and authenticated service-to-service connection. The internal URL and credential are not published in the catalog, and OrbitIntel's paid business endpoint must not be exposed as an unauthenticated public bypass.
+
+OrbitIntel authenticates that private request before consuming its body, rejects duplicate or invalid `Content-Length`, and streams at most `ORBITINTEL_REQUEST_MAX_BYTES` (256 KiB by default) before JSON validation. Oversized and malformed requests fail with stable `413 ORBITINTEL_REQUEST_BODY_TOO_LARGE` and `422 ORBITINTEL_REQUEST_INVALID` responses.
+
+Every successful OrbitIntel response and stored idempotent replay echoes the fulfillment execution ID, service ID, and canonical input hash. MeterGate verifies all three before accepting the result. OrbitIntel binds the request to the paid NORAD input, and the seeded service-specific output schemas enumerate and bound the complete result—including the relevant NORAD identity—while rejecting unknown fields, so a valid HTTP response is still untrusted until it satisfies the immutable paid quote contract.
+
+The seeded services are `satellite-status-lookup`, `orbital-risk-report`, and `detailed-orbital-analysis`; each accepts exactly a modern-range integer `norad_id`. OrbitIntel associates the `ful_…` key with the exact request binding in namespaced Redis idempotency state for the configured TTL. An identical retry returns the same persisted response bytes, a changed binding is rejected, and a concurrent duplicate cannot start another logical execution.
+
+## CelesTrak
+
+OrbitIntel fetches current General Perturbations JSON by NORAD catalog number from `https://celestrak.org/NORAD/elements/gp.php?CATNR=25544&FORMAT=JSON`; it does not scrape HTML or fabricate missing observations. Its async client uses a descriptive User-Agent, fixed destination, no redirects, bounded response size, explicit connect/read timeouts, strict parsing, and a limited retry budget. Validated snapshots are cached briefly under namespaced Redis keys, with a token-owned distributed lock and single-flight wait to avoid a cache stampede. Failed responses are never cached as valid data.
+
+Deterministic calculations use centrally defined WGS 84/two-body constants and label their units and approximations. The risk report describes heuristic orbital condition only, sets `operational_collision_assessment` to `false`, and explicitly states that it is not a conjunction warning or operational collision-risk product. The ordinary suite mocks CelesTrak; the live NORAD 25544 structural check is opt-in:
+
+```powershell
+Set-Location apps/orbitintel
+$env:RUN_CELESTRAK_INTEGRATION = "1"
+uv run pytest -q -m integration tests/test_celestrak_integration.py
+Remove-Item Env:RUN_CELESTRAK_INTEGRATION
+```
+
+## Fulfillment Failure
+
+Network/upstream failures and other explicitly retryable merchant errors enter `retryable_failure`; a later exact request resumes the same `ful_…` execution and idempotency key within the configured attempt bound. Invalid merchant responses fail closed into reconciliation-required evidence. A permanent merchant error, stale-execution retry exhaustion, or exhausted retryable failure enters `permanent_failure`, releases no result, and records `compensation_required=true` plus an append-only `COMPENSATION_REQUIRED` event. Fulfillment failure does not rewrite the valid captured payment as unpaid and never returns fake success.
+
+`ORBITINTEL_DEV_FAULT_MODE=retryable|permanent` provides configuration-controlled acceptance testing only when `ORBITINTEL_ENVIRONMENT` is `development` or `test`; production startup rejects it. Milestone 7 records the compensation obligation but does not call Razorpay's refund API. Refund execution and recovery are Milestone 8 work. Subscriptions, MCP, and autonomous-agent orchestration are also outside this milestone.
+
+## Exact Local Commands
+
+Start from the repository root. If `.env` does not exist, create it from the committed placeholder file, replace both local database passwords, configure the three Razorpay Test Mode values, and set `PAYMENTS_ENABLED=true` and `FULFILLMENT_ENABLED=true`:
+
+```powershell
+Copy-Item .env.example .env
+[Convert]::ToHexString([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLowerInvariant()
+[Convert]::ToHexString([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLowerInvariant()
+```
+
+Put the two different generated values in `ENTITLEMENT_TOKEN_SECRET` and `ORBITINTEL_SHARED_SECRET` respectively. Keep `.env` local and never reuse Razorpay, webhook, database, session, capability, or merchant-connection secrets.
+
+Start PostgreSQL and Redis:
+
+```powershell
+docker compose up -d --wait
+```
+
+Prepare MeterGate, migrate, seed the OrbitIntel catalog/configuration, and idempotently backfill pre-Milestone-7 paid transactions:
+
+```powershell
+Set-Location apps/api
+uv sync --frozen --dev
+uv run alembic upgrade head
+uv run python -m app.scripts.seed_dev
+uv run python -m app.scripts.backfill_entitlement_outbox
+```
+
+Then keep each process running in its own fresh terminal from the repository root.
+
+MeterGate API:
+
+```powershell
+Set-Location apps/api
+uv run fastapi dev app/main.py
+```
+
+Razorpay webhook worker:
+
+```powershell
+Set-Location apps/api
+uv run python -m app.workers.razorpay_webhooks
+```
+
+Entitlement/outbox worker:
+
+```powershell
+Set-Location apps/api
+uv run python -m app.workers.entitlements
+```
+
+Private OrbitIntel merchant:
+
+```powershell
+Set-Location apps/orbitintel
+uv sync --frozen --all-groups
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8100
+```
+
+Next.js frontend:
+
+```powershell
+Set-Location apps/web
+npm install
+$env:NEXT_PUBLIC_API_URL = "http://localhost:8000"
+npm run dev
+```
+
+Razorpay cannot reach localhost directly. For real Test Mode webhook acceptance, keep the existing zrok setup above active and point the Test Mode webhook to `/api/v1/webhooks/razorpay`. The API, webhook worker, entitlement worker, OrbitIntel, PostgreSQL, and Redis must all stay available while the payment converges and value release runs.
+
+Run each local quality-check block from a fresh repository-root terminal:
+
+```powershell
+Set-Location apps/api
+uv run ruff check .
+uv run ruff format --check .
+uv run pytest -q
+uv run alembic check
+```
+
+```powershell
+Set-Location apps/orbitintel
+uv run ruff check .
+uv run ruff format --check .
+uv run pytest -q
+```
+
+```powershell
+Set-Location apps/web
+npm run lint
+npm run build
+```
+
+From the repository root, also run:
+
+```powershell
+docker compose config --quiet
+git diff --check
+```

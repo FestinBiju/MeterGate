@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 from collections.abc import Callable
 from copy import deepcopy
@@ -24,17 +23,21 @@ from app.domain.exceptions import (
 from app.domain.hashing import (
     MAX_CANONICAL_INTEGER,
     calculate_quote_hash,
-    sha256_bytes,
 )
 from app.domain.ids import new_quote_id
 from app.domain.integrity import IntegrityStructureError
 from app.domain.json_schema import (
     JSON_SCHEMA_DIALECT,
     JSONSchemaConfigurationError,
-    validate_json_instance,
     validate_json_schema_document,
 )
+from app.domain.media_types import normalize_json_content_type
 from app.domain.quote_integrity import verify_quote_integrity
+from app.domain.service_input import (
+    ServiceInputConfigurationError,
+    ServiceInputValueError,
+    validate_normalize_and_hash_service_input,
+)
 from app.models import Merchant, Quote, Service
 from app.repositories.quotes import QuoteRepository
 from app.repositories.services import ServiceRepository
@@ -83,31 +86,29 @@ class QuoteApplicationService:
         self._validate_service_configuration(service)
 
         try:
-            violations = validate_json_instance(payload.input, service.input_schema)
-        except JSONSchemaConfigurationError as error:
+            canonical_input = validate_normalize_and_hash_service_input(
+                payload.input,
+                service.input_schema,
+            )
+        except ServiceInputConfigurationError as error:
             raise ServiceConfigurationError(service.id) from error
-        if violations:
+        except ServiceInputValueError as error:
             raise QuoteInputValidationError(
                 tuple(
-                    QuoteInputIssue(path=violation.path, keyword=violation.keyword)
-                    for violation in violations
-                )
-            )
-
-        try:
-            canonical_input = canonical_json_bytes(payload.input)
-            input_value = json.loads(canonical_input)
-            input_hash = sha256_bytes(canonical_input)
-        except CanonicalJSONError as error:
-            raise QuoteInputValidationError(
-                (
                     QuoteInputIssue(
-                        path=(),
-                        keyword="canonicalization",
-                        error_type="quote_input_not_canonicalizable",
-                    ),
+                        path=path,
+                        keyword=keyword,
+                        error_type=(
+                            "quote_input_not_canonicalizable"
+                            if keyword == "canonicalization"
+                            else "service_input_invalid"
+                        ),
+                    )
+                    for path, keyword in error.violations
                 )
             ) from error
+        input_value = canonical_input.value
+        input_hash = canonical_input.input_hash
 
         try:
             snapshot = self._build_snapshot(merchant, service)
@@ -178,6 +179,7 @@ class QuoteApplicationService:
             or not isinstance(service.maximum_fulfillment_seconds, int)
             or not 1 <= service.maximum_fulfillment_seconds <= 86_400
             or not isinstance(service.refund_on_fulfillment_failure, bool)
+            or normalize_json_content_type(service.output_content_type) is None
         ):
             raise ServiceConfigurationError(service.id)
         try:

@@ -102,4 +102,48 @@ class PaymentTransactionEventType(StrEnum):
     PAYMENT_CAPTURED = "payment_captured"
     ORDER_PAID = "order_paid"
     PAYMENT_RECONCILED = "payment_reconciled"
+    PAYMENT_REVERIFIED = "payment_reverified"
     RECONCILIATION_REQUIRED = "reconciliation_required"
+
+
+class CommerceOutboxEventType(StrEnum):
+    ENTITLEMENT_ISSUANCE_REQUESTED = "entitlement_issuance_requested"
+
+
+class CommerceAggregateType(StrEnum):
+    PAYMENT_TRANSACTION = "payment_transaction"
+
+
+class FulfillmentExecutionState(StrEnum):
+    PENDING = "pending"
+    EXECUTING = "executing"
+    RETRYABLE_FAILURE = "retryable_failure"
+    SUCCEEDED = "succeeded"
+    PERMANENT_FAILURE = "permanent_failure"
+    RECONCILIATION_REQUIRED = "reconciliation_required"
+
+
+class FulfillmentEventType(StrEnum):
+    PAYMENT_REVERIFIED = "payment_reverified"
+    ENTITLEMENT_ISSUED = "entitlement_issued"
+    CAPABILITY_ISSUED = "capability_issued"
+    FULFILLMENT_CLAIMED = "fulfillment_claimed"
+    FULFILLMENT_STARTED = "fulfillment_started"
+    MERCHANT_REQUEST_SENT = "merchant_request_sent"
+    MERCHANT_RESPONSE_RECEIVED = "merchant_response_received"
+    FULFILLMENT_SUCCEEDED = "fulfillment_succeeded"
+    FULFILLMENT_RETRY_SCHEDULED = "fulfillment_retry_scheduled"
+    FULFILLMENT_FAILED = "fulfillment_failed"
+    COMPENSATION_REQUIRED = "compensation_required"
+
+
+class FulfillmentEventActorType(StrEnum):
+    ACCOUNT = "account"
+    SYSTEM = "system"
+    ENTITLEMENT_WORKER = "entitlement_worker"
+    RESOURCE_GATEWAY = "resource_gateway"
+    MERCHANT_SERVICE = "merchant_service"
+
+
+class FulfillmentProviderType(StrEnum):
+    HTTP = "http"

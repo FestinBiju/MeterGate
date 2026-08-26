@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from alembic.config import Config
@@ -22,6 +23,10 @@ def test_migrations_upgrade_and_downgrade_with_injected_connection() -> None:
             "alembic_version",
             "approval_identities",
             "buyer_policies",
+            "commerce_outbox_events",
+            "entitlements",
+            "fulfillment_events",
+            "fulfillment_executions",
             "merchants",
             "passkey_credentials",
             "payment_attempts",
@@ -31,6 +36,7 @@ def test_migrations_upgrade_and_downgrade_with_injected_connection() -> None:
             "purchase_authorizations",
             "quotes",
             "razorpay_webhook_events",
+            "service_fulfillment_configs",
             "services",
         }
         account_columns = {column["name"] for column in inspector.get_columns("accounts")}
@@ -395,6 +401,12 @@ def test_migrations_upgrade_and_downgrade_with_injected_connection() -> None:
             "uq_payment_transaction_events_source_webhook_event_id",
             "uq_payment_transaction_events_transaction_revision",
         }
+        event_type_check = next(
+            constraint
+            for constraint in inspector.get_check_constraints("payment_transaction_events")
+            if constraint["name"] == "ck_payment_transaction_events_event_type"
+        )
+        assert "payment_reverified" in event_type_check["sqltext"]
         assert {
             foreign_key["referred_table"]: foreign_key["options"]["ondelete"]
             for foreign_key in inspector.get_foreign_keys("payment_transaction_events")
@@ -403,6 +415,170 @@ def test_migrations_upgrade_and_downgrade_with_injected_connection() -> None:
             "payment_transactions": "RESTRICT",
             "razorpay_webhook_events": "RESTRICT",
         }
+
+        entitlement_columns = {column["name"] for column in inspector.get_columns("entitlements")}
+        assert {
+            "id",
+            "transaction_id",
+            "payment_binding_hash",
+            "payment_reverification_event_id",
+            "payment_reverification_revision",
+            "provider_order_id",
+            "provider_payment_id",
+            "input",
+            "input_hash",
+            "maximum_executions",
+            "entitlement_version",
+            "entitlement_hash",
+            "created_at",
+        } <= entitlement_columns
+        assert "updated_at" not in entitlement_columns
+        assert "uq_entitlements_transaction_id" in {
+            constraint["name"] for constraint in inspector.get_unique_constraints("entitlements")
+        }
+        assert {
+            foreign_key["referred_table"]: foreign_key["options"]["ondelete"]
+            for foreign_key in inspector.get_foreign_keys("entitlements")
+        } == {
+            "accounts": "RESTRICT",
+            "buyer_policies": "RESTRICT",
+            "merchants": "RESTRICT",
+            "payment_attempts": "RESTRICT",
+            "payment_transaction_events": "RESTRICT",
+            "payment_transactions": "RESTRICT",
+            "policy_evaluations": "RESTRICT",
+            "purchase_authorizations": "RESTRICT",
+            "quotes": "RESTRICT",
+            "services": "RESTRICT",
+        }
+
+        assert {
+            "lease_generation",
+            "lease_expires_at",
+            "processing_started_at",
+            "processed_at",
+        } <= {column["name"] for column in inspector.get_columns("commerce_outbox_events")}
+        assert "uq_commerce_outbox_events_dedup_key" in {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("commerce_outbox_events")
+        }
+        assert {
+            "revision",
+            "lease_generation",
+            "lease_expires_at",
+            "result_json",
+            "result_hash",
+            "compensation_required",
+            "fulfillment_config_id",
+            "fulfillment_config_revision",
+            "provider_type",
+            "endpoint_url",
+            "request_timeout_seconds",
+            "maximum_attempts",
+        } <= {column["name"] for column in inspector.get_columns("fulfillment_executions")}
+        assert "uq_fulfillment_executions_entitlement_id" in {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("fulfillment_executions")
+        }
+        assert {
+            foreign_key["referred_table"]: foreign_key["options"]["ondelete"]
+            for foreign_key in inspector.get_foreign_keys("fulfillment_executions")
+        } == {
+            "accounts": "RESTRICT",
+            "entitlements": "RESTRICT",
+            "merchants": "RESTRICT",
+            "payment_transactions": "RESTRICT",
+            "service_fulfillment_configs": "RESTRICT",
+            "services": "RESTRICT",
+        }
+        fulfillment_event_columns = {
+            column["name"] for column in inspector.get_columns("fulfillment_events")
+        }
+        assert {"transaction_id", "entitlement_id", "execution_id"} <= fulfillment_event_columns
+        assert inspector.get_columns("fulfillment_events")[1]["nullable"] is False
+
+        reverified_event_id = "pte_00000000000000000000000001"
+        connection.exec_driver_sql(
+            """
+            INSERT INTO payment_transaction_events (
+                id,
+                transaction_id,
+                transaction_revision,
+                event_type,
+                actor_type,
+                actor_id,
+                prior_state,
+                resulting_state,
+                reason_code,
+                metadata,
+                payment_attempt_id,
+                source_webhook_event_id,
+                idempotency_key,
+                occurred_at
+            ) VALUES (?, ?, 1, 'payment_reverified', 'provider_api', NULL, NULL,
+                      'paid', 'PAYMENT_REVERIFIED', ?, NULL, NULL, ?, ?)
+            """,
+            (
+                reverified_event_id,
+                "txn_00000000000000000000000001",
+                '{"provider_status":"captured"}',
+                "migration:payment-reverified",
+                "2026-08-26 00:00:00+00:00",
+            ),
+        )
+        event_before_downgrade = connection.exec_driver_sql(
+            """
+            SELECT id, transaction_id, transaction_revision, event_type, actor_type,
+                   actor_id, prior_state, resulting_state, reason_code, metadata,
+                   payment_attempt_id, source_webhook_event_id, idempotency_key, occurred_at
+            FROM payment_transaction_events
+            WHERE id = ?
+            """,
+            (reverified_event_id,),
+        ).one()
+
+        command.downgrade(config, "20260825_0006")
+        assert {
+            "commerce_outbox_events",
+            "entitlements",
+            "fulfillment_events",
+            "fulfillment_executions",
+            "service_fulfillment_configs",
+        }.isdisjoint(inspect(connection).get_table_names())
+        event_after_downgrade = connection.exec_driver_sql(
+            """
+            SELECT id, transaction_id, transaction_revision, event_type, actor_type,
+                   actor_id, prior_state, resulting_state, reason_code, metadata,
+                   payment_attempt_id, source_webhook_event_id, idempotency_key, occurred_at
+            FROM payment_transaction_events
+            WHERE id = ?
+            """,
+            (reverified_event_id,),
+        ).one()
+        assert event_after_downgrade[:9] == (
+            *event_before_downgrade[:3],
+            "payment_reconciled",
+            *event_before_downgrade[4:9],
+        )
+        assert event_after_downgrade[10:] == event_before_downgrade[10:]
+        downgraded_metadata = json.loads(event_after_downgrade[9])
+        assert downgraded_metadata["provider_status"] == "captured"
+        assert downgraded_metadata["_metergate_migration"] == {
+            "20260826_0007_downgrade": {
+                "event_type_from": "payment_reverified",
+                "event_type_to": "payment_reconciled",
+            }
+        }
+        downgraded_event_type_check = next(
+            constraint
+            for constraint in inspect(connection).get_check_constraints(
+                "payment_transaction_events"
+            )
+            if constraint["name"] == "ck_payment_transaction_events_event_type"
+        )
+        assert "payment_reverified" not in downgraded_event_type_check["sqltext"]
+        assert "payment_reconciled" in downgraded_event_type_check["sqltext"]
+        command.upgrade(config, "head")
 
         command.downgrade(config, "20260825_0005")
         milestone_six_a_tables = set(inspect(connection).get_table_names())

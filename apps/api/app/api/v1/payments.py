@@ -113,6 +113,7 @@ async def accept_razorpay_webhook(
     request: Request,
     settings: SettingsDependency,
     ingress: RazorpayWebhookIngressDependency,
+    application_service: PaymentApplicationDependency,
 ) -> RazorpayWebhookAccepted:
     raw_body = await _read_bounded_body(
         request,
@@ -122,6 +123,7 @@ async def accept_razorpay_webhook(
         raw_body=raw_body,
         signature=_single_header(request, b"x-razorpay-signature"),
         provider_event_id=_single_header(request, b"x-razorpay-event-id"),
+        before_enqueue=application_service.quarantine_value_revoking_webhook,
     )
     return RazorpayWebhookAccepted(
         status="accepted",

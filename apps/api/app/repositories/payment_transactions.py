@@ -6,8 +6,13 @@ from sqlalchemy import inspect as sqlalchemy_inspect
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domain.enums import PaymentTransactionState
+from app.domain.enums import (
+    CommerceAggregateType,
+    CommerceOutboxEventType,
+    PaymentTransactionState,
+)
 from app.models import (
+    CommerceOutboxEvent,
     PaymentAttempt,
     PaymentTransaction,
     PaymentTransactionEvent,
@@ -159,6 +164,12 @@ class PaymentTransactionRepository:
         ):
             raise ValueError("Payment event resulting state does not match the aggregate")
 
+        first_paid_transition = (
+            PaymentTransactionState(prior_state) is not PaymentTransactionState.PAID
+            and PaymentTransactionState(transaction.transaction_state)
+            is PaymentTransactionState.PAID
+        )
+
         prerequisite_records: list[object] = [transaction]
         attempt_records = list(attempts)
         if attempt is not None:
@@ -191,6 +202,32 @@ class PaymentTransactionRepository:
             prerequisite_records.append(webhook_event)
 
         transaction.revision = next_revision
+        if first_paid_transition:
+            # The paid aggregate revision and its entitlement work become visible
+            # in one commit. The database also carries a deferred guard trigger so
+            # no future code path can persist a first paid transition without this
+            # durable handoff.
+            self._session.add(
+                CommerceOutboxEvent(
+                    event_type=CommerceOutboxEventType.ENTITLEMENT_ISSUANCE_REQUESTED,
+                    aggregate_type=CommerceAggregateType.PAYMENT_TRANSACTION,
+                    aggregate_id=transaction.id,
+                    deduplication_key=f"entitlement:{transaction.id}",
+                    payload_version="1",
+                    payload={
+                        "transaction_id": transaction.id,
+                        "payment_binding_hash": transaction.payment_binding_hash,
+                    },
+                    created_at=event.occurred_at,
+                    available_at=event.occurred_at,
+                    processing_started_at=None,
+                    processed_at=None,
+                    attempt_count=0,
+                    lease_generation=0,
+                    lease_expires_at=None,
+                    last_error_code=None,
+                )
+            )
         self._session.add_all(prerequisite_records)
         try:
             await self._session.flush()

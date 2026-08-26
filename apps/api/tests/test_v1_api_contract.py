@@ -29,6 +29,10 @@ def test_v1_openapi_exposes_exact_management_and_catalog_routes(
         "/api/v1/services/{service_id}": {"get", "patch"},
         "/api/v1/catalog": {"get"},
         "/api/v1/catalog/services/{service_id}": {"get"},
+        "/api/v1/payment-transactions/{transaction_id}/entitlement": {"get"},
+        "/api/v1/entitlements/{entitlement_id}": {"get"},
+        "/api/v1/entitlements/{entitlement_id}/capability": {"post"},
+        "/api/v1/resources/{merchant_slug}/{service_slug}/execute": {"post"},
     }
 
     for path, methods in expected_methods.items():

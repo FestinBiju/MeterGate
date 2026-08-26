@@ -16,6 +16,7 @@ from app.domain.enums import (
     ApprovalIdentityStatus,
     MerchantStatus,
     PaymentAttemptStatus,
+    PaymentTransactionEventType,
     PaymentTransactionState,
     PolicyDecision,
     PurchaseType,
@@ -23,6 +24,7 @@ from app.domain.enums import (
 )
 from app.domain.exceptions import (
     AuthenticationForbiddenError,
+    EntitlementConflictError,
     PaymentConflictError,
     PaymentExpiredError,
     PaymentIntegrityError,
@@ -115,8 +117,12 @@ def make_provider_payment(
     amount: int = 500,
     currency: str = "INR",
     created_at: datetime = NOW,
+    amount_refunded: int | None = None,
 ) -> ProviderPayment:
     captured = status in {"captured", "refunded"}
+    effective_amount_refunded = (
+        (amount if status == "refunded" else 0) if amount_refunded is None else amount_refunded
+    )
     return ProviderPayment(
         id=payment_id,
         order_id=order_id,
@@ -124,7 +130,7 @@ def make_provider_payment(
         currency=currency,
         status=status,  # type: ignore[arg-type]
         captured=captured,
-        amount_refunded=amount if status == "refunded" else 0,
+        amount_refunded=effective_amount_refunded,
         method="upi",
         created_at=created_at,
     )
@@ -265,6 +271,16 @@ class MemoryEventRepository:
     async def get_by_idempotency_key(self, key: str) -> Any | None:
         return self.state.events_by_key.get(key)
 
+    async def list_for_transaction(self, transaction_id: str) -> list[Any]:
+        return sorted(
+            (
+                event
+                for event in self.state.events_by_key.values()
+                if event.transaction_id == transaction_id
+            ),
+            key=lambda event: event.transaction_revision,
+        )
+
 
 class MemoryAttemptRepository:
     def __init__(self, state: MemoryState) -> None:
@@ -350,6 +366,15 @@ class MemoryTransactionRepository:
             ),
             None,
         )
+
+    async def get_by_provider_order_id_for_update(
+        self,
+        order_id: str,
+    ) -> PaymentTransaction | None:
+        transaction = await self.get_by_provider_order_id(order_id)
+        if transaction is not None:
+            return await self.get_for_update(transaction.id)
+        return None
 
     async def get_by_provider_receipt(self, receipt: str) -> PaymentTransaction | None:
         return next(
@@ -1030,6 +1055,156 @@ async def test_checkout_uses_server_fetched_payment_truth(
     assert harness.state.attempts_by_payment_id[PAYMENT_ID].provider_status is (
         PaymentAttemptStatus(payment_status)
     )
+
+
+@pytest.mark.asyncio
+async def test_replayed_checkout_detects_new_partial_refund_evidence() -> None:
+    harness = make_harness()
+    await harness.create_transaction()
+    transaction = harness.transaction
+    service = harness.build_service()
+    harness.provider.fetch_order_outcome = make_provider_order(
+        receipt=transaction.id,
+        status="paid",
+    )
+    harness.provider.fetch_payment_outcome = make_provider_payment(status="captured")
+    payload = checkout_payload(transaction)
+    await service.verify_checkout(transaction.id, payload, account_id=ACCOUNT_ID)
+
+    harness.clock.advance()
+    harness.provider.fetch_payment_outcome = make_provider_payment(
+        status="captured",
+        amount_refunded=100,
+    )
+    replayed = await service.verify_checkout(
+        transaction.id,
+        payload,
+        account_id=ACCOUNT_ID,
+    )
+
+    assert replayed.response.state is PaymentTransactionState.PAID
+    assert any(
+        event.event_type is PaymentTransactionEventType.RECONCILIATION_REQUIRED
+        and event.reason_code == "PAYMENT_REFUND_EVIDENCE_DETECTED"
+        for event in harness.state.events_by_key.values()
+    )
+
+
+@pytest.mark.asyncio
+async def test_replayed_checkout_cannot_hide_changed_binding_behind_clean_event_key() -> None:
+    harness = make_harness()
+    await harness.create_transaction()
+    transaction = harness.transaction
+    service = harness.build_service()
+    payload = checkout_payload(transaction)
+    harness.provider.fetch_order_outcome = make_provider_order(
+        receipt=transaction.id,
+        status="paid",
+    )
+    harness.provider.fetch_payment_outcome = make_provider_payment(status="captured")
+    await service.verify_checkout(transaction.id, payload, account_id=ACCOUNT_ID)
+
+    harness.clock.advance()
+    harness.provider.fetch_order_outcome = make_provider_order(
+        receipt=transaction.id,
+        amount=600,
+        status="paid",
+    )
+    harness.provider.fetch_payment_outcome = make_provider_payment(
+        status="captured",
+        amount=600,
+    )
+    replayed = await service.verify_checkout(transaction.id, payload, account_id=ACCOUNT_ID)
+
+    assert replayed.response.state is PaymentTransactionState.PAID
+    assert any(
+        event.event_type is PaymentTransactionEventType.RECONCILIATION_REQUIRED
+        and event.reason_code == "PAYMENT_PROVIDER_RESPONSE_MISMATCH"
+        for event in harness.state.events_by_key.values()
+    )
+    with pytest.raises(EntitlementConflictError) as blocked:
+        await service.require_local_value_release_eligibility(transaction.id)
+    assert blocked.value.reason_code == "ENTITLEMENT_RECONCILIATION_REQUIRED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payment_status", "order_status"),
+    [("authorized", "paid"), ("captured", "attempted")],
+)
+async def test_checkout_snapshot_regression_after_capture_requires_reconciliation(
+    payment_status: str,
+    order_status: str,
+) -> None:
+    harness = make_harness()
+    await harness.create_transaction()
+    transaction = harness.transaction
+    service = harness.build_service()
+    payload = checkout_payload(transaction)
+    harness.provider.fetch_order_outcome = make_provider_order(
+        receipt=transaction.id,
+        status="paid",
+    )
+    harness.provider.fetch_payment_outcome = make_provider_payment(status="captured")
+    await service.verify_checkout(transaction.id, payload, account_id=ACCOUNT_ID)
+
+    harness.clock.advance()
+    harness.provider.fetch_order_outcome = make_provider_order(
+        receipt=transaction.id,
+        status=order_status,
+    )
+    harness.provider.fetch_payment_outcome = make_provider_payment(status=payment_status)
+    replayed = await service.verify_checkout(transaction.id, payload, account_id=ACCOUNT_ID)
+
+    assert replayed.response.state is PaymentTransactionState.PAID
+    assert any(
+        event.event_type is PaymentTransactionEventType.RECONCILIATION_REQUIRED
+        and event.reason_code == "PAYMENT_PROVIDER_EVIDENCE_REGRESSED"
+        for event in harness.state.events_by_key.values()
+    )
+    with pytest.raises(EntitlementConflictError):
+        await service.require_local_value_release_eligibility(transaction.id)
+
+
+@pytest.mark.asyncio
+async def test_identical_regression_is_recorded_again_after_trusted_resolution() -> None:
+    harness = make_harness()
+    await harness.create_transaction()
+    transaction = harness.transaction
+    service = harness.build_service()
+    payload = checkout_payload(transaction)
+    paid_order = make_provider_order(receipt=transaction.id, status="paid")
+    captured_payment = make_provider_payment(status="captured")
+    harness.provider.fetch_order_outcome = paid_order
+    harness.provider.fetch_payment_outcome = captured_payment
+    await service.verify_checkout(transaction.id, payload, account_id=ACCOUNT_ID)
+
+    regressed_payment = make_provider_payment(status="authorized")
+    harness.clock.advance()
+    harness.provider.fetch_payment_outcome = regressed_payment
+    await service.verify_checkout(transaction.id, payload, account_id=ACCOUNT_ID)
+
+    harness.clock.advance()
+    harness.provider.fetch_order_outcome = paid_order
+    harness.provider.fetch_payments_result = (captured_payment,)
+    await service.reconcile_transaction(transaction.id, account_id=ACCOUNT_ID)
+    assert (await service.require_local_value_release_eligibility(transaction.id)).id == (
+        transaction.id
+    )
+
+    harness.clock.advance()
+    harness.provider.fetch_payment_outcome = regressed_payment
+    await service.verify_checkout(transaction.id, payload, account_id=ACCOUNT_ID)
+
+    regression_events = [
+        event
+        for event in harness.state.events_by_key.values()
+        if event.event_type is PaymentTransactionEventType.RECONCILIATION_REQUIRED
+        and event.reason_code == "PAYMENT_PROVIDER_EVIDENCE_REGRESSED"
+    ]
+    assert len(regression_events) == 2
+    with pytest.raises(EntitlementConflictError):
+        await service.require_local_value_release_eligibility(transaction.id)
 
 
 @pytest.mark.asyncio

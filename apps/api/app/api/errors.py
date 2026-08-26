@@ -16,6 +16,19 @@ from app.domain.exceptions import (
     AuthenticationNotFoundError,
     AuthenticationUnauthorizedError,
     AuthenticationVerificationError,
+    CapabilityExpiredError,
+    CapabilityForbiddenError,
+    CapabilityInvalidError,
+    EntitlementConflictError,
+    EntitlementExpiredError,
+    EntitlementForbiddenError,
+    EntitlementIntegrityError,
+    EntitlementNotFoundError,
+    EntitlementUnavailableError,
+    FulfillmentConflictError,
+    FulfillmentIntegrityError,
+    FulfillmentPermanentError,
+    FulfillmentRetryableError,
     InvalidStateTransitionError,
     PaymentConflictError,
     PaymentExpiredError,
@@ -29,6 +42,7 @@ from app.domain.exceptions import (
     QuoteConflictError,
     QuoteInputValidationError,
     ResourceNotFoundError,
+    ResourceRequestError,
     SlugConflictError,
     StoredIntegrityError,
 )
@@ -37,6 +51,7 @@ from app.domain.exceptions import (
 def register_domain_exception_handlers(application: FastAPI) -> None:
     """Install one explicit status mapping per public domain failure."""
     application.add_exception_handler(ResourceNotFoundError, _not_found_handler)
+    application.add_exception_handler(ResourceRequestError, _resource_request_handler)
     application.add_exception_handler(SlugConflictError, _conflict_handler)
     application.add_exception_handler(InvalidStateTransitionError, _transition_handler)
     application.add_exception_handler(QuoteConflictError, _quote_conflict_handler)
@@ -84,6 +99,22 @@ def register_domain_exception_handlers(application: FastAPI) -> None:
     application.add_exception_handler(PaymentProviderError, _payment_provider_handler)
     application.add_exception_handler(PaymentUnavailableError, _payment_unavailable_handler)
     application.add_exception_handler(PaymentTimeoutError, _payment_timeout_handler)
+    application.add_exception_handler(EntitlementNotFoundError, _entitlement_not_found_handler)
+    application.add_exception_handler(EntitlementForbiddenError, _entitlement_forbidden_handler)
+    application.add_exception_handler(EntitlementExpiredError, _entitlement_expired_handler)
+    application.add_exception_handler(EntitlementConflictError, _entitlement_conflict_handler)
+    application.add_exception_handler(EntitlementIntegrityError, _entitlement_integrity_handler)
+    application.add_exception_handler(
+        EntitlementUnavailableError,
+        _entitlement_unavailable_handler,
+    )
+    application.add_exception_handler(CapabilityInvalidError, _capability_unauthorized_handler)
+    application.add_exception_handler(CapabilityExpiredError, _capability_unauthorized_handler)
+    application.add_exception_handler(CapabilityForbiddenError, _capability_forbidden_handler)
+    application.add_exception_handler(FulfillmentConflictError, _fulfillment_conflict_handler)
+    application.add_exception_handler(FulfillmentRetryableError, _fulfillment_retryable_handler)
+    application.add_exception_handler(FulfillmentPermanentError, _fulfillment_permanent_handler)
+    application.add_exception_handler(FulfillmentIntegrityError, _fulfillment_integrity_handler)
 
 
 async def _not_found_handler(
@@ -95,6 +126,17 @@ async def _not_found_handler(
         status_code=status.HTTP_404_NOT_FOUND,
         content={"detail": str(error)},
     )
+
+
+async def _resource_request_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    assert isinstance(error, ResourceRequestError)
+    status_code = (
+        status.HTTP_413_CONTENT_TOO_LARGE
+        if error.reason_code == "RESOURCE_REQUEST_BODY_TOO_LARGE"
+        else status.HTTP_422_UNPROCESSABLE_CONTENT
+    )
+    return _paid_access_response(error, status_code)
 
 
 async def _conflict_handler(
@@ -349,3 +391,89 @@ async def _payment_unavailable_handler(request: Request, error: Exception) -> JS
 async def _payment_timeout_handler(request: Request, error: Exception) -> JSONResponse:
     del request
     return _payment_response(error, status.HTTP_504_GATEWAY_TIMEOUT)
+
+
+def _paid_access_response(
+    error: Exception,
+    status_code: int,
+    *,
+    bearer_challenge: bool = False,
+) -> JSONResponse:
+    reason_code = getattr(error, "reason_code", "PAID_ACCESS_FAILED")
+    headers = {"Cache-Control": "private, no-store", "Pragma": "no-cache"}
+    if bearer_challenge:
+        headers["WWW-Authenticate"] = 'Bearer realm="metergate-protected-resource"'
+    return JSONResponse(
+        status_code=status_code,
+        content={"detail": str(error), "reason_code": reason_code},
+        headers=headers,
+    )
+
+
+async def _entitlement_not_found_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _paid_access_response(error, status.HTTP_404_NOT_FOUND)
+
+
+async def _entitlement_forbidden_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _paid_access_response(error, status.HTTP_403_FORBIDDEN)
+
+
+async def _entitlement_expired_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _paid_access_response(error, status.HTTP_410_GONE)
+
+
+async def _entitlement_conflict_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _paid_access_response(error, status.HTTP_409_CONFLICT)
+
+
+async def _entitlement_integrity_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _paid_access_response(error, status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+async def _entitlement_unavailable_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _paid_access_response(error, status.HTTP_503_SERVICE_UNAVAILABLE)
+
+
+async def _capability_unauthorized_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _paid_access_response(
+        error,
+        status.HTTP_401_UNAUTHORIZED,
+        bearer_challenge=True,
+    )
+
+
+async def _capability_forbidden_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _paid_access_response(error, status.HTTP_403_FORBIDDEN)
+
+
+async def _fulfillment_conflict_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _paid_access_response(error, status.HTTP_409_CONFLICT)
+
+
+async def _fulfillment_retryable_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _paid_access_response(error, status.HTTP_503_SERVICE_UNAVAILABLE)
+
+
+async def _fulfillment_permanent_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    status_code = (
+        status.HTTP_503_SERVICE_UNAVAILABLE
+        if getattr(error, "reason_code", "") == "FULFILLMENT_PROVIDER_UNAVAILABLE"
+        else status.HTTP_409_CONFLICT
+    )
+    return _paid_access_response(error, status_code)
+
+
+async def _fulfillment_integrity_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _paid_access_response(error, status.HTTP_502_BAD_GATEWAY)

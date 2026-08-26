@@ -214,6 +214,20 @@ def test_json_schema_allows_a_property_named_pattern() -> None:
     assert validate_json_instance({"pattern": "ordinary value"}, schema) == ()
 
 
+def test_json_schema_enforces_allowlisted_date_time_format() -> None:
+    schema = {"type": "string", "format": "date-time"}
+
+    assert validate_json_instance("2026-08-26T12:00:00Z", schema) == ()
+    violations = validate_json_instance("not-a-timestamp", schema)
+    assert len(violations) == 1
+    assert violations[0].keyword == "format"
+
+
+def test_json_schema_rejects_non_allowlisted_formats() -> None:
+    with pytest.raises(JSONSchemaConfigurationError, match="Unsupported JSON Schema format"):
+        validate_json_instance("person@example.com", {"type": "string", "format": "email"})
+
+
 def test_json_schema_rejects_excessive_schema_depth() -> None:
     schema: dict[str, Any] = {"type": "string"}
     for _ in range(40):
@@ -337,6 +351,18 @@ async def test_quote_supports_root_null_when_the_schema_allows_it() -> None:
     quote = await application.create(QuoteCreate(service_id=service.id, input=None))
 
     assert quote.input is None
+
+
+@pytest.mark.asyncio
+async def test_quote_rejects_non_json_output_before_payment_can_begin() -> None:
+    merchant, service = make_offer()
+    service.output_content_type = "text/plain"
+    application, repository, _ = make_application((merchant, service))
+
+    with pytest.raises(ServiceConfigurationError):
+        await application.create(QuoteCreate(service_id=service.id, input={"norad_id": 25_544}))
+
+    assert repository.records == {}
 
 
 @pytest.mark.asyncio

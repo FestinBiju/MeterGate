@@ -11,6 +11,33 @@ type CredentialedJsonRequestOptions = {
   allowEmptyResponse?: boolean;
 };
 
+export type JsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
+type ProtectedResourceRequestOptions = {
+  body: JsonValue;
+  bearerToken?: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+};
+
+export type ProtectedResourceJsonResponse =
+  | {
+      kind: "payment_required";
+      status: 402;
+      body: Record<string, unknown>;
+    }
+  | {
+      kind: "success";
+      status: number;
+      body: Record<string, unknown>;
+    };
+
 export class ApiRequestFailure extends Error {
   constructor(
     readonly code: string,
@@ -23,6 +50,10 @@ export class ApiRequestFailure extends Error {
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+const MAX_PROTECTED_RESOURCE_RESPONSE_BYTES = 1_048_576;
+const MAX_BEARER_TOKEN_LENGTH = 8_192;
+const compactJwtPattern =
+  /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -185,6 +216,134 @@ export async function requestCredentialedJson(
     throw new ApiRequestFailure(
       "API_REQUEST_FAILED",
       "The MeterGate API request could not be completed.",
+    );
+  } finally {
+    window.clearTimeout(timeout);
+    options.signal?.removeEventListener("abort", abortFromCaller);
+  }
+}
+
+export async function requestProtectedResourceJson(
+  endpoint: string,
+  options: ProtectedResourceRequestOptions,
+): Promise<ProtectedResourceJsonResponse> {
+  if (
+    options.bearerToken !== undefined &&
+    (options.bearerToken.length > MAX_BEARER_TOKEN_LENGTH ||
+      !compactJwtPattern.test(options.bearerToken))
+  ) {
+    throw new ApiRequestFailure(
+      "CAPABILITY_INVALID",
+      "The access capability has an invalid format.",
+      401,
+    );
+  }
+
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeout = window.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS);
+  const abortFromCaller = () => controller.abort();
+
+  if (options.signal?.aborted) {
+    controller.abort();
+  } else {
+    options.signal?.addEventListener("abort", abortFromCaller, { once: true });
+  }
+
+  try {
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    };
+    if (options.bearerToken !== undefined) {
+      headers.Authorization = `Bearer ${options.bearerToken}`;
+    }
+
+    const response = await fetch(endpoint, {
+      method: "POST",
+      cache: "no-store",
+      credentials: "omit",
+      headers,
+      body: JSON.stringify(options.body),
+      redirect: "error",
+      referrerPolicy: "no-referrer",
+      signal: controller.signal,
+    });
+
+    const text = await response.text();
+    if (new TextEncoder().encode(text).byteLength > MAX_PROTECTED_RESOURCE_RESPONSE_BYTES) {
+      throw new ApiRequestFailure(
+        "API_RESPONSE_TOO_LARGE",
+        "The protected resource returned more data than this client accepts.",
+        response.status,
+      );
+    }
+
+    let body: unknown = null;
+    if (text) {
+      try {
+        body = JSON.parse(text) as unknown;
+      } catch {
+        if (response.ok || response.status === 402) {
+          throw new ApiRequestFailure(
+            "API_RESPONSE_INVALID",
+            "The protected resource returned unreadable JSON.",
+            response.status,
+          );
+        }
+      }
+    }
+
+    if (response.status === 402) {
+      if (!isRecord(body)) {
+        throw new ApiRequestFailure(
+          "PAYMENT_REQUIRED_RESPONSE_INVALID",
+          "The payment-required response was not machine-readable.",
+          response.status,
+        );
+      }
+      return { kind: "payment_required", status: 402, body };
+    }
+
+    if (!response.ok) {
+      throw responseFailure(response.status, body);
+    }
+    if (!isRecord(body)) {
+      throw new ApiRequestFailure(
+        "API_RESPONSE_INVALID",
+        "The protected resource returned an unexpected response.",
+        response.status,
+      );
+    }
+
+    return { kind: "success", status: response.status, body };
+  } catch (error: unknown) {
+    if (error instanceof ApiRequestFailure) {
+      throw error;
+    }
+
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new ApiRequestFailure(
+        timedOut ? "API_REQUEST_TIMEOUT" : "API_REQUEST_CANCELLED",
+        timedOut
+          ? "The protected-resource request timed out. Its final server state may be unknown."
+          : "The protected-resource request was cancelled.",
+      );
+    }
+
+    if (error instanceof TypeError) {
+      throw new ApiRequestFailure(
+        "API_SERVICE_UNAVAILABLE",
+        "The protected resource could not be reached. Confirm FastAPI is running and CORS permits Authorization.",
+      );
+    }
+
+    throw new ApiRequestFailure(
+      "API_REQUEST_FAILED",
+      "The protected-resource request could not be completed.",
     );
   } finally {
     window.clearTimeout(timeout);
