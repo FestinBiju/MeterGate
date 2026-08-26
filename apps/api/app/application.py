@@ -13,6 +13,7 @@ from app.api.health import router as health_router
 from app.api.v1.router import router as api_v1_router
 from app.cache.approval_challenges import ChallengeStore, RedisChallengeStore
 from app.cache.auth import AuthStore, RedisAuthStore
+from app.cache.operator import RedisOperatorRateLimiter
 from app.cache.payment_webhooks import RedisPaymentWebhookQueue, WebhookQueuePublisher
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
@@ -40,16 +41,12 @@ def create_app(
     effective_settings = settings or get_settings()
     owns_database = database is None
     effective_database = database or create_database(effective_settings)
-    redis_client: Redis | None = None
-    if (
-        challenge_store is None
-        or auth_store is None
-        or (effective_settings.payments_enabled and payment_webhook_queue is None)
-    ):
-        redis_client = Redis.from_url(
-            effective_settings.redis_url.get_secret_value(),
-            decode_responses=False,
-        )
+    # Redis is also the fail-closed enforcement store for operator and
+    # reconciliation rate limits. Client construction itself is lazy.
+    redis_client: Redis | None = Redis.from_url(
+        effective_settings.redis_url.get_secret_value(),
+        decode_responses=False,
+    )
     if challenge_store is None:
         assert redis_client is not None
         effective_challenge_store: ChallengeStore = RedisChallengeStore(redis_client)
@@ -132,6 +129,10 @@ def create_app(
     application.state.payment_webhook_queue = effective_payment_webhook_queue
     application.state.readiness_service = readiness_service or build_readiness_service(
         effective_settings
+    )
+    application.state.redis_client = redis_client
+    application.state.operator_rate_limiter = (
+        RedisOperatorRateLimiter(redis_client) if redis_client is not None else None
     )
 
     application.add_middleware(

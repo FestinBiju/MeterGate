@@ -1,13 +1,16 @@
 """Authenticated buyer reads for compensation and refund evidence."""
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, HTTPException, Response
 
 from app.api.v1.dependencies import (
     AuthenticatedMutationDependency,
     CompensationApplicationDependency,
     CurrentAccountDependency,
+    OperatorRateLimiterDependency,
     RefundApplicationDependency,
+    SettingsDependency,
 )
+from app.cache.operator import OperatorRateLimitExceeded
 from app.schemas.compensations import (
     CompensationCaseResponse,
     CompensationId,
@@ -83,7 +86,26 @@ async def reconcile_payment_refund(
     response: Response,
     application_service: RefundApplicationDependency,
     current: AuthenticatedMutationDependency,
+    limiter: OperatorRateLimiterDependency,
+    settings: SettingsDependency,
 ) -> PaymentRefundResponse:
+    try:
+        await limiter.require(
+            account_id=current.account.id,
+            action="buyer-refund-reconcile",
+            limit=settings.operator_reconciliation_rate_limit,
+            window_seconds=settings.operator_rate_limit_window_seconds,
+        )
+    except OperatorRateLimitExceeded as error:
+        raise HTTPException(
+            429,
+            detail={"code": "RECONCILIATION_RATE_LIMITED"},
+            headers={"Retry-After": str(error.retry_after_seconds)},
+        ) from error
+    except Exception as error:
+        raise HTTPException(
+            503, detail={"code": "RECONCILIATION_RATE_LIMIT_UNAVAILABLE"}
+        ) from error
     refund = await application_service.reconcile_refund(
         refund_id,
         account_id=current.account.id,

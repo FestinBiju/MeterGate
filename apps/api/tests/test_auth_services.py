@@ -493,6 +493,37 @@ async def test_discoverable_login_maps_credential_server_side_and_commits_before
 
 
 @pytest.mark.asyncio
+async def test_reauthentication_rotates_current_session() -> None:
+    account, identity, credential = make_account(), make_identity(), make_credential()
+    service, _, _, _, store, _, _ = build_service(
+        account=account,
+        identity=identity,
+        credential=credential,
+    )
+    first_options = await service.login_options()
+    first = await service.login_verify(
+        AuthCeremonyVerify(
+            challenge_id=first_options.challenge_id,
+            credential=browser_credential(),
+        )
+    )
+    current = await service.resolve_session(first.session_id)
+    reauth_options = await service.login_options()
+    reauthenticated = await service.reauthenticate(
+        current,
+        AuthCeremonyVerify(
+            challenge_id=reauth_options.challenge_id,
+            credential=browser_credential(),
+        ),
+    )
+
+    assert reauthenticated.session_id != first.session_id
+    with pytest.raises(AuthenticationUnauthorizedError):
+        await service.resolve_session(first.session_id)
+    assert (await service.resolve_session(reauthenticated.session_id)).account.id == ACCOUNT_ID
+
+
+@pytest.mark.asyncio
 async def test_login_unknown_wrong_handle_missing_uv_and_counter_regression_fail_closed() -> None:
     unknown, *_ = build_service()
     unknown_options = await unknown.login_options()

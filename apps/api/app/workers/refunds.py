@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import signal
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -17,6 +18,7 @@ from app.providers import RefundProvider
 from app.repositories import RefundOutboxEventRepository
 from app.services.compensations import RefundApplicationService
 from app.services.payments import build_razorpay_payment_provider
+from app.services.worker_health import record_worker_heartbeat
 
 Clock = Callable[[], datetime]
 
@@ -50,6 +52,7 @@ class RefundOutboxWorker:
         self._provider = provider
         self._clock = clock
         self._logger = logger or logging.getLogger(__name__)
+        self._instance_id = f"ref-{secrets.token_urlsafe(12)}"
 
     async def run_once(self) -> RefundWorkerCycle:
         if not self._settings.refunds_enabled or self._provider is None:
@@ -159,6 +162,13 @@ class RefundOutboxWorker:
     async def run_forever(self, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
             result = await self.run_once()
+            await record_worker_heartbeat(
+                self._database,
+                worker_type="refund",
+                instance_id=self._instance_id,
+                successful_work=result.processed,
+                now=self._read_clock(),
+            )
             if result.claimed:
                 continue
             try:

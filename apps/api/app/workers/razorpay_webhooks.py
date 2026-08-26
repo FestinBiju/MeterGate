@@ -7,7 +7,7 @@ import importlib
 import logging
 import re
 import signal
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
@@ -24,6 +24,7 @@ WebhookWorkerRuntimeFactory = Callable[
     [],
     AbstractAsyncContextManager["RazorpayWebhookWorker"],
 ]
+HeartbeatWriter = Callable[[bool], Awaitable[None]]
 
 
 @runtime_checkable
@@ -63,6 +64,7 @@ class RazorpayWebhookWorker:
         block_ms: int = 5_000,
         reclaim_idle_ms: int = 30_000,
         logger: logging.Logger | None = None,
+        heartbeat_writer: HeartbeatWriter | None = None,
     ) -> None:
         if (
             not isinstance(consumer_name, str)
@@ -83,6 +85,7 @@ class RazorpayWebhookWorker:
         self._reclaim_idle_ms = reclaim_idle_ms
         self._logger = logger or logging.getLogger(__name__)
         self._claim_cursor = "0-0"
+        self._heartbeat_writer = heartbeat_writer
 
     async def initialize(self) -> None:
         await self._queue.initialize()
@@ -124,7 +127,9 @@ class RazorpayWebhookWorker:
             raise ValueError("Webhook worker requires an asyncio stop event")
         await self.initialize()
         while not stop_event.is_set():
-            await self.run_once()
+            result = await self.run_once()
+            if self._heartbeat_writer is not None:
+                await self._heartbeat_writer(result.processed > 0)
 
     async def _process(self, message: QueuedWebhookMessage) -> bool:
         try:

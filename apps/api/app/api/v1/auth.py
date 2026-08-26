@@ -103,6 +103,28 @@ async def verify_login(
     return issued.response
 
 
+@router.post("/reauth/options", response_model=AuthCeremonyOptionsResponse)
+async def create_reauthentication_options(
+    current: AuthenticatedMutationDependency,
+    application_service: AuthenticationApplicationDependency,
+) -> AuthCeremonyOptionsResponse:
+    del current
+    return await application_service.login_options()
+
+
+@router.post("/reauth/verify", response_model=AuthSessionResponse)
+async def verify_reauthentication(
+    payload: AuthCeremonyVerify,
+    response: Response,
+    settings: SettingsDependency,
+    current: AuthenticatedMutationDependency,
+    application_service: AuthenticationApplicationDependency,
+) -> AuthSessionResponse:
+    issued = await application_service.reauthenticate(current, payload)
+    _set_session_cookie(response, issued, settings)
+    return issued.response
+
+
 @router.get("/session", response_model=AuthSessionResponse)
 async def get_auth_session(current: CurrentAccountDependency) -> AuthSessionResponse:
     return current.response

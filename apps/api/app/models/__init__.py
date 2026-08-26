@@ -11,6 +11,14 @@ from app.models.entitlement import Entitlement
 from app.models.fulfillment_event import FulfillmentEvent
 from app.models.fulfillment_execution import FulfillmentExecution
 from app.models.merchant import Merchant
+from app.models.operator import (
+    Incident,
+    OperatorAction,
+    OperatorDecision,
+    OperatorRole,
+    RefundDispatchAttempt,
+    WorkerHeartbeat,
+)
 from app.models.passkey_credential import PasskeyCredential
 from app.models.payment_attempt import PaymentAttempt
 from app.models.payment_refund import PaymentRefund
@@ -36,6 +44,12 @@ __all__ = [
     "FulfillmentEvent",
     "FulfillmentExecution",
     "Merchant",
+    "Incident",
+    "OperatorDecision",
+    "OperatorAction",
+    "OperatorRole",
+    "RefundDispatchAttempt",
+    "WorkerHeartbeat",
     "PasskeyCredential",
     "PaymentAttempt",
     "PaymentRefund",

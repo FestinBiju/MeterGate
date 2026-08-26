@@ -288,6 +288,41 @@ class FulfillmentApplicationService:
             input=canonical_input.value,
         )
 
+    async def reconcile_execution(self, execution_id: str) -> FulfillmentOperation:
+        """Retry one existing logical execution through the normal capability path."""
+        execution = await self._executions.get(execution_id)
+        if execution is None:
+            raise EntitlementNotFoundError(
+                "The fulfillment execution was not found",
+                "FULFILLMENT_EXECUTION_NOT_FOUND",
+            )
+        if FulfillmentExecutionState(execution.execution_state) not in {
+            FulfillmentExecutionState.RETRYABLE_FAILURE,
+            FulfillmentExecutionState.RECONCILIATION_REQUIRED,
+        }:
+            raise FulfillmentConflictError(
+                "The fulfillment execution is not recoverable",
+                "FULFILLMENT_RECONCILIATION_NOT_ALLOWED",
+            )
+        entitlement = await self._entitlements.get(execution.entitlement_id)
+        # The quote is addressed by the entitlement, never by operator input.
+        quote = await self._quotes.get(entitlement.quote_id) if entitlement is not None else None
+        merchant = await self._merchants.get(execution.merchant_id)
+        service = await self._services.get(execution.service_id)
+        if entitlement is None or quote is None or merchant is None or service is None:
+            raise FulfillmentIntegrityError(
+                "The fulfillment recovery binding is incomplete",
+                "FULFILLMENT_INTEGRITY_FAILED",
+            )
+        issued = self._capabilities.issue(entitlement)
+        return await self.execute(
+            merchant_slug=merchant.slug,
+            service_slug=service.slug,
+            input_value=quote.input,
+            token=issued.token,
+            allow_reconciliation=True,
+        )
+
     async def execute(
         self,
         *,
@@ -295,6 +330,7 @@ class FulfillmentApplicationService:
         service_slug: str,
         input_value: object,
         token: str,
+        allow_reconciliation: bool = False,
     ) -> FulfillmentOperation:
         claims = self._capabilities.verify(token)
         entitlement = await self._entitlements.get(claims.entitlement_id)
@@ -391,6 +427,7 @@ class FulfillmentApplicationService:
         claimed = await self._claim_execution(
             entitlement,
             maximum_attempts=maximum_attempts,
+            allow_reconciliation=allow_reconciliation,
         )
         if isinstance(claimed, FulfillmentResult):
             return FulfillmentOperation(
@@ -680,6 +717,7 @@ class FulfillmentApplicationService:
         entitlement: Entitlement,
         *,
         maximum_attempts: int,
+        allow_reconciliation: bool = False,
     ) -> tuple[FulfillmentExecution, bool] | FulfillmentResult:
         execution = await self._executions.get_by_entitlement_id_for_update(entitlement.id)
         if execution is None:
@@ -746,7 +784,7 @@ class FulfillmentApplicationService:
                 "Fulfillment failed permanently and requires compensation",
                 "FULFILLMENT_COMPENSATION_REQUIRED",
             )
-        if state is FulfillmentExecutionState.RECONCILIATION_REQUIRED:
+        if state is FulfillmentExecutionState.RECONCILIATION_REQUIRED and not allow_reconciliation:
             raise FulfillmentIntegrityError(
                 "Fulfillment requires reconciliation",
                 "FULFILLMENT_RECONCILIATION_REQUIRED",

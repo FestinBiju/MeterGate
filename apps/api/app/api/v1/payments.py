@@ -1,15 +1,17 @@
 """Protected buyer payment routes and public signed Razorpay webhook ingress."""
 
-from fastapi import APIRouter, Request, Response, status
+from fastapi import APIRouter, HTTPException, Request, Response, status
 
 from app.api.v1.dependencies import (
     AuthenticatedMutationDependency,
     CurrentAccountDependency,
+    OperatorRateLimiterDependency,
     PaymentApplicationDependency,
     RazorpayWebhookIngressDependency,
     SettingsDependency,
     _single_header,
 )
+from app.cache.operator import OperatorRateLimitExceeded
 from app.domain.exceptions import PaymentVerificationError
 from app.schemas.payments import (
     CheckoutVerificationCreate,
@@ -95,7 +97,26 @@ async def reconcile_payment_transaction(
     response: Response,
     application_service: PaymentApplicationDependency,
     current: AuthenticatedMutationDependency,
+    limiter: OperatorRateLimiterDependency,
+    settings: SettingsDependency,
 ) -> PaymentTransactionResponse:
+    try:
+        await limiter.require(
+            account_id=current.account.id,
+            action="buyer-payment-reconcile",
+            limit=settings.operator_reconciliation_rate_limit,
+            window_seconds=settings.operator_rate_limit_window_seconds,
+        )
+    except OperatorRateLimitExceeded as error:
+        raise HTTPException(
+            429,
+            detail={"code": "RECONCILIATION_RATE_LIMITED"},
+            headers={"Retry-After": str(error.retry_after_seconds)},
+        ) from error
+    except Exception as error:
+        raise HTTPException(
+            503, detail={"code": "RECONCILIATION_RATE_LIMIT_UNAVAILABLE"}
+        ) from error
     result = await application_service.reconcile_transaction(
         transaction_id,
         account_id=current.account.id,

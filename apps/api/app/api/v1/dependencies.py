@@ -1,14 +1,17 @@
 """Request-scoped application-service and authenticated-principal dependencies."""
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hmac import compare_digest
 from typing import Annotated
 
 from fastapi import Depends, Request, Response
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache.approval_challenges import ChallengeStore
 from app.cache.auth import AuthStore
+from app.cache.operator import OperatorRateLimiter
 from app.cache.payment_webhooks import WebhookQueuePublisher
 from app.core.config import Settings
 from app.db.session import get_session
@@ -17,6 +20,7 @@ from app.domain.exceptions import (
     AuthenticationForbiddenError,
     AuthenticationUnauthorizedError,
 )
+from app.models import OperatorRole
 from app.providers import PaymentProvider, RefundProvider
 from app.providers.fulfillment import FulfillmentProvider, UnavailableFulfillmentProvider
 from app.repositories.accounts import AccountRepository
@@ -84,6 +88,19 @@ def get_auth_store(request: Request) -> AuthStore:
 
 
 AuthStoreDependency = Annotated[AuthStore, Depends(get_auth_store)]
+
+
+def get_operator_rate_limiter(request: Request) -> OperatorRateLimiter:
+    limiter = getattr(request.app.state, "operator_rate_limiter", None)
+    if not isinstance(limiter, OperatorRateLimiter):
+        raise RuntimeError("Operator rate limiting is unavailable")
+    return limiter
+
+
+OperatorRateLimiterDependency = Annotated[
+    OperatorRateLimiter,
+    Depends(get_operator_rate_limiter),
+]
 
 
 def get_payment_provider(request: Request) -> PaymentProvider | None:
@@ -485,6 +502,60 @@ RecentAuthenticationDependency = Annotated[
     ResolvedAuthSession,
     Depends(require_recent_authentication),
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorContext:
+    account_id: str
+    role: str
+
+
+async def require_operator(
+    current: CurrentAccountDependency,
+    session: SessionDependency,
+) -> OperatorContext:
+    assignment = await session.scalar(
+        select(OperatorRole).where(
+            OperatorRole.account_id == current.account.id,
+            OperatorRole.status == "active",
+        )
+    )
+    if assignment is None:
+        raise AuthenticationForbiddenError(
+            "An active operator role is required", "OPERATOR_ROLE_REQUIRED"
+        )
+    return OperatorContext(account_id=current.account.id, role=assignment.role)
+
+
+OperatorDependency = Annotated[OperatorContext, Depends(require_operator)]
+
+
+async def require_recent_operator(
+    current: RecentAuthenticationDependency,
+    session: SessionDependency,
+    settings: SettingsDependency,
+) -> OperatorContext:
+    if datetime.now(UTC) - current.state.authenticated_at.astimezone(UTC) > timedelta(
+        seconds=settings.operator_reauth_max_age_seconds
+    ):
+        raise AuthenticationForbiddenError(
+            "Recent operator passkey authentication is required",
+            "OPERATOR_REAUTH_REQUIRED",
+        )
+    assignment = await session.scalar(
+        select(OperatorRole).where(
+            OperatorRole.account_id == current.account.id,
+            OperatorRole.status == "active",
+        )
+    )
+    if assignment is None:
+        raise AuthenticationForbiddenError(
+            "An active operator role is required", "OPERATOR_ROLE_REQUIRED"
+        )
+    return OperatorContext(account_id=current.account.id, role=assignment.role)
+
+
+RecentOperatorDependency = Annotated[OperatorContext, Depends(require_recent_operator)]
 
 
 MerchantApplicationDependency = Annotated[

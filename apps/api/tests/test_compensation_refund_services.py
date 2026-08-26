@@ -1877,7 +1877,8 @@ def test_postgresql_completed_case_requires_exact_processed_refund_aggregate(
                 text(
                     """
                     UPDATE compensation_cases
-                       SET decision_state = 'completed', closed_at = :closed_at, revision = 3
+                           SET decision_state = 'completed',
+                               closed_at = GREATEST(:closed_at, decided_at), revision = 3
                      WHERE id = :case_id
                     """
                 ),

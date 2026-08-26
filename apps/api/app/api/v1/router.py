@@ -9,6 +9,7 @@ from app.api.v1.catalog import router as catalog_router
 from app.api.v1.compensations import router as compensations_router
 from app.api.v1.entitlements import router as entitlements_router
 from app.api.v1.merchants import router as merchants_router
+from app.api.v1.operator import router as operator_router
 from app.api.v1.payments import router as payments_router
 from app.api.v1.policies import router as policies_router
 from app.api.v1.policy_evaluations import router as policy_evaluations_router
@@ -30,3 +31,4 @@ router.include_router(payments_router)
 router.include_router(compensations_router)
 router.include_router(entitlements_router)
 router.include_router(resources_router)
+router.include_router(operator_router)

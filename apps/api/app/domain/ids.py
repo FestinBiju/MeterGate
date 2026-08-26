@@ -18,6 +18,12 @@ IdPrefix = Literal[
     "fve_",
     "mrc_",
     "obx_",
+    "opr_",
+    "opd_",
+    "opa_",
+    "inc_",
+    "rda_",
+    "whb_",
     "pmt_",
     "pkc_",
     "pol_",
@@ -44,6 +50,12 @@ FULFILLMENT_EXECUTION_ID_PREFIX: IdPrefix = "ful_"
 FULFILLMENT_EVENT_ID_PREFIX: IdPrefix = "fve_"
 MERCHANT_ID_PREFIX: IdPrefix = "mrc_"
 COMMERCE_OUTBOX_EVENT_ID_PREFIX: IdPrefix = "obx_"
+OPERATOR_ROLE_ID_PREFIX: IdPrefix = "opr_"
+OPERATOR_DECISION_ID_PREFIX: IdPrefix = "opd_"
+OPERATOR_ACTION_ID_PREFIX: IdPrefix = "opa_"
+INCIDENT_ID_PREFIX: IdPrefix = "inc_"
+REFUND_DISPATCH_ATTEMPT_ID_PREFIX: IdPrefix = "rda_"
+WORKER_HEARTBEAT_ID_PREFIX: IdPrefix = "whb_"
 PAYMENT_ATTEMPT_ID_PREFIX: IdPrefix = "pmt_"
 PASSKEY_CREDENTIAL_ID_PREFIX: IdPrefix = "pkc_"
 POLICY_ID_PREFIX: IdPrefix = "pol_"
@@ -81,6 +93,12 @@ def generate_id(prefix: IdPrefix) -> str:
         FULFILLMENT_EVENT_ID_PREFIX,
         MERCHANT_ID_PREFIX,
         COMMERCE_OUTBOX_EVENT_ID_PREFIX,
+        OPERATOR_ROLE_ID_PREFIX,
+        OPERATOR_DECISION_ID_PREFIX,
+        OPERATOR_ACTION_ID_PREFIX,
+        INCIDENT_ID_PREFIX,
+        REFUND_DISPATCH_ATTEMPT_ID_PREFIX,
+        WORKER_HEARTBEAT_ID_PREFIX,
         PAYMENT_ATTEMPT_ID_PREFIX,
         PASSKEY_CREDENTIAL_ID_PREFIX,
         POLICY_ID_PREFIX,
@@ -147,6 +165,30 @@ def new_merchant_id() -> str:
 
 def new_commerce_outbox_event_id() -> str:
     return generate_id(COMMERCE_OUTBOX_EVENT_ID_PREFIX)
+
+
+def new_operator_role_id() -> str:
+    return generate_id(OPERATOR_ROLE_ID_PREFIX)
+
+
+def new_operator_decision_id() -> str:
+    return generate_id(OPERATOR_DECISION_ID_PREFIX)
+
+
+def new_operator_action_id() -> str:
+    return generate_id(OPERATOR_ACTION_ID_PREFIX)
+
+
+def new_incident_id() -> str:
+    return generate_id(INCIDENT_ID_PREFIX)
+
+
+def new_refund_dispatch_attempt_id() -> str:
+    return generate_id(REFUND_DISPATCH_ATTEMPT_ID_PREFIX)
+
+
+def new_worker_heartbeat_id() -> str:
+    return generate_id(WORKER_HEARTBEAT_ID_PREFIX)
 
 
 def new_payment_attempt_id() -> str:

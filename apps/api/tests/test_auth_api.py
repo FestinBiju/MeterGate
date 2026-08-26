@@ -116,6 +116,11 @@ class StubAuthenticationService:
         assert payload.challenge_id == CHALLENGE_ID
         return IssuedAuthSession(session_id=SESSION_ID, response=self.resolved.response)
 
+    async def reauthenticate(self, current: Any, payload: Any) -> IssuedAuthSession:
+        assert current is self.resolved
+        assert payload.challenge_id == CHALLENGE_ID
+        return IssuedAuthSession(session_id=SESSION_ID, response=self.resolved.response)
+
     async def resolve_session(self, session_id: str) -> Any:
         self.resolved_session_ids.append(session_id)
         if self.error is not None:
@@ -186,6 +191,8 @@ def test_auth_routes_are_explicit_and_never_expose_the_session_id(
     assert set(paths["/api/v1/auth/signup/verify"]) == {"post"}
     assert set(paths["/api/v1/auth/login/options"]) == {"post"}
     assert set(paths["/api/v1/auth/login/verify"]) == {"post"}
+    assert set(paths["/api/v1/auth/reauth/options"]) == {"post"}
+    assert set(paths["/api/v1/auth/reauth/verify"]) == {"post"}
     assert set(paths["/api/v1/auth/session"]) == {"get"}
     assert set(paths["/api/v1/auth/logout"]) == {"post"}
     assert set(paths["/api/v1/auth/passkeys"]) == {"get"}
@@ -201,6 +208,41 @@ def test_auth_routes_are_explicit_and_never_expose_the_session_id(
     assert response.headers["cache-control"] == "private, no-store"
     assert response.json()["reason_code"] == "AUTH_LOGGED_IN"
     assert response.json()["auth_method"] == "passkey"
+
+
+def test_reauthentication_requires_existing_csrf_origin_and_rotates_cookie(
+    make_client: Callable[..., TestClient],
+) -> None:
+    client, _ = _client(make_client)
+    _authenticate(client)
+
+    missing_csrf = client.post(
+        "/api/v1/auth/reauth/options",
+        headers={"Origin": ORIGIN},
+        json={},
+    )
+    wrong_origin = client.post(
+        "/api/v1/auth/reauth/options",
+        headers={"Origin": "https://attacker.example", "X-CSRF-Token": CSRF_TOKEN},
+        json={},
+    )
+    options = client.post(
+        "/api/v1/auth/reauth/options",
+        headers={"Origin": ORIGIN, "X-CSRF-Token": CSRF_TOKEN},
+        json={},
+    )
+    verified = client.post(
+        "/api/v1/auth/reauth/verify",
+        headers={"Origin": ORIGIN, "X-CSRF-Token": CSRF_TOKEN},
+        json={"challenge_id": CHALLENGE_ID, "credential": _credential_json()},
+    )
+
+    assert missing_csrf.status_code == 403
+    assert wrong_origin.status_code == 403
+    assert options.status_code == 200
+    assert verified.status_code == 200
+    assert verified.json()["reason_code"] == "AUTH_LOGGED_IN"
+    assert SESSION_ID not in verified.text
 
 
 def test_signup_and_login_ceremonies_fail_closed_without_an_allowed_origin(

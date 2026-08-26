@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 import socket
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -118,6 +119,7 @@ from app.services.compensations import (
     RefundApplicationService,
 )
 from app.services.policy_evaluations import PolicyEvaluationApplicationService
+from app.services.worker_health import record_worker_heartbeat
 from app.workers.razorpay_webhooks import RazorpayWebhookWorker
 
 Clock = Callable[[], datetime]
@@ -759,6 +761,39 @@ class PaymentApplicationService:
             actor_type=PaymentEventActorType.ACCOUNT,
             actor_id=account_id,
             idempotency_key=f"reconcile:{transaction.id}:{self._read_clock().isoformat()}",
+        )
+        return PaymentOperationResult(
+            await self._response(transaction),
+            self._pending_status(transaction),
+        )
+
+    async def reconcile_transaction_for_operator(
+        self,
+        transaction_id: str,
+        *,
+        operator_account_id: str,
+    ) -> PaymentOperationResult:
+        """Reconcile provider evidence without weakening buyer ownership checks."""
+        self._require_enabled()
+        transaction = await self._transactions.get_for_update(transaction_id)
+        if transaction is None:
+            raise PaymentNotFoundError(
+                f"Payment transaction '{transaction_id}' was not found",
+                "PAYMENT_TRANSACTION_NOT_FOUND",
+            )
+        self._verify_transaction_integrity(transaction)
+        await self._session.commit()
+        if transaction.provider_order_id is None:
+            transaction = await self._reconcile_order_creation(transaction.id)
+            if transaction.provider_order_id is None:
+                return PaymentOperationResult(await self._response(transaction), 202)
+        transaction = await self._fetch_and_apply_order(
+            transaction.id,
+            actor_type=PaymentEventActorType.SYSTEM,
+            actor_id=operator_account_id,
+            idempotency_key=(
+                f"operator-reconcile:{transaction.id}:{self._read_clock().isoformat()}"
+            ),
         )
         return PaymentOperationResult(
             await self._response(transaction),
@@ -2768,10 +2803,22 @@ async def build_razorpay_webhook_worker_runtime() -> AsyncIterator[RazorpayWebho
     queue = RedisPaymentWebhookQueue(redis_client)
     processor = DatabaseWebhookEventProcessor(database, provider, settings)
     consumer_name = f"metergate-{socket.gethostname()}-{os.getpid()}"
+    heartbeat_instance_id = f"whk-{secrets.token_urlsafe(12)}"
+
+    async def heartbeat(successful_work: bool) -> None:
+        await record_worker_heartbeat(
+            database,
+            worker_type="razorpay_webhook",
+            instance_id=heartbeat_instance_id,
+            successful_work=successful_work,
+            now=datetime.now(UTC),
+        )
+
     worker = RazorpayWebhookWorker(
         queue=queue,
         processor=processor,
         consumer_name=consumer_name[:128],
+        heartbeat_writer=heartbeat,
     )
     try:
         yield worker

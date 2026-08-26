@@ -45,6 +45,16 @@ class Settings(BaseSettings):
     authorization_ttl_seconds: int = Field(default=120, ge=1, le=600)
     auth_session_ttl_seconds: int = Field(default=3_600, ge=60, le=86_400)
     auth_reauth_max_age_seconds: int = Field(default=300, ge=1, le=3_600)
+    operator_reauth_max_age_seconds: int = Field(default=180, ge=1, le=3_600)
+    outbox_stuck_seconds: int = Field(default=300, ge=30, le=86_400)
+    refund_pending_alert_seconds: int = Field(default=300, ge=30, le=86_400)
+    refund_uncertain_alert_seconds: int = Field(default=60, ge=10, le=86_400)
+    reconciliation_alert_seconds: int = Field(default=60, ge=10, le=86_400)
+    webhook_lag_alert_seconds: int = Field(default=120, ge=10, le=86_400)
+    worker_heartbeat_stale_seconds: int = Field(default=30, ge=5, le=3_600)
+    operator_mutation_rate_limit: int = Field(default=10, ge=1, le=100)
+    operator_reconciliation_rate_limit: int = Field(default=5, ge=1, le=100)
+    operator_rate_limit_window_seconds: int = Field(default=60, ge=10, le=3_600)
     auth_cookie_name: str = Field(default="metergate_session", min_length=1, max_length=128)
     auth_cookie_secure: bool = False
     auth_cookie_samesite: Literal["lax", "strict", "none"] = "lax"
@@ -292,6 +302,10 @@ class Settings(BaseSettings):
                 )
         if self.auth_reauth_max_age_seconds > self.auth_session_ttl_seconds:
             raise ValueError("AUTH_REAUTH_MAX_AGE_SECONDS cannot exceed AUTH_SESSION_TTL_SECONDS")
+        if self.operator_reauth_max_age_seconds > self.auth_reauth_max_age_seconds:
+            raise ValueError(
+                "OPERATOR_REAUTH_MAX_AGE_SECONDS cannot exceed AUTH_REAUTH_MAX_AGE_SECONDS"
+            )
         if self.auth_cookie_samesite == "none" and not self.auth_cookie_secure:
             raise ValueError("AUTH_COOKIE_SAMESITE=none requires AUTH_COOKIE_SECURE=true")
         if self.auth_cookie_name.startswith("__Host-") and (

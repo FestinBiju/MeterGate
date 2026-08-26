@@ -30,6 +30,10 @@ def test_migrations_upgrade_and_downgrade_with_injected_connection() -> None:
             "fulfillment_events",
             "fulfillment_executions",
             "merchants",
+            "incidents",
+            "operator_decisions",
+            "operator_actions",
+            "operator_roles",
             "passkey_credentials",
             "payment_attempts",
             "payment_refunds",
@@ -40,8 +44,10 @@ def test_migrations_upgrade_and_downgrade_with_injected_connection() -> None:
             "quotes",
             "razorpay_webhook_events",
             "refund_outbox_events",
+            "refund_dispatch_attempts",
             "service_fulfillment_configs",
             "services",
+            "worker_heartbeats",
         }
         account_columns = {column["name"] for column in inspector.get_columns("accounts")}
         assert account_columns == {

@@ -48,6 +48,7 @@ from app.models import (
     CompensationEvent,
     FulfillmentExecution,
     PaymentRefund,
+    RefundDispatchAttempt,
     RefundOutboxEvent,
 )
 from app.providers import (
@@ -581,6 +582,7 @@ class RefundApplicationService:
                 )
 
         if evidence is None:
+            dispatch = await self._begin_dispatch(refund.id)
             request = CreateProviderRefund(
                 payment_id=refund.provider_payment_id,
                 amount=refund.amount,
@@ -626,6 +628,7 @@ class RefundApplicationService:
                     "Razorpay returned mismatched refund creation evidence",
                     "REFUND_PROVIDER_RESPONSE_MISMATCH",
                 ) from error
+            await self._finish_dispatch(dispatch.id, evidence.id, "provider_response_received")
 
         applied = await self.apply_provider_evidence(
             refund.id,
@@ -987,7 +990,10 @@ class RefundApplicationService:
                     "REFUND_CASE_STATE_CONFLICT",
                 )
             case.decision_state = CompensationDecisionState.COMPLETED
-            case.closed_at = now
+            # The provider observation clock may be injected and can precede
+            # a database server timestamp by a small amount. Closure must
+            # never predate the durable decision evidence.
+            case.closed_at = max(now, self._as_utc(case.decided_at))
             case.revision += 1
         sequence = await self._next_sequence(case.id)
         events: list[CompensationEvent] = []
@@ -1266,6 +1272,49 @@ class RefundApplicationService:
         await self._session.commit()
         await self._session.refresh(refund)
         return refund, True
+
+    async def _begin_dispatch(self, refund_id: str) -> RefundDispatchAttempt:
+        """Commit one stable intent before crossing the provider boundary."""
+        existing = await self._session.scalar(
+            select(RefundDispatchAttempt).where(RefundDispatchAttempt.refund_id == refund_id)
+        )
+        now = self._read_clock()
+        if existing is None:
+            existing = RefundDispatchAttempt(
+                refund_id=refund_id,
+                dispatch_generation=1,
+                provider_idempotency_key=refund_id,
+                state="provider_call_started",
+                intent_committed_at=now,
+                provider_call_started_at=now,
+            )
+            self._session.add(existing)
+        elif existing.provider_idempotency_key != refund_id:
+            raise CompensationIntegrityError(
+                "Refund dispatch identity conflicts with its reservation",
+                "REFUND_DISPATCH_IDENTITY_MISMATCH",
+            )
+        elif existing.provider_call_started_at is None:
+            existing.state = "provider_call_started"
+            existing.provider_call_started_at = now
+        await self._session.commit()
+        await self._session.refresh(existing)
+        return existing
+
+    async def _finish_dispatch(
+        self, dispatch_id: str, provider_refund_id: str, outcome: str
+    ) -> None:
+        dispatch = await self._session.get(RefundDispatchAttempt, dispatch_id)
+        if dispatch is None:
+            raise CompensationIntegrityError(
+                "Refund dispatch evidence disappeared",
+                "REFUND_DISPATCH_EVIDENCE_MISSING",
+            )
+        dispatch.state = "provider_call_finished"
+        dispatch.provider_call_finished_at = self._read_clock()
+        dispatch.provider_refund_id = provider_refund_id
+        dispatch.outcome = outcome
+        await self._session.commit()
 
     async def _find_existing_provider_refund(
         self, provider: RefundProvider, refund: PaymentRefund

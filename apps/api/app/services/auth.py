@@ -292,6 +292,28 @@ class AuthenticationApplicationService:
             authenticated_at=authenticated_at,
         )
 
+    async def reauthenticate(
+        self,
+        current: ResolvedAuthSession,
+        payload: AuthCeremonyVerify,
+    ) -> IssuedAuthSession:
+        """Rotate one session after a fresh passkey proof for the same account."""
+        issued = await self.login_verify(payload)
+        if issued.response.account.id != current.account.id:
+            await self._auth_store.revoke_session(issued.session_id)
+            raise AuthenticationUnauthorizedError(
+                "Reauthentication must use a passkey owned by the current account",
+                "AUTH_REAUTH_ACCOUNT_MISMATCH",
+            )
+
+        await self._auth_store.revoke_session(current.state.session_id)
+        logger.info(
+            "PASSKEY_REAUTH_SUCCESS account_id=%s approval_identity_id=%s",
+            current.account.id,
+            current.approval_identity.id,
+        )
+        return issued
+
     async def resolve_session(self, session_id: str) -> ResolvedAuthSession:
         """Resolve one opaque Redis session into a currently active DB principal."""
         try:

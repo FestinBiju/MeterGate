@@ -30,7 +30,18 @@ The goal is to help merchants become **discoverable, understandable, payable, an
 
 ## Current Milestone
 
-Milestone 8 closes the verified commerce loop after fulfillment failure. The Milestone 7 payment, entitlement, HTTP `402`, capability, and real OrbitIntel fulfillment boundaries remain intact; a permanent paid failure with no delivered value can now create an audited `cmp_…` compensation case and a backend-controlled Razorpay Test Mode `rfd_…` refund flow. A captured payment remains historical paid evidence rather than being rewritten as unpaid. Commerce completes only through trusted fulfillment success or trusted provider `processed` refund evidence, and value stays quarantined while compensation or refund state is ambiguous. Test Mode does not move real money. Subscriptions, MCP, and autonomous-agent orchestration remain outside this milestone.
+Milestone 9 completes the operator control plane for the verified commerce loop. The Milestone 7 payment, entitlement, HTTP `402`, capability, and real OrbitIntel fulfillment boundaries and the Milestone 8 compensation/refund boundary remain intact. Operators can inspect authoritative evidence, acknowledge evidence-bound incidents, and invoke bounded legal recovery services, but cannot rewrite captured payment history or force commerce state. Commerce completes only through trusted fulfillment success or trusted provider `processed` refund evidence, and value stays quarantined while compensation or refund state is ambiguous. Test Mode does not move real money. Subscriptions, MCP, and autonomous-agent orchestration remain outside this milestone.
+
+## Operator Control Plane
+
+Milestone 9 adds explicit PostgreSQL-backed `operator` and `admin` assignments, recent-passkey gates, immutable operator decisions, deterministic work and alert projections, incidents, refund dispatch intents, worker health, operational metrics, and recovery runbooks. `/operator` uses these server-authoritative APIs; normal buyers receive `403`, and frontend route hiding is not authority.
+
+Bootstrap a local operator explicitly from `apps/api` with `uv run python -m app.scripts.grant_operator acct_… --confirm`. There is no public role-grant endpoint. Manual compensation approval always uses the captured server-derived amount. Operators can invoke bounded domain reconciliation, but cannot force paid/refunded/fulfilled state or directly clear quarantine. Runbooks and forbidden actions are in [`docs/runbooks`](docs/runbooks/).
+
+The dashboard's **Reauthenticate with Passkey** control rotates the current
+server-side session only after a fresh passkey proof for the same account. This
+refreshes the bounded high-risk action window without requiring an operator to
+sign out or weakening Origin and CSRF enforcement.
 
 ## Domain Model
 
