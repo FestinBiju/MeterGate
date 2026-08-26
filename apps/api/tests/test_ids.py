@@ -5,7 +5,8 @@ import pytest
 from app.domain import ids
 
 ID_PATTERN = re.compile(
-    r"^(aid_|ach_|aut_|mrc_|pkc_|pol_|pye_|qte_|svc_)[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    r"^(aid_|ach_|aut_|mrc_|pkc_|pmt_|pol_|pte_|pye_|qte_|rwe_|svc_|txn_)"
+    r"[0-7][0-9A-HJKMNP-TV-Z]{25}$"
 )
 ACCOUNT_ID_PATTERN = re.compile(r"^acct_[0-7][0-9A-HJKMNP-TV-Z]{25}$")
 
@@ -17,11 +18,15 @@ def test_domain_ids_have_expected_prefix_length_and_alphabet() -> None:
         ids.new_approval_challenge_id(),
         ids.new_authorization_id(),
         ids.new_merchant_id(),
+        ids.new_payment_attempt_id(),
         ids.new_passkey_credential_id(),
         ids.new_policy_id(),
+        ids.new_payment_transaction_event_id(),
         ids.new_policy_evaluation_id(),
         ids.new_quote_id(),
+        ids.new_razorpay_webhook_event_id(),
         ids.new_service_id(),
+        ids.new_payment_transaction_id(),
     )
 
     assert len(account_id) == 31

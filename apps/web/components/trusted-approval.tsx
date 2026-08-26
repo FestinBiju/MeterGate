@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { useAccountSession } from "@/components/account-session";
+import { StandardCheckout } from "@/components/standard-checkout";
 import { ApiRequestFailure } from "@/lib/api-client";
 import {
   getPasskeyCredential,
@@ -54,7 +55,9 @@ type Authorization = {
   id: string;
   state: "active" | "expired";
   subject_ref: string;
+  merchantId: string;
   merchantName: string;
+  serviceId: string;
   serviceName: string;
   amount: number;
   currency: string;
@@ -258,18 +261,30 @@ function entityName(
   return safeMessage(nested);
 }
 
+function entityId(
+  value: Record<string, unknown>,
+  field: "merchant" | "service",
+): string | null {
+  const nested = value[field];
+  return isRecord(nested) && isNonEmptyString(nested.id) ? nested.id : null;
+}
+
 function parseAuthorization(value: unknown): Authorization | null {
   if (!isRecord(value)) {
     return null;
   }
 
+  const merchantId = entityId(value, "merchant");
   const merchantName = entityName(value, "merchant");
+  const serviceId = entityId(value, "service");
   const serviceName = entityName(value, "service");
   if (
     !isNonEmptyString(value.id) ||
     (value.state !== "active" && value.state !== "expired") ||
     !isNonEmptyString(value.subject_ref) ||
+    !merchantId ||
     !merchantName ||
+    !serviceId ||
     !serviceName ||
     typeof value.amount !== "number" ||
     !Number.isSafeInteger(value.amount) ||
@@ -291,7 +306,9 @@ function parseAuthorization(value: unknown): Authorization | null {
     id: value.id,
     state: value.state,
     subject_ref: value.subject_ref,
+    merchantId,
     merchantName,
+    serviceId,
     serviceName,
     amount: value.amount,
     currency: value.currency,
@@ -559,7 +576,8 @@ function AuthorizationPanel({ authorization }: { authorization: Authorization })
       </div>
 
       <p className="mt-4 rounded-xl border border-white/[0.08] bg-black/20 px-3 py-2.5 text-xs font-medium leading-5 text-white">
-        No payment has been created or executed yet.
+        This authorization has not moved money. Continue below to create one
+        server-bound Razorpay Test Mode transaction.
       </p>
     </section>
   );
@@ -855,7 +873,15 @@ export function TrustedApproval({
       ) : null}
 
       {approvalFailure ? <FailureNotice failure={approvalFailure} /> : null}
-      {authorization ? <AuthorizationPanel authorization={authorization} /> : null}
+      {authorization ? (
+        <>
+          <AuthorizationPanel authorization={authorization} />
+          <StandardCheckout
+            apiBaseEndpoint={apiBaseEndpoint}
+            authorization={authorization}
+          />
+        </>
+      ) : null}
     </section>
   );
 }

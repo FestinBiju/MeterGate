@@ -3,6 +3,7 @@
 from datetime import datetime
 
 from sqlalchemy import inspect as sqlalchemy_inspect
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import PasskeyCredential, PurchaseAuthorization
@@ -61,3 +62,15 @@ class PurchaseAuthorizationRepository:
 
     async def get(self, authorization_id: str) -> PurchaseAuthorization | None:
         return await self._session.get(PurchaseAuthorization, authorization_id)
+
+    async def get_for_update(
+        self,
+        authorization_id: str,
+    ) -> PurchaseAuthorization | None:
+        result = await self._session.scalars(
+            select(PurchaseAuthorization)
+            .where(PurchaseAuthorization.id == authorization_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return result.one_or_none()

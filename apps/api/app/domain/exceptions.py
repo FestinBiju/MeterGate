@@ -71,6 +71,46 @@ class ApprovalIntegrityError(ApprovalError):
     """Immutable approval evidence failed its integrity check."""
 
 
+class PaymentError(DomainError):
+    """Fail-closed payment-gate failure with a stable public code."""
+
+    def __init__(self, detail: str, reason_code: str) -> None:
+        self.reason_code = reason_code
+        super().__init__(detail)
+
+
+class PaymentNotFoundError(PaymentError):
+    """A payment authorization or transaction could not be found."""
+
+
+class PaymentExpiredError(PaymentError):
+    """A new transaction cannot be claimed from an expired authorization."""
+
+
+class PaymentVerificationError(PaymentError):
+    """Untrusted checkout or webhook evidence failed verification."""
+
+
+class PaymentConflictError(PaymentError):
+    """Payment state conflicts with the requested operation."""
+
+
+class PaymentIntegrityError(PaymentError):
+    """Stored or provider payment evidence failed an integrity check."""
+
+
+class PaymentProviderError(PaymentError):
+    """Razorpay rejected a request or returned an invalid response."""
+
+
+class PaymentUnavailableError(PaymentError):
+    """Payment processing or its durable queue is unavailable."""
+
+
+class PaymentTimeoutError(PaymentError):
+    """A read-only provider operation exceeded its bounded timeout."""
+
+
 class ResourceNotFoundError(DomainError):
     def __init__(self, resource: str, resource_id: str) -> None:
         self.resource = resource

@@ -24,9 +24,13 @@ def test_migrations_upgrade_and_downgrade_with_injected_connection() -> None:
             "buyer_policies",
             "merchants",
             "passkey_credentials",
+            "payment_attempts",
+            "payment_transaction_events",
+            "payment_transactions",
             "policy_evaluations",
             "purchase_authorizations",
             "quotes",
+            "razorpay_webhook_events",
             "services",
         }
         account_columns = {column["name"] for column in inspector.get_columns("accounts")}
@@ -247,6 +251,176 @@ def test_migrations_upgrade_and_downgrade_with_injected_connection() -> None:
             "quotes": "RESTRICT",
             "services": "RESTRICT",
         }
+
+        transaction_columns = {
+            column["name"] for column in inspector.get_columns("payment_transactions")
+        }
+        assert transaction_columns == {
+            "id",
+            "account_id",
+            "authorization_id",
+            "authorization_hash",
+            "evaluation_id",
+            "policy_id",
+            "policy_hash",
+            "quote_id",
+            "quote_hash",
+            "merchant_id",
+            "service_id",
+            "amount",
+            "currency",
+            "purchase_type",
+            "provider",
+            "provider_receipt",
+            "provider_order_id",
+            "provider_order_status",
+            "transaction_state",
+            "order_creation_attempts",
+            "order_creation_started_at",
+            "order_created_at",
+            "paid_at",
+            "last_reconciled_at",
+            "payment_binding_version",
+            "payment_binding_hash",
+            "revision",
+            "created_at",
+            "updated_at",
+        }
+        assert {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("payment_transactions")
+        } == {
+            "uq_payment_transactions_authorization_id",
+            "uq_payment_transactions_id_provider_order_id",
+            "uq_payment_transactions_payment_binding_hash",
+            "uq_payment_transactions_provider_order_id",
+            "uq_payment_transactions_provider_receipt",
+        }
+        assert {index["name"] for index in inspector.get_indexes("payment_transactions")} >= {
+            "ix_payment_transactions_account_created_at",
+            "ix_payment_transactions_merchant_created_at",
+            "ix_payment_transactions_quote_created_at",
+            "ix_payment_transactions_state_updated_at",
+        }
+        transaction_foreign_keys = {
+            foreign_key["referred_table"]: foreign_key["options"]["ondelete"]
+            for foreign_key in inspector.get_foreign_keys("payment_transactions")
+        }
+        assert transaction_foreign_keys == {
+            "accounts": "RESTRICT",
+            "buyer_policies": "RESTRICT",
+            "merchants": "RESTRICT",
+            "policy_evaluations": "RESTRICT",
+            "purchase_authorizations": "RESTRICT",
+            "quotes": "RESTRICT",
+            "services": "RESTRICT",
+        }
+
+        assert {column["name"] for column in inspector.get_columns("payment_attempts")} == {
+            "id",
+            "transaction_id",
+            "provider",
+            "provider_order_id",
+            "provider_payment_id",
+            "amount",
+            "currency",
+            "provider_status",
+            "method",
+            "captured",
+            "provider_created_at",
+            "first_seen_at",
+            "last_seen_at",
+            "created_at",
+            "updated_at",
+        }
+        attempt_foreign_key = inspector.get_foreign_keys("payment_attempts")[0]
+        assert attempt_foreign_key["referred_table"] == "payment_transactions"
+        assert attempt_foreign_key["constrained_columns"] == [
+            "transaction_id",
+            "provider_order_id",
+        ]
+        assert attempt_foreign_key["options"]["ondelete"] == "RESTRICT"
+        assert {index["name"] for index in inspector.get_indexes("payment_attempts")} >= {
+            "ix_payment_attempts_transaction_first_seen_at",
+            "uq_payment_attempts_one_captured_per_transaction",
+        }
+
+        assert {column["name"] for column in inspector.get_columns("razorpay_webhook_events")} == {
+            "id",
+            "provider_event_id",
+            "provider_event_type",
+            "raw_body_hash",
+            "provider_created_at",
+            "received_at",
+            "processed_at",
+            "processing_status",
+            "processing_reason_code",
+            "provider_order_id",
+            "provider_payment_id",
+            "transaction_id",
+            "created_at",
+        }
+        assert {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("razorpay_webhook_events")
+        } == {"uq_razorpay_webhook_events_provider_event_id"}
+        webhook_foreign_key = inspector.get_foreign_keys("razorpay_webhook_events")[0]
+        assert webhook_foreign_key["referred_table"] == "payment_transactions"
+        assert webhook_foreign_key["options"]["ondelete"] == "RESTRICT"
+
+        assert {
+            column["name"] for column in inspector.get_columns("payment_transaction_events")
+        } == {
+            "id",
+            "transaction_id",
+            "transaction_revision",
+            "event_type",
+            "actor_type",
+            "actor_id",
+            "prior_state",
+            "resulting_state",
+            "reason_code",
+            "metadata",
+            "payment_attempt_id",
+            "source_webhook_event_id",
+            "idempotency_key",
+            "occurred_at",
+            "created_at",
+        }
+        assert {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("payment_transaction_events")
+        } == {
+            "uq_payment_transaction_events_idempotency_key",
+            "uq_payment_transaction_events_source_webhook_event_id",
+            "uq_payment_transaction_events_transaction_revision",
+        }
+        assert {
+            foreign_key["referred_table"]: foreign_key["options"]["ondelete"]
+            for foreign_key in inspector.get_foreign_keys("payment_transaction_events")
+        } == {
+            "payment_attempts": "RESTRICT",
+            "payment_transactions": "RESTRICT",
+            "razorpay_webhook_events": "RESTRICT",
+        }
+
+        command.downgrade(config, "20260825_0005")
+        milestone_six_a_tables = set(inspect(connection).get_table_names())
+        assert {
+            "payment_attempts",
+            "payment_transaction_events",
+            "payment_transactions",
+            "razorpay_webhook_events",
+        }.isdisjoint(milestone_six_a_tables)
+        assert "purchase_authorizations" in milestone_six_a_tables
+
+        command.upgrade(config, "head")
+        assert {
+            "payment_attempts",
+            "payment_transaction_events",
+            "payment_transactions",
+            "razorpay_webhook_events",
+        } <= set(inspect(connection).get_table_names())
 
         command.downgrade(config, "20260825_0004")
         assert set(inspect(connection).get_table_names()) == {

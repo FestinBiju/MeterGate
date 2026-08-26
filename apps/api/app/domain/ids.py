@@ -11,11 +11,15 @@ IdPrefix = Literal[
     "ach_",
     "aut_",
     "mrc_",
+    "pmt_",
     "pkc_",
     "pol_",
+    "pte_",
     "pye_",
     "qte_",
+    "rwe_",
     "svc_",
+    "txn_",
 ]
 
 ACCOUNT_ID_PREFIX: IdPrefix = "acct_"
@@ -23,11 +27,15 @@ APPROVAL_IDENTITY_ID_PREFIX: IdPrefix = "aid_"
 APPROVAL_CHALLENGE_ID_PREFIX: IdPrefix = "ach_"
 AUTHORIZATION_ID_PREFIX: IdPrefix = "aut_"
 MERCHANT_ID_PREFIX: IdPrefix = "mrc_"
+PAYMENT_ATTEMPT_ID_PREFIX: IdPrefix = "pmt_"
 PASSKEY_CREDENTIAL_ID_PREFIX: IdPrefix = "pkc_"
 POLICY_ID_PREFIX: IdPrefix = "pol_"
+PAYMENT_TRANSACTION_EVENT_ID_PREFIX: IdPrefix = "pte_"
 POLICY_EVALUATION_ID_PREFIX: IdPrefix = "pye_"
 QUOTE_ID_PREFIX: IdPrefix = "qte_"
+RAZORPAY_WEBHOOK_EVENT_ID_PREFIX: IdPrefix = "rwe_"
 SERVICE_ID_PREFIX: IdPrefix = "svc_"
+PAYMENT_TRANSACTION_ID_PREFIX: IdPrefix = "txn_"
 
 _CROCKFORD_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _ENCODED_LENGTH = 26
@@ -46,11 +54,15 @@ def generate_id(prefix: IdPrefix) -> str:
         APPROVAL_CHALLENGE_ID_PREFIX,
         AUTHORIZATION_ID_PREFIX,
         MERCHANT_ID_PREFIX,
+        PAYMENT_ATTEMPT_ID_PREFIX,
         PASSKEY_CREDENTIAL_ID_PREFIX,
         POLICY_ID_PREFIX,
+        PAYMENT_TRANSACTION_EVENT_ID_PREFIX,
         POLICY_EVALUATION_ID_PREFIX,
         QUOTE_ID_PREFIX,
+        RAZORPAY_WEBHOOK_EVENT_ID_PREFIX,
         SERVICE_ID_PREFIX,
+        PAYMENT_TRANSACTION_ID_PREFIX,
     }:
         raise ValueError("Unsupported MeterGate ID prefix")
 
@@ -79,12 +91,20 @@ def new_merchant_id() -> str:
     return generate_id(MERCHANT_ID_PREFIX)
 
 
+def new_payment_attempt_id() -> str:
+    return generate_id(PAYMENT_ATTEMPT_ID_PREFIX)
+
+
 def new_passkey_credential_id() -> str:
     return generate_id(PASSKEY_CREDENTIAL_ID_PREFIX)
 
 
 def new_policy_id() -> str:
     return generate_id(POLICY_ID_PREFIX)
+
+
+def new_payment_transaction_event_id() -> str:
+    return generate_id(PAYMENT_TRANSACTION_EVENT_ID_PREFIX)
 
 
 def new_policy_evaluation_id() -> str:
@@ -95,8 +115,16 @@ def new_quote_id() -> str:
     return generate_id(QUOTE_ID_PREFIX)
 
 
+def new_razorpay_webhook_event_id() -> str:
+    return generate_id(RAZORPAY_WEBHOOK_EVENT_ID_PREFIX)
+
+
 def new_service_id() -> str:
     return generate_id(SERVICE_ID_PREFIX)
+
+
+def new_payment_transaction_id() -> str:
+    return generate_id(PAYMENT_TRANSACTION_ID_PREFIX)
 
 
 def _next_payload() -> tuple[int, int]:

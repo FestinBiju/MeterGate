@@ -10,7 +10,8 @@ from urllib.parse import urlsplit
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-REPOSITORY_ENV_FILE = Path(__file__).resolve().parents[4] / ".env"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
+REPOSITORY_ENV_FILE = REPOSITORY_ROOT / ".env"
 _POSTGRESQL_URL_SCHEMES = frozenset({"postgres", "postgresql", "postgresql+asyncpg"})
 _RP_ID_PATTERN = re.compile(
     r"^(?=.{1,253}\Z)"
@@ -47,6 +48,17 @@ class Settings(BaseSettings):
     auth_cookie_samesite: Literal["lax", "strict", "none"] = "lax"
     auth_cookie_domain: str | None = None
     auth_cookie_path: str = Field(default="/api/v1", min_length=1, max_length=256)
+    payments_enabled: bool = False
+    razorpay_mode: Literal["test"] = "test"
+    razorpay_key_id: SecretStr | None = None
+    razorpay_key_secret: SecretStr | None = None
+    razorpay_webhook_secret: SecretStr | None = None
+    razorpay_webhook_max_age_seconds: int = Field(default=300, ge=60, le=900)
+    razorpay_webhook_max_body_bytes: int = Field(default=262_144, ge=1_024, le=1_048_576)
+    razorpay_connect_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
+    razorpay_read_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+    razorpay_provider_max_concurrency: int = Field(default=4, ge=1, le=32)
+    razorpay_order_recovery_age_seconds: int = Field(default=15, ge=5, le=300)
     database_url: SecretStr
     redis_url: SecretStr
     cors_allowed_origins: Annotated[list[str], NoDecode] = Field(
@@ -240,10 +252,32 @@ class Settings(BaseSettings):
             or self.auth_cookie_path != "/"
         ):
             raise ValueError("__Host- cookies require Secure=true, no Domain, and Path=/")
+        if self.razorpay_key_id is not None:
+            key_id = self.razorpay_key_id.get_secret_value()
+            if re.fullmatch(r"rzp_test_[A-Za-z0-9]{8,64}", key_id) is None:
+                raise ValueError("RAZORPAY_KEY_ID must be a Razorpay Test Mode key")
+        if self.payments_enabled:
+            if self.razorpay_mode != "test":
+                raise ValueError("Only Razorpay Test Mode is supported")
+            if self.razorpay_key_id is None:
+                raise ValueError("RAZORPAY_KEY_ID is required when payments are enabled")
+            for setting_name, secret in (
+                ("RAZORPAY_KEY_SECRET", self.razorpay_key_secret),
+                ("RAZORPAY_WEBHOOK_SECRET", self.razorpay_webhook_secret),
+            ):
+                secret_value = secret.get_secret_value() if secret is not None else ""
+                if (
+                    not 8 <= len(secret_value) <= 256
+                    or secret_value != secret_value.strip()
+                    or "\x00" in secret_value
+                ):
+                    raise ValueError(
+                        f"{setting_name} must contain 8 to 256 valid characters when payments are enabled"
+                    )
         return self
 
 
 @lru_cache
 def get_settings() -> Settings:
-    """Return one validated settings instance per process."""
-    return Settings()  # type: ignore[call-arg]
+    """Return repository-root dotenv settings shared by every runtime entrypoint."""
+    return Settings(_env_file=REPOSITORY_ENV_FILE)  # type: ignore[call-arg]

@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache.approval_challenges import ChallengeStore
 from app.cache.auth import AuthStore
+from app.cache.payment_webhooks import WebhookQueuePublisher
 from app.core.config import Settings
 from app.db.session import get_session
 from app.domain.enums import AccountStatus
@@ -16,6 +17,7 @@ from app.domain.exceptions import (
     AuthenticationForbiddenError,
     AuthenticationUnauthorizedError,
 )
+from app.providers import PaymentProvider
 from app.repositories.accounts import AccountRepository
 from app.repositories.approval_identities import ApprovalIdentityRepository
 from app.repositories.authorizations import PurchaseAuthorizationRepository
@@ -30,6 +32,8 @@ from app.services.auth import AuthenticationApplicationService, ResolvedAuthSess
 from app.services.catalog import CatalogApplicationService
 from app.services.merchants import MerchantApplicationService
 from app.services.passkeys import PasskeyApplicationService
+from app.services.payment_webhooks import RazorpayWebhookIngressService
+from app.services.payments import PaymentApplicationService
 from app.services.policies import BuyerPolicyApplicationService
 from app.services.policy_evaluations import PolicyEvaluationApplicationService
 from app.services.quotes import QuoteApplicationService
@@ -75,6 +79,30 @@ def get_auth_store(request: Request) -> AuthStore:
 
 
 AuthStoreDependency = Annotated[AuthStore, Depends(get_auth_store)]
+
+
+def get_payment_provider(request: Request) -> PaymentProvider | None:
+    provider = getattr(request.app.state, "payment_provider", None)
+    if provider is not None and not isinstance(provider, PaymentProvider):
+        raise RuntimeError("Payment provider is not configured correctly")
+    return provider
+
+
+def get_payment_webhook_queue(request: Request) -> WebhookQueuePublisher | None:
+    queue = getattr(request.app.state, "payment_webhook_queue", None)
+    if queue is not None and not isinstance(queue, WebhookQueuePublisher):
+        raise RuntimeError("Payment webhook queue is not configured correctly")
+    return queue
+
+
+PaymentProviderDependency = Annotated[
+    PaymentProvider | None,
+    Depends(get_payment_provider),
+]
+PaymentWebhookQueueDependency = Annotated[
+    WebhookQueuePublisher | None,
+    Depends(get_payment_webhook_queue),
+]
 
 
 def get_merchant_application_service(
@@ -180,6 +208,30 @@ def get_authentication_application_service(
         webauthn_backend,
         challenge_ttl=timedelta(seconds=settings.webauthn_challenge_ttl_seconds),
         session_ttl=timedelta(seconds=settings.auth_session_ttl_seconds),
+    )
+
+
+def get_payment_application_service(
+    session: SessionDependency,
+    settings: SettingsDependency,
+    provider: PaymentProviderDependency,
+) -> PaymentApplicationService:
+    return PaymentApplicationService(session, provider, settings)
+
+
+def get_razorpay_webhook_ingress_service(
+    settings: SettingsDependency,
+    queue: PaymentWebhookQueueDependency,
+) -> RazorpayWebhookIngressService:
+    secret = (
+        settings.razorpay_webhook_secret.get_secret_value()
+        if settings.payments_enabled and settings.razorpay_webhook_secret is not None
+        else None
+    )
+    return RazorpayWebhookIngressService(
+        queue if settings.payments_enabled else None,
+        webhook_secret=secret,
+        maximum_age=timedelta(seconds=settings.razorpay_webhook_max_age_seconds),
     )
 
 
@@ -384,4 +436,12 @@ PasskeyApplicationDependency = Annotated[
 ApprovalApplicationDependency = Annotated[
     ApprovalApplicationService,
     Depends(get_approval_application_service),
+]
+PaymentApplicationDependency = Annotated[
+    PaymentApplicationService,
+    Depends(get_payment_application_service),
+]
+RazorpayWebhookIngressDependency = Annotated[
+    RazorpayWebhookIngressService,
+    Depends(get_razorpay_webhook_ingress_service),
 ]

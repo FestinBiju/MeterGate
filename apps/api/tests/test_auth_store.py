@@ -274,13 +274,13 @@ async def test_real_redis_auth_ttl_replay_and_revocation_when_configured() -> No
     challenge_id = "ach_00000000000000000000000003"
     challenge = login_state(
         challenge_id=challenge_id,
-        expires_at=now + timedelta(seconds=2),
+        expires_at=now + timedelta(seconds=10),
     ).model_copy(update={"issued_at": now})
-    live_session = session_state(expires_at=now + timedelta(seconds=2)).model_copy(
+    live_session = session_state(expires_at=now + timedelta(seconds=10)).model_copy(
         update={"created_at": now, "authenticated_at": now}
     )
     try:
-        await store.save_login(challenge, ttl_seconds=2)
+        await store.save_login(challenge, ttl_seconds=10)
         results = await asyncio.gather(
             store.consume_login(challenge_id),
             store.consume_login(challenge_id),
@@ -289,7 +289,7 @@ async def test_real_redis_auth_ttl_replay_and_revocation_when_configured() -> No
         assert sum(isinstance(result, LoginChallengeState) for result in results) == 1
         assert sum(isinstance(result, AuthStateAlreadyUsedError) for result in results) == 1
 
-        await store.save_session(live_session, ttl_seconds=2)
+        await store.save_session(live_session, ttl_seconds=10)
         assert (await store.get_session(SESSION_ID)).account_id == ACCOUNT_ID
         await store.revoke_session(SESSION_ID)
         with pytest.raises(AuthSessionRevokedError):

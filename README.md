@@ -30,7 +30,7 @@ The goal is to help merchants become **discoverable, understandable, payable, an
 
 ## Current Milestone
 
-Milestone 6A adds a passkey-first authenticated buyer-account boundary around the immutable policy, evaluation, approval, and authorization chain. A browser signs up or signs in with real WebAuthn, receives an opaque Redis-backed session in an HttpOnly cookie, and uses strict Origin plus synchronizer-token CSRF protection for buyer mutations. Payment creation, Razorpay, authorization consumption, entitlements, and fulfillment execution remain intentionally out of scope.
+Milestone 6B adds a real Razorpay Test Mode payment gate after the passkey-first buyer-account, policy, approval, and authorization chain. MeterGate consumes one active `aut_…` into at most one durable `txn_…`, creates the Razorpay Order server-side, launches genuine Standard Checkout, verifies callback and webhook signatures, and requires captured server-side payment evidence before reporting `paid`. Test Mode does not move real money. Entitlements, fulfillment, and refunds remain intentionally out of scope.
 
 ## Domain Model
 
@@ -42,13 +42,15 @@ Milestone 6A adds a passkey-first authenticated buyer-account boundary around th
 - A **policy evaluation** is immutable evidence that a specific policy hash was compared with a specific quote hash at a recorded time and produced an `allow` or `deny` decision with ordered reason-coded checks.
 - An **approval identity** belongs immutably one-to-one to an account and binds its private WebAuthn user handle to one or more registered passkey credentials.
 - A **purchase authorization** is immutable, short-lived evidence that a registered passkey confirmed one exact server-derived review. It is not a payment, order, reservation, or record of money spent.
+- A **payment transaction** is the stateful, audit-backed consumption of one authorization into one Razorpay Order. Its immutable RFC 8785 binding carries the approved terms forward after the short authorization expires.
+- A **payment attempt** is one safe normalized Razorpay `pay_…` observation. Failed attempts remain evidence and do not prevent another attempt on the same Order from being captured.
 - Merchant slugs are globally unique. Service slugs are unique within their merchant. Public removal is lifecycle-based; there are no hard-delete endpoints.
 
 ## Local Development
 
 Prerequisites: Docker Desktop with Docker Compose, Python 3.13, [`uv`](https://docs.astral.sh/uv/), Node.js 20.9 or newer, and npm.
 
-1. Copy `.env.example` to the repository-root `.env`, replace the local-only `change-me` password in both PostgreSQL values, and keep the Razorpay placeholders empty. This root file is the single dotenv source for Docker Compose and FastAPI.
+1. Copy `.env.example` to the repository-root `.env` and replace the local-only `change-me` password in both PostgreSQL values. Payment support is safely disabled by default; keep its Razorpay placeholders empty unless following the Test Mode setup below. This root file is the single dotenv source for Docker Compose and FastAPI.
 2. Start PostgreSQL and Redis from the repository root:
 
    ```powershell
@@ -136,23 +138,91 @@ The account-bound flow is:
 
 Redis contains only ephemeral ceremony and session state. PostgreSQL remains authoritative for accounts, identities, passkey credentials, and authorizations. API responses never expose credential raw-ID bytes, public-key bytes, authenticator counters, raw authenticator signatures, session IDs, or Redis state. The supplied localhost RP, Origin, CORS, and cookie defaults are for development only.
 
-No payment is created or executed in this milestone. A future payment gate must separately validate and consume an active authorization.
+## Razorpay Test Mode
+
+MeterGate uses the official Razorpay Python SDK for Orders and Payment reads. It has no live-mode switch: `PAYMENTS_ENABLED=true` requires `RAZORPAY_MODE=test`, a Key ID beginning with `rzp_test_`, a Key Secret, and a dedicated webhook secret. Startup validation rejects incomplete or live-mode credentials. Secrets are server-only `SecretStr` settings; the browser receives only the public Test Mode Key ID and its exact server-created Order configuration.
+
+Set these values in the repository-root `.env`, never in `apps/web` or a `NEXT_PUBLIC_*` variable:
+
+```dotenv
+PAYMENTS_ENABLED=true
+RAZORPAY_MODE=test
+RAZORPAY_KEY_ID=rzp_test_replace_me
+RAZORPAY_KEY_SECRET=replace_me
+RAZORPAY_WEBHOOK_SECRET=replace_with_a_dedicated_test_webhook_secret
+```
+
+Restart the API and worker after credential changes. Test Mode exercises Razorpay's real API and Checkout integration against simulated rails; it does not charge real money.
+
+To run the explicitly side-effecting provider acceptance (it creates one genuine
+₹5.00 Razorpay Test Mode Order, then fetches it directly and by receipt):
+
+```powershell
+cd apps/api
+$env:RUN_RAZORPAY_TEST_MODE = "1"
+uv run pytest -q -s tests/test_razorpay_test_mode_integration.py
+Remove-Item Env:RUN_RAZORPAY_TEST_MODE
+```
+
+The ordinary test suite skips this check so local and CI runs never create
+provider objects unexpectedly.
+
+## Payment Boundary
+
+`POST /api/v1/payment-transactions` accepts only an `authorization_id`. Under the authenticated Account lock, MeterGate reloads the authorization, resolves ownership through its ApprovalIdentity, recomputes authorization, policy, quote, and evaluation integrity, requires a still-active one-time authorization, and derives merchant, service, integer minor-unit amount, and currency exclusively from PostgreSQL. A unique `authorization_id` constraint makes repeated or concurrent calls return the same transaction.
+
+## Payment Transaction
+
+The authorization-to-transaction claim commits before any network call. The transaction ID is also the stable Razorpay receipt and fits the provider's receipt limit. A successful provider response must exactly match receipt, amount, currency, and supported status before its `order_…` ID is bound. A timeout is recorded as `order_creation_uncertain`; it is reconciled by exact receipt before any retry, never blindly duplicated. The original authorization expiry only controls the first claim. Once claimed, the immutable transaction binding—not a mutation of `PurchaseAuthorization`—carries the intent through Checkout and later webhooks.
+
+Standard Checkout opens only after a user action and receives its order configuration from the API. Its handler sends only the `razorpay_payment_id`, `razorpay_order_id`, and `razorpay_signature` to the owning, Origin- and CSRF-protected verification route. MeterGate compares the returned order ID but computes HMAC over the order ID stored in PostgreSQL. A valid callback signature proves binding, not payment success: MeterGate fetches Razorpay's Order and Payment and reports `paid` only for exact matching captured/paid provider evidence. `authorized` is pending, and one failed attempt does not kill the Order.
+
+Payment is not fulfillment. Milestone 6B stops at **VERIFIED PAYMENT CAPTURED** and does not issue an entitlement, call a paid merchant API, unlock a resource, generate the report, or initiate a refund.
+
+## Webhook Worker
+
+Razorpay calls the public `POST /api/v1/webhooks/razorpay` route without a buyer cookie or CSRF token. MeterGate reads a bounded raw body exactly once, requires one event ID and signature, verifies HMAC with the dedicated webhook secret before JSON parsing, enforces the configurable 300-second baseline replay age, and durably appends the verified body to the `metergate:razorpay:webhooks:v1` Redis Stream before returning `200`. Invalid or stale signatures never mutate payment state.
+
+Run the independent consumer from `apps/api`:
+
+```powershell
+uv run python -m app.workers.razorpay_webhooks
+```
+
+The worker uses a consumer group, recovers abandoned pending entries, and acknowledges an item only after an atomic PostgreSQL commit. `x-razorpay-event-id` is unique in the append-only normalized event table, so redelivery is harmless. Raw payloads remain ephemeral in Redis; PostgreSQL retains only the body hash, event/Order/Payment IDs, timestamps, safe processing outcome, attempts, and transaction audit events. Webhooks are reconciliation triggers rather than trusted state assignments, so duplicates and out-of-order `payment.authorized`, `payment.captured`, `payment.failed`, and `order.paid` events cannot regress captured success.
+
+## Payment Reconciliation
+
+The owning account can call `POST /api/v1/payment-transactions/{transaction_id}/reconcile` with its normal Origin and CSRF protections. MeterGate fetches the stored Razorpay Order and all its Payment attempts, verifies order ID, receipt, amount, currency, and each payment binding, and monotonically rebuilds local state. This repairs a lost browser callback, delayed webhook, temporary worker outage, or ambiguous Order-creation response. No client-provided provider status is accepted.
+
+### Local Test Mode webhooks with zrok
+
+Razorpay cannot deliver webhooks to `localhost`, and its documentation recommends zrok for local testing. With the API listening on port 8000, authenticate/install zrok according to its current documentation and run:
+
+```powershell
+zrok share public localhost:8000
+```
+
+In the Razorpay Dashboard's **Test Mode**, configure the resulting HTTPS URL plus `/api/v1/webhooks/razorpay`, use the same dedicated secret as `RAZORPAY_WEBHOOK_SECRET`, and subscribe to `payment.authorized`, `payment.captured`, `payment.failed`, and `order.paid`. Start PostgreSQL, Redis, the webhook worker, API, and frontend before the payment. A deployed HTTPS staging API can be used instead; do not use a tunnel hostname currently blocked by Razorpay.
 
 ### Manual Windows Hello acceptance
 
 Physical authenticator acceptance cannot be replaced by an automated fake. On a Windows development machine with Chrome or Edge and Windows Hello configured:
 
 1. Run `docker compose up -d --wait` from the repository root.
-2. In `apps/api`, run `uv sync --frozen --dev`, `uv run alembic upgrade head`, `uv run python -m app.scripts.seed_dev`, and `uv run fastapi dev app/main.py`.
+2. Configure Razorpay Test Mode credentials and the Test Mode webhook as described above. In `apps/api`, run `uv sync --frozen --dev`, `uv run alembic upgrade head`, `uv run python -m app.scripts.seed_dev`, `uv run python -m app.workers.razorpay_webhooks`, and—in another terminal—`uv run fastapi dev app/main.py`.
 3. In `apps/web`, set `$env:NEXT_PUBLIC_API_URL = "http://localhost:8000"`, run `npm install`, then `npm run dev`.
 4. Open `http://localhost:3000` exactly (the default WebAuthn RP is `localhost`).
 5. Choose **Create Account**, enter a display name, register the first passkey, and complete Windows Hello. Confirm the page shows the active `acct_…` account, its display name, and authentication method **Passkey**.
 6. Sign out, confirm the buyer-authority controls show **Sign in to continue**, then choose **Sign in with Passkey** and complete Windows Hello.
 7. Request the ₹5.00 INR OrbitIntel quote, create a policy capped at 1000 paise (₹10.00), and evaluate it to `allow`. Confirm the policy subject shown by the server is the signed-in Account ID; the UI must not ask for `dev-user-001` or another subject.
 8. Prepare the trusted review, confirm the server-derived terms and review hash, choose **Approve with Passkey**, and complete Windows Hello again.
-9. Confirm the UI shows `AUTHORIZED`, an `aut_…` ID, the exact ₹5.00 terms, an expiry and authorization hash, plus “No payment has been created or executed yet.”
-10. Sign out and request `GET /api/v1/authorizations/<aut_id>` without the session cookie; confirm `401 AUTH_SESSION_REQUIRED`.
-11. Sign back in with the same passkey and retrieve that authorization through the credentialed frontend flow; confirm it succeeds.
-12. Use automated ownership tests to confirm a second account receives `403 AUTH_RESOURCE_OWNERSHIP_MISMATCH` for the first account's policy, evaluation, identity, challenge, or authorization.
+9. Confirm the UI shows `AUTHORIZED`, an `aut_…` ID, the exact ₹5.00 terms, an expiry and authorization hash, and **TEST MODE — NO REAL MONEY WILL BE CHARGED**.
+10. Choose **Pay ₹5.00 with Razorpay**, confirm genuine Razorpay Standard Checkout opens with the same server-derived terms, and complete one successful Test Mode payment. Confirm the browser remains in verifying/pending state until the API observes capture, then shows **VERIFIED PAYMENT CAPTURED** with durable `txn_…`, `order_…`, and `pay_…` identifiers.
+11. Repeat with a failed Test Mode attempt and confirm it is retained as a failed attempt without marking the transaction paid or preventing a later attempt on the same Order.
+12. Confirm the Dashboard deliveries or API reconciliation converge on the same `paid` result and that no entitlement, report, merchant API call, protected-resource unlock, or refund occurs.
+13. Sign out and request `GET /api/v1/authorizations/<aut_id>` and `GET /api/v1/payment-transactions/<txn_id>` without the session cookie; confirm `401 AUTH_SESSION_REQUIRED`.
+14. Sign back in with the same passkey and retrieve both records through the credentialed frontend flow; confirm they succeed.
+15. Use automated ownership tests to confirm a second account receives `403 AUTH_RESOURCE_OWNERSHIP_MISMATCH` for the first account's policy, evaluation, identity, challenge, authorization, or payment transaction.
 
 Windows Hello is a physical acceptance step and cannot be claimed from automated WebAuthn stubs. Record the actual browser and authenticator result when performing this checklist.

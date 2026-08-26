@@ -17,6 +17,14 @@ from app.domain.exceptions import (
     AuthenticationUnauthorizedError,
     AuthenticationVerificationError,
     InvalidStateTransitionError,
+    PaymentConflictError,
+    PaymentExpiredError,
+    PaymentIntegrityError,
+    PaymentNotFoundError,
+    PaymentProviderError,
+    PaymentTimeoutError,
+    PaymentUnavailableError,
+    PaymentVerificationError,
     PolicyTTLExceededError,
     QuoteConflictError,
     QuoteInputValidationError,
@@ -68,6 +76,14 @@ def register_domain_exception_handlers(application: FastAPI) -> None:
         AuthenticationIntegrityError,
         _authentication_integrity_handler,
     )
+    application.add_exception_handler(PaymentNotFoundError, _payment_not_found_handler)
+    application.add_exception_handler(PaymentExpiredError, _payment_expired_handler)
+    application.add_exception_handler(PaymentVerificationError, _payment_verification_handler)
+    application.add_exception_handler(PaymentConflictError, _payment_conflict_handler)
+    application.add_exception_handler(PaymentIntegrityError, _payment_integrity_handler)
+    application.add_exception_handler(PaymentProviderError, _payment_provider_handler)
+    application.add_exception_handler(PaymentUnavailableError, _payment_unavailable_handler)
+    application.add_exception_handler(PaymentTimeoutError, _payment_timeout_handler)
 
 
 async def _not_found_handler(
@@ -184,6 +200,7 @@ def _approval_response(error: Exception, status_code: int) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
         content={"detail": str(error), "reason_code": error.reason_code},
+        headers={"Cache-Control": "private, no-store"},
     )
 
 
@@ -228,6 +245,7 @@ def _authentication_response(error: Exception, status_code: int) -> JSONResponse
     return JSONResponse(
         status_code=status_code,
         content={"detail": str(error), "reason_code": error.reason_code},
+        headers={"Cache-Control": "private, no-store"},
     )
 
 
@@ -270,3 +288,64 @@ async def _authentication_conflict_handler(request: Request, error: Exception) -
 async def _authentication_integrity_handler(request: Request, error: Exception) -> JSONResponse:
     del request
     return _authentication_response(error, status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+def _payment_response(error: Exception, status_code: int) -> JSONResponse:
+    assert isinstance(
+        error,
+        (
+            PaymentNotFoundError,
+            PaymentExpiredError,
+            PaymentVerificationError,
+            PaymentConflictError,
+            PaymentIntegrityError,
+            PaymentProviderError,
+            PaymentUnavailableError,
+            PaymentTimeoutError,
+        ),
+    )
+    return JSONResponse(
+        status_code=status_code,
+        content={"detail": str(error), "reason_code": error.reason_code},
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+async def _payment_not_found_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _payment_response(error, status.HTTP_404_NOT_FOUND)
+
+
+async def _payment_expired_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _payment_response(error, status.HTTP_410_GONE)
+
+
+async def _payment_verification_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _payment_response(error, status.HTTP_400_BAD_REQUEST)
+
+
+async def _payment_conflict_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _payment_response(error, status.HTTP_409_CONFLICT)
+
+
+async def _payment_integrity_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _payment_response(error, status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+async def _payment_provider_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _payment_response(error, status.HTTP_502_BAD_GATEWAY)
+
+
+async def _payment_unavailable_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _payment_response(error, status.HTTP_503_SERVICE_UNAVAILABLE)
+
+
+async def _payment_timeout_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _payment_response(error, status.HTTP_504_GATEWAY_TIMEOUT)

@@ -21,9 +21,20 @@ from app.domain.enums import (
     AccountStatus,
     ApprovalIdentityStatus,
     MerchantStatus,
+    PaymentAttemptStatus,
+    PaymentEventActorType,
+    PaymentProvider,
+    PaymentTransactionEventType,
+    PaymentTransactionState,
     PolicyDecision,
     PurchaseType,
+    RazorpayOrderStatus,
     ServiceStatus,
+    WebhookProcessingStatus,
+)
+from app.domain.payment_hashing import (
+    PAYMENT_BINDING_VERSION,
+    calculate_payment_binding_hash,
 )
 from app.models import (
     Account,
@@ -31,8 +42,12 @@ from app.models import (
     Base,
     BuyerPolicy,
     Merchant,
+    PaymentAttempt,
+    PaymentTransaction,
+    PaymentTransactionEvent,
     PolicyEvaluation,
     Quote,
+    RazorpayWebhookEvent,
     Service,
 )
 from app.repositories import BuyerPolicyRepository, PolicyEvaluationRepository
@@ -95,6 +110,53 @@ def evaluation_for_test(*, hash_value: int = 301) -> PolicyEvaluation:
     )
 
 
+def payment_transaction_for_test(*, hash_value: int = 401) -> PaymentTransaction:
+    transaction_id = "txn_00000000000000000000000001"
+    fields = {
+        "transaction_id": transaction_id,
+        "payment_binding_version": PAYMENT_BINDING_VERSION,
+        "account_id": "acct_00000000000000000000000001",
+        "authorization_id": "aut_00000000000000000000000001",
+        "authorization_hash": f"{HASH_PREFIX}{hash_value:064x}",
+        "evaluation_id": "pye_00000000000000000000000001",
+        "policy_id": "pol_00000000000000000000000001",
+        "policy_hash": f"{HASH_PREFIX}{hash_value + 1:064x}",
+        "quote_id": "qte_00000000000000000000000001",
+        "quote_hash": f"{HASH_PREFIX}{hash_value + 2:064x}",
+        "merchant_id": "mrc_00000000000000000000000001",
+        "service_id": "svc_00000000000000000000000001",
+        "amount": 500,
+        "currency": "INR",
+        "purchase_type": PurchaseType.ONE_TIME,
+        "provider": PaymentProvider.RAZORPAY,
+        "provider_receipt": transaction_id,
+    }
+    return PaymentTransaction(
+        id=transaction_id,
+        account_id=fields["account_id"],
+        authorization_id=fields["authorization_id"],
+        authorization_hash=fields["authorization_hash"],
+        evaluation_id=fields["evaluation_id"],
+        policy_id=fields["policy_id"],
+        policy_hash=fields["policy_hash"],
+        quote_id=fields["quote_id"],
+        quote_hash=fields["quote_hash"],
+        merchant_id=fields["merchant_id"],
+        service_id=fields["service_id"],
+        amount=fields["amount"],
+        currency=fields["currency"],
+        purchase_type=fields["purchase_type"],
+        provider=fields["provider"],
+        provider_receipt=fields["provider_receipt"],
+        transaction_state=PaymentTransactionState.ORDER_CREATION_PENDING,
+        order_creation_attempts=1,
+        order_creation_started_at=datetime(2026, 8, 25, 12, tzinfo=UTC),
+        payment_binding_version=PAYMENT_BINDING_VERSION,
+        payment_binding_hash=calculate_payment_binding_hash(**fields),
+        revision=1,
+    )
+
+
 def test_models_use_prefixed_string_primary_keys() -> None:
     account_id_column = Account.__table__.c.id
     assert account_id_column.primary_key is True
@@ -104,8 +166,12 @@ def test_models_use_prefixed_string_primary_keys() -> None:
     for table in (
         BuyerPolicy.__table__,
         Merchant.__table__,
+        PaymentAttempt.__table__,
+        PaymentTransaction.__table__,
+        PaymentTransactionEvent.__table__,
         PolicyEvaluation.__table__,
         Quote.__table__,
+        RazorpayWebhookEvent.__table__,
         Service.__table__,
     ):
         id_column = table.c.id
@@ -358,6 +424,14 @@ def test_persisted_enum_values_are_lowercase_strings() -> None:
         Service.__table__.c.purchase_type,
         Quote.__table__.c.purchase_type,
         PolicyEvaluation.__table__.c.decision,
+        PaymentTransaction.__table__.c.provider,
+        PaymentTransaction.__table__.c.provider_order_status,
+        PaymentTransaction.__table__.c.transaction_state,
+        PaymentAttempt.__table__.c.provider_status,
+        RazorpayWebhookEvent.__table__.c.processing_status,
+        PaymentTransactionEvent.__table__.c.event_type,
+        PaymentTransactionEvent.__table__.c.actor_type,
+        PaymentTransactionEvent.__table__.c.resulting_state,
     )
     for column in enum_columns:
         assert isinstance(column.type, Enum)
@@ -601,3 +675,248 @@ def test_policy_repositories_expose_no_mutation_methods() -> None:
     for repository in (BuyerPolicyRepository, PolicyEvaluationRepository):
         assert not hasattr(repository, "update")
         assert not hasattr(repository, "delete")
+
+
+def test_payment_models_define_safe_money_evidence_and_restrict_history() -> None:
+    transaction_table = PaymentTransaction.__table__
+    attempt_table = PaymentAttempt.__table__
+    webhook_table = RazorpayWebhookEvent.__table__
+    event_table = PaymentTransactionEvent.__table__
+
+    assert isinstance(transaction_table.c.amount.type, BigInteger)
+    assert isinstance(transaction_table.c.revision.type, BigInteger)
+    assert transaction_table.c.provider_receipt.type.length == 40
+    assert transaction_table.c.payment_binding_hash.type.length == 71
+    assert isinstance(attempt_table.c.amount.type, BigInteger)
+    assert isinstance(attempt_table.c.captured.type, Boolean)
+    assert str(event_table.c.metadata.type.compile(dialect=postgresql.dialect())) == "JSONB"
+    assert str(event_table.c.metadata.type.compile(dialect=sqlite.dialect())) == "JSON"
+
+    transaction_uniques = {
+        constraint.name
+        for constraint in transaction_table.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    assert {
+        "uq_payment_transactions_authorization_id",
+        "uq_payment_transactions_id_provider_order_id",
+        "uq_payment_transactions_payment_binding_hash",
+        "uq_payment_transactions_provider_order_id",
+        "uq_payment_transactions_provider_receipt",
+    } <= transaction_uniques
+    assert {index.name for index in transaction_table.indexes} == {
+        "ix_payment_transactions_account_created_at",
+        "ix_payment_transactions_merchant_created_at",
+        "ix_payment_transactions_quote_created_at",
+        "ix_payment_transactions_state_updated_at",
+    }
+
+    captured_index = next(
+        index
+        for index in attempt_table.indexes
+        if index.name == "uq_payment_attempts_one_captured_per_transaction"
+    )
+    assert captured_index.unique is True
+    assert "captured" in str(captured_index.dialect_options["postgresql"]["where"])
+    assert {
+        constraint.name
+        for constraint in webhook_table.constraints
+        if isinstance(constraint, UniqueConstraint)
+    } == {"uq_razorpay_webhook_events_provider_event_id"}
+    assert {
+        constraint.name
+        for constraint in event_table.constraints
+        if isinstance(constraint, UniqueConstraint)
+    } == {
+        "uq_payment_transaction_events_idempotency_key",
+        "uq_payment_transaction_events_source_webhook_event_id",
+        "uq_payment_transaction_events_transaction_revision",
+    }
+
+    transaction_foreign_keys = {
+        foreign_key.target_fullname: foreign_key.ondelete
+        for column in transaction_table.c
+        for foreign_key in column.foreign_keys
+    }
+    assert transaction_foreign_keys == {
+        "accounts.id": "RESTRICT",
+        "buyer_policies.id": "RESTRICT",
+        "merchants.id": "RESTRICT",
+        "policy_evaluations.id": "RESTRICT",
+        "purchase_authorizations.id": "RESTRICT",
+        "quotes.id": "RESTRICT",
+        "services.id": "RESTRICT",
+    }
+    assert all(
+        foreign_key.ondelete == "RESTRICT"
+        for table in (attempt_table, webhook_table, event_table)
+        for constraint in table.foreign_key_constraints
+        for foreign_key in constraint.elements
+    )
+
+
+def test_payment_models_define_state_and_integrity_constraints() -> None:
+    transaction_checks = {
+        constraint.name
+        for constraint in PaymentTransaction.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    attempt_checks = {
+        constraint.name
+        for constraint in PaymentAttempt.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    event_checks = {
+        constraint.name
+        for constraint in PaymentTransactionEvent.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+
+    assert {
+        "ck_payment_transactions_amount_safe_integer_range",
+        "ck_payment_transactions_authorization_hash_format",
+        "ck_payment_transactions_binding_version",
+        "ck_payment_transactions_paid_timestamp_matches_state",
+        "ck_payment_transactions_payment_binding_hash_format",
+        "ck_payment_transactions_provider_order_binding_complete",
+        "ck_payment_transactions_provider_receipt_is_id",
+        "ck_payment_transactions_revision_positive",
+        "ck_payment_transactions_state_requires_provider_order",
+        "ck_payment_transactions_transaction_state",
+    } <= transaction_checks
+    assert {
+        "ck_payment_attempts_amount_safe_integer_range",
+        "ck_payment_attempts_captured_flag_matches_status",
+        "ck_payment_attempts_captured_status_sets_flag",
+        "ck_payment_attempts_provider_status",
+    } <= attempt_checks
+    assert {
+        "ck_payment_transaction_events_metadata_object",
+        "ck_payment_transaction_events_prior_state_matches_revision",
+        "ck_payment_transaction_events_reason_code_format",
+        "ck_payment_transaction_events_transaction_revision_positive",
+    } <= event_checks
+
+
+def test_payment_mapper_guards_prevent_binding_changes_and_state_regression() -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    started_at = datetime(2026, 8, 25, 12, tzinfo=UTC)
+
+    with Session(engine, expire_on_commit=False) as session:
+        transaction = payment_transaction_for_test()
+        session.add(transaction)
+        session.commit()
+
+        transaction.amount = 501
+        transaction.revision = 2
+        with pytest.raises(InvalidRequestError, match="binding fields are immutable"):
+            session.commit()
+        session.rollback()
+
+        transaction = session.get(PaymentTransaction, transaction.id)
+        assert transaction is not None
+        transaction.transaction_state = PaymentTransactionState.PAID
+        transaction.paid_at = started_at + timedelta(seconds=3)
+        transaction.revision = 2
+        with pytest.raises(InvalidRequestError, match="state transition"):
+            session.commit()
+        session.rollback()
+
+        transaction = session.get(PaymentTransaction, transaction.id)
+        assert transaction is not None
+        transaction.provider_order_id = "order_test001"
+        transaction.provider_order_status = RazorpayOrderStatus.CREATED
+        transaction.order_created_at = started_at + timedelta(seconds=1)
+        transaction.transaction_state = PaymentTransactionState.ORDER_CREATED
+        transaction.revision = 2
+        session.commit()
+
+        attempt = PaymentAttempt(
+            id="pmt_00000000000000000000000001",
+            transaction_id=transaction.id,
+            provider=PaymentProvider.RAZORPAY,
+            provider_order_id="order_test001",
+            provider_payment_id="pay_test001",
+            amount=500,
+            currency="INR",
+            provider_status=PaymentAttemptStatus.FAILED,
+            method="upi",
+            captured=False,
+            provider_created_at=started_at,
+            first_seen_at=started_at,
+            last_seen_at=started_at,
+        )
+        session.add(attempt)
+        session.commit()
+
+        attempt.provider_status = PaymentAttemptStatus.AUTHORIZED
+        attempt.last_seen_at = started_at + timedelta(seconds=2)
+        session.commit()
+        attempt.provider_status = PaymentAttemptStatus.CAPTURED
+        attempt.captured = True
+        attempt.last_seen_at = started_at + timedelta(seconds=3)
+        session.commit()
+        attempt.provider_status = PaymentAttemptStatus.AUTHORIZED
+        attempt.last_seen_at = started_at + timedelta(seconds=4)
+        with pytest.raises(InvalidRequestError, match="status transition"):
+            session.commit()
+        session.rollback()
+
+        transaction = session.get(PaymentTransaction, transaction.id)
+        assert transaction is not None
+        session.delete(transaction)
+        with pytest.raises(InvalidRequestError, match="cannot be deleted"):
+            session.commit()
+        session.rollback()
+
+    engine.dispose()
+
+
+def test_payment_audit_evidence_mappers_are_append_only() -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    occurred_at = datetime(2026, 8, 25, 12, tzinfo=UTC)
+
+    with Session(engine, expire_on_commit=False) as session:
+        webhook = RazorpayWebhookEvent(
+            id="rwe_00000000000000000000000001",
+            provider_event_id="event_test001",
+            provider_event_type="payment.captured",
+            raw_body_hash=f"{HASH_PREFIX}{501:064x}",
+            provider_created_at=occurred_at,
+            received_at=occurred_at,
+            processed_at=occurred_at,
+            processing_status=WebhookProcessingStatus.IGNORED,
+            processing_reason_code="PAYMENT_TRANSACTION_NOT_FOUND",
+        )
+        event = PaymentTransactionEvent(
+            id="pte_00000000000000000000000001",
+            transaction_id="txn_00000000000000000000000001",
+            transaction_revision=1,
+            event_type=PaymentTransactionEventType.PAYMENT_TRANSACTION_CREATED,
+            actor_type=PaymentEventActorType.ACCOUNT,
+            actor_id="acct_00000000000000000000000001",
+            prior_state=None,
+            resulting_state=PaymentTransactionState.ORDER_CREATION_PENDING,
+            reason_code="PAYMENT_TRANSACTION_CREATED",
+            event_metadata={},
+            idempotency_key="transaction:txn_00000000000000000000000001:revision:1",
+            occurred_at=occurred_at,
+        )
+        session.add_all((webhook, event))
+        session.commit()
+
+        webhook.processing_reason_code = "CHANGED"
+        with pytest.raises(InvalidRequestError, match="webhook evidence is immutable"):
+            session.commit()
+        session.rollback()
+
+        event = session.get(PaymentTransactionEvent, event.id)
+        assert event is not None
+        session.delete(event)
+        with pytest.raises(InvalidRequestError, match="events are immutable"):
+            session.commit()
+        session.rollback()
+
+    engine.dispose()

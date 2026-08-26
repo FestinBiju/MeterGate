@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 from alembic.config import Config
 from fastapi.testclient import TestClient
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, select, text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
@@ -28,21 +28,51 @@ from app.application import create_app
 from app.core.config import Settings, get_settings
 from app.db.session import Database, make_async_database_url
 from app.domain.approval_hashing import AUTHORIZATION_VERSION, calculate_authorization_hash
-from app.domain.enums import AccountStatus, ApprovalIdentityStatus, PurchaseType
+from app.domain.enums import (
+    AccountStatus,
+    ApprovalIdentityStatus,
+    PaymentAttemptStatus,
+    PaymentEventActorType,
+    PaymentProvider,
+    PaymentTransactionEventType,
+    PaymentTransactionState,
+    PurchaseType,
+    RazorpayOrderStatus,
+    WebhookProcessingStatus,
+)
 from app.domain.hashing import sha256_bytes
 from app.domain.ids import (
     new_account_id,
     new_approval_identity_id,
     new_authorization_id,
     new_passkey_credential_id,
+    new_payment_attempt_id,
+    new_payment_transaction_event_id,
+    new_payment_transaction_id,
     new_policy_evaluation_id,
     new_policy_id,
+    new_razorpay_webhook_event_id,
 )
-from app.models import Account, ApprovalIdentity, PasskeyCredential, PurchaseAuthorization
+from app.domain.payment_hashing import (
+    PAYMENT_BINDING_VERSION,
+    calculate_payment_binding_hash,
+)
+from app.models import (
+    Account,
+    ApprovalIdentity,
+    PasskeyCredential,
+    PaymentAttempt,
+    PaymentTransaction,
+    PaymentTransactionEvent,
+    PurchaseAuthorization,
+    RazorpayWebhookEvent,
+)
 from app.repositories.accounts import AccountRepository
 from app.repositories.approval_identities import ApprovalIdentityRepository
 from app.repositories.authorizations import PurchaseAuthorizationRepository
 from app.repositories.passkey_credentials import PasskeyCredentialRepository
+from app.repositories.payment_attempts import PaymentAttemptRepository
+from app.repositories.payment_transactions import PaymentTransactionRepository
 from app.scripts.seed_dev import seed_development_data
 from app.services.readiness import ReadinessService
 
@@ -120,6 +150,12 @@ def _alembic_downgrade_to_trusted_approval(connection: Any) -> None:
     config = Config(API_ROOT / "alembic.ini")
     config.attributes["connection"] = connection
     command.downgrade(config, "20260825_0004")
+
+
+def _alembic_downgrade_to_authenticated_accounts(connection: Any) -> None:
+    config = Config(API_ROOT / "alembic.ini")
+    config.attributes["connection"] = connection
+    command.downgrade(config, "20260825_0005")
 
 
 async def _prepare_isolated_database() -> IsolatedDatabase:
@@ -1008,6 +1044,219 @@ def test_account_migration_has_postgresql_integrity_guards(
     }
 
 
+def test_payment_migration_has_postgresql_constraints_and_guards(
+    isolated_database: IsolatedDatabase,
+) -> None:
+    async def inspect_payment_tables() -> dict[str, Any]:
+        async with isolated_database.database.engine.connect() as connection:
+
+            def inspect_connection(sync_connection: Any) -> dict[str, Any]:
+                inspector = inspect(sync_connection)
+                return {
+                    "transaction_columns": {
+                        column["name"]: str(column["type"])
+                        for column in inspector.get_columns("payment_transactions")
+                    },
+                    "transaction_checks": {
+                        item["name"]
+                        for item in inspector.get_check_constraints("payment_transactions")
+                    },
+                    "transaction_unique": {
+                        item["name"]
+                        for item in inspector.get_unique_constraints("payment_transactions")
+                    },
+                    "transaction_foreign_keys": {
+                        item["referred_table"]: item["options"].get("ondelete")
+                        for item in inspector.get_foreign_keys("payment_transactions")
+                    },
+                    "attempt_indexes": {
+                        item["name"] for item in inspector.get_indexes("payment_attempts")
+                    },
+                    "attempt_foreign_keys": {
+                        item["name"]: (
+                            item["referred_table"],
+                            tuple(item["constrained_columns"]),
+                            item["options"].get("ondelete"),
+                        )
+                        for item in inspector.get_foreign_keys("payment_attempts")
+                    },
+                    "webhook_unique": {
+                        item["name"]
+                        for item in inspector.get_unique_constraints("razorpay_webhook_events")
+                    },
+                    "event_unique": {
+                        item["name"]
+                        for item in inspector.get_unique_constraints("payment_transaction_events")
+                    },
+                    "event_checks": {
+                        item["name"]
+                        for item in inspector.get_check_constraints("payment_transaction_events")
+                    },
+                }
+
+            inspected = await connection.run_sync(inspect_connection)
+            trigger_rows = await connection.execute(
+                text(
+                    """
+                    SELECT event_object_table, trigger_name
+                    FROM information_schema.triggers
+                    WHERE event_object_schema = current_schema()
+                      AND event_object_table IN (
+                          'payment_transactions',
+                          'payment_attempts',
+                          'razorpay_webhook_events',
+                          'payment_transaction_events'
+                      )
+                    """
+                )
+            )
+            inspected["triggers"] = set(trigger_rows.tuples().all())
+            functions = await connection.scalars(
+                text(
+                    """
+                    SELECT pg_proc.proname
+                    FROM pg_proc
+                    JOIN pg_namespace ON pg_namespace.oid = pg_proc.pronamespace
+                    WHERE pg_namespace.nspname = current_schema()
+                      AND pg_proc.proname IN (
+                          'metergate_guard_payment_attempt_mutation',
+                          'metergate_guard_payment_transaction_mutation',
+                          'metergate_reject_payment_transaction_event_mutation',
+                          'metergate_reject_razorpay_webhook_event_mutation',
+                          'metergate_require_payment_transaction_audit_event'
+                      )
+                    """
+                )
+            )
+            inspected["functions"] = set(functions.all())
+            await connection.run_sync(_alembic_check)
+            return inspected
+
+    schema = asyncio.run(inspect_payment_tables())
+
+    assert schema["transaction_columns"]["amount"] == "BIGINT"
+    assert schema["transaction_columns"]["provider_receipt"] == "VARCHAR(40)"
+    assert schema["transaction_columns"]["payment_binding_hash"] == "VARCHAR(71)"
+    assert {
+        "ck_payment_transactions_amount_safe_integer_range",
+        "ck_payment_transactions_authorization_hash_format",
+        "ck_payment_transactions_binding_version",
+        "ck_payment_transactions_payment_binding_hash_format",
+        "ck_payment_transactions_provider_order_binding_complete",
+        "ck_payment_transactions_provider_receipt_is_id",
+        "ck_payment_transactions_state_requires_provider_order",
+        "ck_payment_transactions_transaction_state",
+    } <= schema["transaction_checks"]
+    assert schema["transaction_unique"] == {
+        "uq_payment_transactions_authorization_id",
+        "uq_payment_transactions_id_provider_order_id",
+        "uq_payment_transactions_payment_binding_hash",
+        "uq_payment_transactions_provider_order_id",
+        "uq_payment_transactions_provider_receipt",
+    }
+    assert schema["transaction_foreign_keys"] == {
+        "accounts": "RESTRICT",
+        "buyer_policies": "RESTRICT",
+        "merchants": "RESTRICT",
+        "policy_evaluations": "RESTRICT",
+        "purchase_authorizations": "RESTRICT",
+        "quotes": "RESTRICT",
+        "services": "RESTRICT",
+    }
+    assert schema["attempt_indexes"] >= {
+        "ix_payment_attempts_transaction_first_seen_at",
+        "uq_payment_attempts_one_captured_per_transaction",
+    }
+    assert schema["attempt_foreign_keys"] == {
+        "fk_payment_attempts_transaction_order": (
+            "payment_transactions",
+            ("transaction_id", "provider_order_id"),
+            "RESTRICT",
+        )
+    }
+    assert schema["webhook_unique"] == {"uq_razorpay_webhook_events_provider_event_id"}
+    assert schema["event_unique"] == {
+        "uq_payment_transaction_events_idempotency_key",
+        "uq_payment_transaction_events_source_webhook_event_id",
+        "uq_payment_transaction_events_transaction_revision",
+    }
+    assert {
+        "ck_payment_transaction_events_metadata_object",
+        "ck_payment_transaction_events_prior_state_matches_revision",
+        "ck_payment_transaction_events_reason_code_format",
+    } <= schema["event_checks"]
+    assert schema["triggers"] == {
+        ("payment_attempts", "trg_payment_attempts_guard_mutation"),
+        ("payment_transaction_events", "trg_payment_transaction_events_immutable"),
+        ("payment_transactions", "trg_payment_transactions_guard_mutation"),
+        ("payment_transactions", "trg_payment_transactions_require_audit_event"),
+        ("razorpay_webhook_events", "trg_razorpay_webhook_events_immutable"),
+    }
+    assert schema["functions"] >= {
+        "metergate_guard_payment_attempt_mutation",
+        "metergate_guard_payment_transaction_mutation",
+        "metergate_reject_payment_transaction_event_mutation",
+        "metergate_reject_razorpay_webhook_event_mutation",
+        "metergate_require_payment_transaction_audit_event",
+    }
+
+
+def test_payment_migration_downgrades_to_accounts_and_reupgrades() -> None:
+    isolated = asyncio.run(_prepare_isolated_database())
+
+    async def exercise_cycle() -> None:
+        try:
+            async with isolated.database.engine.begin() as connection:
+
+                def payment_tables(sync_connection: Any) -> set[str]:
+                    return set(inspect(sync_connection).get_table_names()) & {
+                        "payment_attempts",
+                        "payment_transaction_events",
+                        "payment_transactions",
+                        "razorpay_webhook_events",
+                    }
+
+                assert await connection.run_sync(payment_tables) == {
+                    "payment_attempts",
+                    "payment_transaction_events",
+                    "payment_transactions",
+                    "razorpay_webhook_events",
+                }
+                await connection.run_sync(_alembic_downgrade_to_authenticated_accounts)
+                assert await connection.run_sync(payment_tables) == set()
+                function_count = await connection.scalar(
+                    text(
+                        """
+                        SELECT count(*)
+                        FROM pg_proc
+                        JOIN pg_namespace ON pg_namespace.oid = pg_proc.pronamespace
+                        WHERE pg_namespace.nspname = current_schema()
+                          AND pg_proc.proname IN (
+                              'metergate_guard_payment_attempt_mutation',
+                              'metergate_guard_payment_transaction_mutation',
+                              'metergate_reject_payment_transaction_event_mutation',
+                              'metergate_reject_razorpay_webhook_event_mutation',
+                              'metergate_require_payment_transaction_audit_event'
+                          )
+                        """
+                    )
+                )
+                assert function_count == 0
+                await connection.run_sync(_alembic_upgrade)
+                assert await connection.run_sync(payment_tables) == {
+                    "payment_attempts",
+                    "payment_transaction_events",
+                    "payment_transactions",
+                    "razorpay_webhook_events",
+                }
+                await connection.run_sync(_alembic_check)
+        finally:
+            await isolated.database.dispose()
+            await _drop_isolated_schema(isolated.database_url, isolated.schema)
+
+    asyncio.run(exercise_cycle())
+
+
 def test_account_repository_creates_signup_bundle_atomically(
     isolated_database: IsolatedDatabase,
 ) -> None:
@@ -1889,6 +2138,494 @@ def test_approval_records_enforce_atomic_usage_and_database_immutability(
     ):
         with pytest.raises(DBAPIError):
             asyncio.run(execute(statement, authorization.id))
+
+
+def test_payment_repository_commits_audited_aggregate_and_postgresql_guards(
+    domain_client: TestClient,
+    isolated_database: IsolatedDatabase,
+) -> None:
+    raw_credential_id = f"payment-persistence-{uuid.uuid4().hex}".encode()
+    current, credential = asyncio.run(
+        create_authenticated_account(
+            isolated_database,
+            display_name="PostgreSQL Payment User",
+            raw_credential_id=raw_credential_id,
+        )
+    )
+    merchant = create_merchant(
+        domain_client,
+        f"payment-persistence-{uuid.uuid4().hex[:12]}",
+    )
+    service = create_service(
+        domain_client,
+        merchant["id"],
+        f"payment-service-{uuid.uuid4().hex[:12]}",
+        base_price=500,
+    )
+    quote_response = domain_client.post(
+        "/api/v1/quotes",
+        json={"service_id": service["id"], "input": {"norad_id": 25544}},
+    )
+    assert quote_response.status_code == 201, quote_response.text
+    quote = quote_response.json()
+    with authenticated_domain_client(domain_client, current) as authenticated_client:
+        policy_response = authenticated_client.post(
+            "/api/v1/policies",
+            json={
+                "maximum_amount": 1_000,
+                "allowed_currencies": ["INR"],
+                "allowed_merchant_ids": [merchant["id"]],
+                "allowed_service_ids": [service["id"]],
+                "allowed_service_types": ["report"],
+                "allowed_purchase_types": ["one_time"],
+                "expires_in_seconds": 900,
+            },
+        )
+        assert policy_response.status_code == 201, policy_response.text
+        policy = policy_response.json()
+        evaluation_response = authenticated_client.post(
+            "/api/v1/policy-evaluations",
+            json={"policy_id": policy["id"], "quote_id": quote["id"]},
+        )
+        assert evaluation_response.status_code == 201, evaluation_response.text
+        evaluation = evaluation_response.json()
+    assert evaluation["decision"] == "allow"
+
+    authorized_at = datetime.now(UTC)
+    expires_at = authorized_at + timedelta(minutes=2)
+    authorization_id = new_authorization_id()
+    review_hash = sha256_bytes(b"payment-persistence-review")
+    challenge_hash = sha256_bytes(uuid.uuid4().bytes)
+    authorization_hash = calculate_authorization_hash(
+        authorization_id=authorization_id,
+        authorization_version=AUTHORIZATION_VERSION,
+        approval_identity_id=current.approval_identity.id,
+        passkey_credential_id=credential.id,
+        subject_ref=current.account.id,
+        evaluation_id=evaluation["id"],
+        policy_id=policy["id"],
+        policy_hash=policy["policy_hash"],
+        quote_id=quote["id"],
+        quote_hash=quote["quote_hash"],
+        merchant_id=merchant["id"],
+        service_id=service["id"],
+        amount=quote["pricing"]["amount"],
+        currency=quote["pricing"]["currency"],
+        purchase_type=PurchaseType(quote["pricing"]["purchase_type"]),
+        review_hash=review_hash,
+        challenge_hash=challenge_hash,
+        authorized_at=authorized_at,
+        expires_at=expires_at,
+    )
+    authorization = PurchaseAuthorization(
+        id=authorization_id,
+        approval_identity_id=current.approval_identity.id,
+        passkey_credential_id=credential.id,
+        evaluation_id=evaluation["id"],
+        policy_id=policy["id"],
+        policy_hash=policy["policy_hash"],
+        quote_id=quote["id"],
+        quote_hash=quote["quote_hash"],
+        merchant_id=merchant["id"],
+        service_id=service["id"],
+        subject_ref=current.account.id,
+        amount=quote["pricing"]["amount"],
+        currency=quote["pricing"]["currency"],
+        purchase_type=PurchaseType(quote["pricing"]["purchase_type"]),
+        review_hash=review_hash,
+        challenge_hash=challenge_hash,
+        authorized_at=authorized_at,
+        expires_at=expires_at,
+        authorization_version=AUTHORIZATION_VERSION,
+        authorization_hash=authorization_hash,
+    )
+
+    async def persist_authorization() -> None:
+        async with isolated_database.database.session() as session:
+            locked_credential = await PasskeyCredentialRepository(
+                session
+            ).get_by_credential_id_for_update(
+                raw_credential_id,
+                identity_id=current.approval_identity.id,
+            )
+            assert locked_credential is not None
+            await PurchaseAuthorizationRepository(session).create_with_locked_credential_update(
+                authorization,
+                credential=locked_credential,
+                new_sign_count=1,
+                last_used_at=authorized_at,
+            )
+
+    asyncio.run(persist_authorization())
+
+    def transaction_bundle(
+        *,
+        transaction_id: str,
+        occurred_at: datetime,
+        idempotency_suffix: str,
+    ) -> tuple[PaymentTransaction, PaymentTransactionEvent]:
+        binding_fields: dict[str, Any] = {
+            "transaction_id": transaction_id,
+            "payment_binding_version": PAYMENT_BINDING_VERSION,
+            "account_id": current.account.id,
+            "authorization_id": authorization.id,
+            "authorization_hash": authorization.authorization_hash,
+            "evaluation_id": authorization.evaluation_id,
+            "policy_id": authorization.policy_id,
+            "policy_hash": authorization.policy_hash,
+            "quote_id": authorization.quote_id,
+            "quote_hash": authorization.quote_hash,
+            "merchant_id": authorization.merchant_id,
+            "service_id": authorization.service_id,
+            "amount": authorization.amount,
+            "currency": authorization.currency,
+            "purchase_type": authorization.purchase_type,
+            "provider": PaymentProvider.RAZORPAY,
+            "provider_receipt": transaction_id,
+        }
+        transaction = PaymentTransaction(
+            id=transaction_id,
+            account_id=current.account.id,
+            authorization_id=authorization.id,
+            authorization_hash=authorization.authorization_hash,
+            evaluation_id=authorization.evaluation_id,
+            policy_id=authorization.policy_id,
+            policy_hash=authorization.policy_hash,
+            quote_id=authorization.quote_id,
+            quote_hash=authorization.quote_hash,
+            merchant_id=authorization.merchant_id,
+            service_id=authorization.service_id,
+            amount=authorization.amount,
+            currency=authorization.currency,
+            purchase_type=authorization.purchase_type,
+            provider=PaymentProvider.RAZORPAY,
+            provider_receipt=transaction_id,
+            transaction_state=PaymentTransactionState.ORDER_CREATION_PENDING,
+            order_creation_attempts=1,
+            order_creation_started_at=occurred_at,
+            payment_binding_version=PAYMENT_BINDING_VERSION,
+            payment_binding_hash=calculate_payment_binding_hash(**binding_fields),
+            revision=1,
+        )
+        event = PaymentTransactionEvent(
+            id=new_payment_transaction_event_id(),
+            transaction_id=transaction_id,
+            transaction_revision=1,
+            event_type=PaymentTransactionEventType.PAYMENT_TRANSACTION_CREATED,
+            actor_type=PaymentEventActorType.ACCOUNT,
+            actor_id=current.account.id,
+            prior_state=None,
+            resulting_state=PaymentTransactionState.ORDER_CREATION_PENDING,
+            reason_code="PAYMENT_TRANSACTION_CREATED",
+            event_metadata={"authorization_id": authorization.id},
+            idempotency_key=f"{transaction_id}:{idempotency_suffix}",
+            occurred_at=occurred_at,
+        )
+        return transaction, event
+
+    started_at = datetime.now(UTC)
+    transaction, initial_event = transaction_bundle(
+        transaction_id=new_payment_transaction_id(),
+        occurred_at=started_at,
+        idempotency_suffix="claim",
+    )
+
+    duplicate, duplicate_event = transaction_bundle(
+        transaction_id=new_payment_transaction_id(),
+        occurred_at=started_at,
+        idempotency_suffix="duplicate",
+    )
+
+    async def race_authorization_claims() -> tuple[bool, bool]:
+        barrier = asyncio.Barrier(2)
+
+        async def claim(
+            candidate: PaymentTransaction,
+            event: PaymentTransactionEvent,
+        ) -> bool:
+            async with isolated_database.database.session() as session:
+                await barrier.wait()
+                try:
+                    await PaymentTransactionRepository(session).create_with_event(
+                        candidate,
+                        event=event,
+                    )
+                except IntegrityError:
+                    return False
+                return True
+
+        first, second = await asyncio.gather(
+            claim(transaction, initial_event),
+            claim(duplicate, duplicate_event),
+        )
+        return first, second
+
+    claim_results = asyncio.run(race_authorization_claims())
+    assert sorted(claim_results) == [False, True]
+    transaction = transaction if claim_results[0] else duplicate
+
+    async def claimed_transaction_ids() -> list[str]:
+        async with isolated_database.database.session() as session:
+            result = await session.scalars(
+                select(PaymentTransaction.id).where(
+                    PaymentTransaction.authorization_id == authorization.id
+                )
+            )
+            return list(result)
+
+    assert asyncio.run(claimed_transaction_ids()) == [transaction.id]
+
+    order_id = f"order_{uuid.uuid4().hex}"
+
+    async def bind_order() -> None:
+        async with isolated_database.database.session() as session:
+            repository = PaymentTransactionRepository(session)
+            locked = await repository.get_for_update(transaction.id)
+            assert locked is not None
+            prior_state = PaymentTransactionState(locked.transaction_state)
+            observed_at = started_at + timedelta(seconds=1)
+            locked.provider_order_id = order_id
+            locked.provider_order_status = RazorpayOrderStatus.CREATED
+            locked.transaction_state = PaymentTransactionState.ORDER_CREATED
+            locked.order_created_at = observed_at
+            event = PaymentTransactionEvent(
+                id=new_payment_transaction_event_id(),
+                transaction_id=locked.id,
+                transaction_revision=locked.revision + 1,
+                event_type=PaymentTransactionEventType.RAZORPAY_ORDER_CREATED,
+                actor_type=PaymentEventActorType.PROVIDER_API,
+                actor_id=order_id,
+                prior_state=prior_state,
+                resulting_state=PaymentTransactionState.ORDER_CREATED,
+                reason_code="PAYMENT_ORDER_CREATED",
+                event_metadata={"provider_order_id": order_id},
+                idempotency_key=f"{locked.id}:order:{order_id}",
+                occurred_at=observed_at,
+            )
+            await repository.update_with_event(locked, event=event)
+
+    asyncio.run(bind_order())
+
+    first_attempt_id = new_payment_attempt_id()
+    second_attempt_id = new_payment_attempt_id()
+    webhook_id = new_razorpay_webhook_event_id()
+
+    async def persist_multiple_attempts_and_webhook() -> None:
+        async with isolated_database.database.session() as session:
+            repository = PaymentTransactionRepository(session)
+            locked = await repository.get_for_update(transaction.id)
+            assert locked is not None
+            observed_at = started_at + timedelta(seconds=2)
+            attempts = tuple(
+                PaymentAttempt(
+                    id=attempt_id,
+                    transaction_id=locked.id,
+                    provider=PaymentProvider.RAZORPAY,
+                    provider_order_id=order_id,
+                    provider_payment_id=f"pay_{uuid.uuid4().hex}",
+                    amount=locked.amount,
+                    currency=locked.currency,
+                    provider_status=PaymentAttemptStatus.FAILED,
+                    method="upi",
+                    captured=False,
+                    provider_created_at=observed_at,
+                    first_seen_at=observed_at,
+                    last_seen_at=observed_at,
+                )
+                for attempt_id in (first_attempt_id, second_attempt_id)
+            )
+            webhook = RazorpayWebhookEvent(
+                id=webhook_id,
+                provider_event_id=f"event_{uuid.uuid4().hex}",
+                provider_event_type="payment.failed",
+                raw_body_hash=sha256_bytes(b"payment-persistence-webhook"),
+                provider_created_at=observed_at,
+                received_at=observed_at,
+                processed_at=observed_at,
+                processing_status=WebhookProcessingStatus.PROCESSED,
+                processing_reason_code="PAYMENT_ATTEMPT_FAILED",
+                provider_order_id=order_id,
+                provider_payment_id=attempts[0].provider_payment_id,
+                transaction_id=locked.id,
+            )
+            prior_state = PaymentTransactionState(locked.transaction_state)
+            locked.provider_order_status = RazorpayOrderStatus.ATTEMPTED
+            locked.transaction_state = PaymentTransactionState.PAYMENT_PENDING
+            locked.last_reconciled_at = observed_at
+            event = PaymentTransactionEvent(
+                id=new_payment_transaction_event_id(),
+                transaction_id=locked.id,
+                transaction_revision=locked.revision + 1,
+                event_type=PaymentTransactionEventType.PAYMENT_ATTEMPT_FAILED,
+                actor_type=PaymentEventActorType.PROVIDER_WEBHOOK,
+                actor_id=webhook.provider_event_id,
+                prior_state=prior_state,
+                resulting_state=PaymentTransactionState.PAYMENT_PENDING,
+                reason_code="PAYMENT_ATTEMPT_FAILED",
+                event_metadata={"payment_count": len(attempts)},
+                payment_attempt_id=attempts[0].id,
+                source_webhook_event_id=webhook.id,
+                idempotency_key=f"{locked.id}:webhook:{webhook.provider_event_id}",
+                occurred_at=observed_at,
+            )
+            await repository.update_with_event(
+                locked,
+                event=event,
+                attempts=attempts,
+                webhook_event=webhook,
+            )
+
+    asyncio.run(persist_multiple_attempts_and_webhook())
+
+    async def capture_first_attempt() -> None:
+        async with isolated_database.database.session() as session:
+            repository = PaymentTransactionRepository(session)
+            locked = await repository.get_for_update(transaction.id)
+            stored_attempt = await session.get(PaymentAttempt, first_attempt_id)
+            assert stored_attempt is not None
+            attempt = await PaymentAttemptRepository(session).get_by_provider_payment_id_for_update(
+                stored_attempt.provider_payment_id
+            )
+            assert locked is not None
+            assert attempt is not None
+            observed_at = started_at + timedelta(seconds=3)
+            prior_state = PaymentTransactionState(locked.transaction_state)
+            attempt.provider_status = PaymentAttemptStatus.CAPTURED
+            attempt.captured = True
+            attempt.last_seen_at = observed_at
+            locked.provider_order_status = RazorpayOrderStatus.PAID
+            locked.transaction_state = PaymentTransactionState.PAID
+            locked.paid_at = observed_at
+            locked.last_reconciled_at = observed_at
+            event = PaymentTransactionEvent(
+                id=new_payment_transaction_event_id(),
+                transaction_id=locked.id,
+                transaction_revision=locked.revision + 1,
+                event_type=PaymentTransactionEventType.PAYMENT_CAPTURED,
+                actor_type=PaymentEventActorType.PROVIDER_API,
+                actor_id=attempt.provider_payment_id,
+                prior_state=prior_state,
+                resulting_state=PaymentTransactionState.PAID,
+                reason_code="PAYMENT_CAPTURED",
+                event_metadata={"provider_payment_id": attempt.provider_payment_id},
+                payment_attempt_id=attempt.id,
+                idempotency_key=f"{locked.id}:capture:{attempt.provider_payment_id}",
+                occurred_at=observed_at,
+            )
+            await repository.update_with_event(locked, event=event, attempt=attempt)
+
+    asyncio.run(capture_first_attempt())
+
+    async def capture_second_attempt() -> None:
+        async with isolated_database.database.session() as session:
+            repository = PaymentTransactionRepository(session)
+            locked = await repository.get_for_update(transaction.id)
+            attempt = await session.get(PaymentAttempt, second_attempt_id)
+            assert locked is not None
+            assert attempt is not None
+            observed_at = started_at + timedelta(seconds=4)
+            attempt.provider_status = PaymentAttemptStatus.CAPTURED
+            attempt.captured = True
+            attempt.last_seen_at = observed_at
+            event = PaymentTransactionEvent(
+                id=new_payment_transaction_event_id(),
+                transaction_id=locked.id,
+                transaction_revision=locked.revision + 1,
+                event_type=PaymentTransactionEventType.PAYMENT_CAPTURED,
+                actor_type=PaymentEventActorType.PROVIDER_API,
+                actor_id=attempt.provider_payment_id,
+                prior_state=PaymentTransactionState.PAID,
+                resulting_state=PaymentTransactionState.PAID,
+                reason_code="PAYMENT_MULTIPLE_CAPTURES_DETECTED",
+                event_metadata={},
+                payment_attempt_id=attempt.id,
+                idempotency_key=f"{locked.id}:capture:{attempt.provider_payment_id}",
+                occurred_at=observed_at,
+            )
+            await repository.update_with_event(locked, event=event, attempt=attempt)
+
+    with pytest.raises(IntegrityError):
+        asyncio.run(capture_second_attempt())
+
+    async def read_persisted_state() -> tuple[str, int, int, int]:
+        async with isolated_database.database.session() as session:
+            persisted = await PaymentTransactionRepository(session).get(transaction.id)
+            assert persisted is not None
+            captured_count = await session.scalar(
+                text(
+                    "SELECT count(*) FROM payment_attempts "
+                    "WHERE transaction_id = :transaction_id AND captured"
+                ),
+                {"transaction_id": transaction.id},
+            )
+            event_count = await session.scalar(
+                text(
+                    "SELECT count(*) FROM payment_transaction_events "
+                    "WHERE transaction_id = :transaction_id"
+                ),
+                {"transaction_id": transaction.id},
+            )
+            webhook_count = await session.scalar(
+                text(
+                    "SELECT count(*) FROM razorpay_webhook_events "
+                    "WHERE transaction_id = :transaction_id"
+                ),
+                {"transaction_id": transaction.id},
+            )
+            assert captured_count is not None
+            assert event_count is not None
+            assert webhook_count is not None
+            return (
+                PaymentTransactionState(persisted.transaction_state).value,
+                persisted.revision,
+                captured_count,
+                event_count + webhook_count,
+            )
+
+    assert asyncio.run(read_persisted_state()) == ("paid", 4, 1, 5)
+
+    async def execute(statement: str, parameters: dict[str, object]) -> None:
+        async with isolated_database.database.engine.begin() as connection:
+            await connection.execute(text(statement), parameters)
+
+    with pytest.raises(DBAPIError):
+        asyncio.run(
+            execute(
+                """
+                UPDATE payment_transactions
+                SET last_reconciled_at = :observed_at,
+                    updated_at = :observed_at,
+                    revision = revision + 1
+                WHERE id = :transaction_id
+                """,
+                {
+                    "observed_at": started_at + timedelta(minutes=1),
+                    "transaction_id": transaction.id,
+                },
+            )
+        )
+    with pytest.raises(DBAPIError):
+        asyncio.run(
+            execute(
+                """
+                UPDATE payment_attempts
+                SET provider_status = 'authorized'
+                WHERE id = :attempt_id
+                """,
+                {"attempt_id": first_attempt_id},
+            )
+        )
+    with pytest.raises(DBAPIError):
+        asyncio.run(
+            execute(
+                """
+                UPDATE payment_transaction_events
+                SET reason_code = 'CHANGED'
+                WHERE transaction_id = :transaction_id
+                """,
+                {"transaction_id": transaction.id},
+            )
+        )
 
 
 def test_policy_rows_enforce_json_constraints_foreign_keys_and_immutability(
