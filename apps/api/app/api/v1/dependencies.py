@@ -11,6 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache.approval_challenges import ChallengeStore
 from app.cache.auth import AuthStore
+from app.cache.human_presence import HumanPresenceStore
+from app.cache.mcp import McpRateLimiter
 from app.cache.operator import OperatorRateLimiter
 from app.cache.payment_webhooks import WebhookQueuePublisher
 from app.core.config import Settings
@@ -39,6 +41,8 @@ from app.services.catalog import CatalogApplicationService
 from app.services.compensations import CompensationApplicationService, RefundApplicationService
 from app.services.entitlements import EntitlementApplicationService
 from app.services.fulfillments import FulfillmentApplicationService
+from app.services.human_presence import HumanPresenceService
+from app.services.mcp import McpAgentSessionService, McpAuditService, McpCommerceService
 from app.services.merchants import MerchantApplicationService
 from app.services.passkeys import PasskeyApplicationService
 from app.services.payment_webhooks import RazorpayWebhookIngressService
@@ -90,6 +94,19 @@ def get_auth_store(request: Request) -> AuthStore:
 AuthStoreDependency = Annotated[AuthStore, Depends(get_auth_store)]
 
 
+def get_human_presence_store(request: Request) -> HumanPresenceStore:
+    store = getattr(request.app.state, "human_presence_store", None)
+    if not isinstance(store, HumanPresenceStore):
+        raise RuntimeError("Human-presence challenge storage is unavailable")
+    return store
+
+
+HumanPresenceStoreDependency = Annotated[
+    HumanPresenceStore,
+    Depends(get_human_presence_store),
+]
+
+
 def get_operator_rate_limiter(request: Request) -> OperatorRateLimiter:
     limiter = getattr(request.app.state, "operator_rate_limiter", None)
     if not isinstance(limiter, OperatorRateLimiter):
@@ -100,6 +117,19 @@ def get_operator_rate_limiter(request: Request) -> OperatorRateLimiter:
 OperatorRateLimiterDependency = Annotated[
     OperatorRateLimiter,
     Depends(get_operator_rate_limiter),
+]
+
+
+def get_mcp_rate_limiter(request: Request) -> McpRateLimiter:
+    limiter = getattr(request.app.state, "mcp_rate_limiter", None)
+    if not isinstance(limiter, McpRateLimiter):
+        raise RuntimeError("MCP rate limiting is unavailable")
+    return limiter
+
+
+McpRateLimiterDependency = Annotated[
+    McpRateLimiter,
+    Depends(get_mcp_rate_limiter),
 ]
 
 
@@ -309,6 +339,40 @@ def get_fulfillment_application_service(
         execution_lease=timedelta(seconds=settings.fulfillment_execution_lease_seconds),
         maximum_result_bytes=settings.fulfillment_max_result_bytes,
         default_maximum_attempts=settings.fulfillment_max_attempts,
+    )
+
+
+def get_mcp_agent_session_service(
+    session: SessionDependency,
+    settings: SettingsDependency,
+) -> McpAgentSessionService:
+    return McpAgentSessionService(session, settings)
+
+
+def get_human_presence_service(
+    session: SessionDependency,
+    settings: SettingsDependency,
+    store: HumanPresenceStoreDependency,
+    webauthn: WebAuthnBackendDependency,
+) -> HumanPresenceService:
+    return HumanPresenceService(session, store, webauthn, settings)
+
+
+def get_mcp_audit_service(session: SessionDependency) -> McpAuditService:
+    return McpAuditService(session)
+
+
+def get_mcp_commerce_service(
+    session: SessionDependency,
+    settings: SettingsDependency,
+    payment_provider: PaymentProviderDependency,
+    fulfillment_provider: FulfillmentProviderDependency,
+) -> McpCommerceService:
+    return McpCommerceService(
+        session,
+        settings,
+        payment_provider,
+        fulfillment_provider,
     )
 
 
@@ -609,6 +673,22 @@ EntitlementApplicationDependency = Annotated[
 FulfillmentApplicationDependency = Annotated[
     FulfillmentApplicationService,
     Depends(get_fulfillment_application_service),
+]
+McpAgentSessionServiceDependency = Annotated[
+    McpAgentSessionService,
+    Depends(get_mcp_agent_session_service),
+]
+HumanPresenceServiceDependency = Annotated[
+    HumanPresenceService,
+    Depends(get_human_presence_service),
+]
+McpAuditServiceDependency = Annotated[
+    McpAuditService,
+    Depends(get_mcp_audit_service),
+]
+McpCommerceServiceDependency = Annotated[
+    McpCommerceService,
+    Depends(get_mcp_commerce_service),
 ]
 RazorpayWebhookIngressDependency = Annotated[
     RazorpayWebhookIngressService,

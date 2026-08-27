@@ -7,6 +7,30 @@ class DomainError(Exception):
     """Base class for expected domain failures."""
 
 
+class McpSessionError(DomainError):
+    """Fail-closed buyer-agent session or scope failure."""
+
+    def __init__(self, detail: str, reason_code: str) -> None:
+        self.reason_code = reason_code
+        super().__init__(detail)
+
+
+class McpSessionUnauthorizedError(McpSessionError):
+    """A valid, active MCP bridge session is required."""
+
+
+class McpSessionForbiddenError(McpSessionError):
+    """The bridge session lacks scope or ownership."""
+
+
+class McpSessionNotFoundError(McpSessionError):
+    """An owned MCP session metadata record was not found."""
+
+
+class McpSessionConflictError(McpSessionError):
+    """The requested session operation conflicts with durable state."""
+
+
 class AuthenticationError(DomainError):
     """Fail-closed account/session failure with a stable public code."""
 

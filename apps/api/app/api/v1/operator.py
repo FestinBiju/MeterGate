@@ -653,9 +653,14 @@ async def system_health(
 
 
 @router.get("/metrics/summary")
-async def metrics_summary(session: SessionDependency, operator: OperatorDependency) -> dict:
+async def metrics_summary(
+    session: SessionDependency,
+    settings: SettingsDependency,
+    operator: OperatorDependency,
+) -> dict:
     del operator
-    return await OperatorService(session).metrics_summary()
+    summary = await OperatorService(session).metrics_summary()
+    return {**summary, "demo_mode": settings.demo_mode}
 
 
 @router.get("/metrics", response_class=PlainTextResponse)

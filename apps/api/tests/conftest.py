@@ -12,6 +12,13 @@ async def healthy_probe() -> None:
     return None
 
 
+class AllowingRateLimiter:
+    """Explicit test double; production continues to fail closed through Redis."""
+
+    async def require(self, **_: object) -> None:
+        return None
+
+
 @pytest.fixture
 def settings() -> Settings:
     return Settings(
@@ -40,7 +47,14 @@ def make_client(settings: Settings) -> Callable[..., TestClient]:
             redis_probe=redis_probe,
             timeout_seconds=timeout_seconds,
         )
-        client = TestClient(create_app(settings=settings, readiness_service=readiness_service))
+        client = TestClient(
+            create_app(
+                settings=settings,
+                readiness_service=readiness_service,
+                operator_rate_limiter=AllowingRateLimiter(),
+                mcp_rate_limiter=AllowingRateLimiter(),
+            )
+        )
         clients.append(client)
         return client
 

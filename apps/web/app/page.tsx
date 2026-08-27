@@ -1,5 +1,6 @@
 import { AccountAuth } from "@/components/account-auth";
 import { AccountSessionProvider } from "@/components/account-session";
+import { AgentConnections } from "@/components/agent-connections";
 import { ServiceCatalog } from "@/components/service-catalog";
 import { SystemStatus } from "@/components/system-status";
 
@@ -68,6 +69,7 @@ export default function Home() {
 
         <AccountSessionProvider>
           <AccountAuth />
+          <AgentConnections />
           <ServiceCatalog />
         </AccountSessionProvider>
       </main>

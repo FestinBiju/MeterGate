@@ -36,6 +36,10 @@ from app.domain.exceptions import (
     FulfillmentPermanentError,
     FulfillmentRetryableError,
     InvalidStateTransitionError,
+    McpSessionConflictError,
+    McpSessionForbiddenError,
+    McpSessionNotFoundError,
+    McpSessionUnauthorizedError,
     PaymentConflictError,
     PaymentExpiredError,
     PaymentIntegrityError,
@@ -130,6 +134,49 @@ def register_domain_exception_handlers(application: FastAPI) -> None:
     application.add_exception_handler(FulfillmentRetryableError, _fulfillment_retryable_handler)
     application.add_exception_handler(FulfillmentPermanentError, _fulfillment_permanent_handler)
     application.add_exception_handler(FulfillmentIntegrityError, _fulfillment_integrity_handler)
+    application.add_exception_handler(McpSessionUnauthorizedError, _mcp_unauthorized_handler)
+    application.add_exception_handler(McpSessionForbiddenError, _mcp_forbidden_handler)
+    application.add_exception_handler(McpSessionNotFoundError, _mcp_not_found_handler)
+    application.add_exception_handler(McpSessionConflictError, _mcp_conflict_handler)
+
+
+def _mcp_response(error: Exception, status_code: int) -> JSONResponse:
+    assert isinstance(
+        error,
+        (
+            McpSessionUnauthorizedError,
+            McpSessionForbiddenError,
+            McpSessionNotFoundError,
+            McpSessionConflictError,
+        ),
+    )
+    return JSONResponse(
+        status_code=status_code,
+        content={"detail": str(error), "reason_code": error.reason_code},
+        headers={"Cache-Control": "private, no-store", "Pragma": "no-cache"},
+    )
+
+
+async def _mcp_unauthorized_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    response = _mcp_response(error, status.HTTP_401_UNAUTHORIZED)
+    response.headers["WWW-Authenticate"] = 'Bearer realm="metergate-mcp"'
+    return response
+
+
+async def _mcp_forbidden_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _mcp_response(error, status.HTTP_403_FORBIDDEN)
+
+
+async def _mcp_not_found_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _mcp_response(error, status.HTTP_404_NOT_FOUND)
+
+
+async def _mcp_conflict_handler(request: Request, error: Exception) -> JSONResponse:
+    del request
+    return _mcp_response(error, status.HTTP_409_CONFLICT)
 
 
 async def _not_found_handler(

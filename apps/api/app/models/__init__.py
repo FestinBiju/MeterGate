@@ -10,6 +10,8 @@ from app.models.compensation_event import CompensationEvent
 from app.models.entitlement import Entitlement
 from app.models.fulfillment_event import FulfillmentEvent
 from app.models.fulfillment_execution import FulfillmentExecution
+from app.models.human_presence import HumanPresenceProof
+from app.models.mcp import McpAgentSession, McpToolAuditEvent
 from app.models.merchant import Merchant
 from app.models.operator import (
     Incident,
@@ -43,7 +45,10 @@ __all__ = [
     "Entitlement",
     "FulfillmentEvent",
     "FulfillmentExecution",
+    "HumanPresenceProof",
     "Merchant",
+    "McpAgentSession",
+    "McpToolAuditEvent",
     "Incident",
     "OperatorDecision",
     "OperatorAction",

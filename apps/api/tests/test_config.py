@@ -9,6 +9,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 API_ROOT = REPOSITORY_ROOT / "apps" / "api"
 ENVIRONMENT_VARIABLES = (
     "CORS_ALLOWED_ORIGINS",
+    "APP_ENV",
     "DATABASE_URL",
     "HEALTHCHECK_TIMEOUT_SECONDS",
     "LOG_LEVEL",
@@ -23,6 +24,8 @@ ENVIRONMENT_VARIABLES = (
     "SERVICE_NAME",
     "WEBAUTHN_EXPECTED_ORIGINS",
     "WEBAUTHN_RP_ID",
+    "AUTH_COOKIE_SECURE",
+    "MCP_FRONTEND_BASE_URL",
 )
 
 
@@ -86,6 +89,45 @@ def test_get_settings_loads_repository_dotenv_independent_of_working_directory(
 def test_repository_dotenv_path_is_derived_from_config_file() -> None:
     assert REPOSITORY_ENV_FILE == REPOSITORY_ROOT / ".env"
     assert REPOSITORY_ENV_FILE.is_absolute()
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"auth_cookie_secure": False}, "AUTH_COOKIE_SECURE"),
+        (
+            {
+                "webauthn_expected_origins": ["http://example.com"],
+                "cors_allowed_origins": ["http://example.com"],
+                "webauthn_rp_id": "example.com",
+            },
+            "WEBAUTHN_EXPECTED_ORIGINS",
+        ),
+        (
+            {
+                "cors_allowed_origins": ["https://example.com", "http://example.com"],
+                "webauthn_expected_origins": ["https://example.com"],
+                "webauthn_rp_id": "example.com",
+            },
+            "CORS origins",
+        ),
+        ({"mcp_frontend_base_url": "http://example.com/agent-purchases"}, "MCP_FRONTEND_BASE_URL"),
+    ],
+)
+def test_staging_refuses_insecure_browser_configuration(
+    override: dict[str, object], message: str
+) -> None:
+    baseline: dict[str, object] = {
+        "app_env": "staging",
+        "auth_cookie_secure": True,
+        "webauthn_rp_id": "example.com",
+        "webauthn_expected_origins": ["https://example.com"],
+        "cors_allowed_origins": ["https://example.com"],
+        "mcp_frontend_base_url": "https://example.com",
+    }
+    baseline.update(override)
+    with pytest.raises(ValidationError, match=message):
+        build_settings(**baseline)
 
 
 def test_os_environment_overrides_repository_dotenv(

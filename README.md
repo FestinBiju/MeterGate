@@ -30,7 +30,27 @@ The goal is to help merchants become **discoverable, understandable, payable, an
 
 ## Current Milestone
 
-Milestone 9 completes the operator control plane for the verified commerce loop. The Milestone 7 payment, entitlement, HTTP `402`, capability, and real OrbitIntel fulfillment boundaries and the Milestone 8 compensation/refund boundary remain intact. Operators can inspect authoritative evidence, acknowledge evidence-bound incidents, and invoke bounded legal recovery services, but cannot rewrite captured payment history or force commerce state. Commerce completes only through trusted fulfillment success or trusted provider `processed` refund evidence, and value stays quarantined while compensation or refund state is ambiguous. Test Mode does not move real money. Subscriptions, MCP, and autonomous-agent orchestration remain outside this milestone.
+Milestone 11 makes the verified commerce loop deployable and measurable. Powerful MCP buyer sessions now require a one-use, action-bound Proof of Human Presence created by `userVerification=required` WebAuthn rather than a visual CAPTCHA. Staging configuration fails closed on insecure cookies/origins or non-Test Razorpay mode; Docker deployment references, CI, secret scanning, guarded demo preparation, sanitized transaction evidence export, and a machine-produced 60-scenario evaluation harness are included. The visual redesign remains frozen pending its dedicated design skill.
+
+## Agent Interface
+
+`packages/mcp` provides a local stdio server built with the official Model Context Protocol TypeScript SDK. The web application's **Agent Connections** section creates short-lived account-scoped credentials, displays each secret once, stores only its SHA-256 hash, and supports immediate revocation. The credential is separate from the browser's HttpOnly session cookie and CSRF secret, expires within a configured maximum, and never carries operator or passkey authority.
+
+## MCP Tools
+
+The ten composable tools are `list_services`, `get_service`, `inspect_payment_requirement`, `request_quote`, `create_buyer_policy`, `evaluate_quote`, `get_purchase_status`, `get_entitlement`, `request_capability`, and `execute_paid_resource`. Strict schemas reject unknown fields, money overrides, arbitrary subjects, and oversized input. Each handler delegates to existing application services and emits a secret-free, append-only audit event. See [`docs/mcp/tools.md`](docs/mcp/tools.md).
+
+## 402-first Agent Commerce
+
+An agent may begin with only `POST /api/v1/resources/orbitintel/orbital-risk-report/execute` and `{"norad_id":25544}`. `inspect_payment_requirement` returns that gateway's actual machine-readable `402` contract. The agent follows its service and quote recipe, applies the buyer's deterministic policy, pauses for human approval and Checkout, then observes verified payment and entitlement state before using a narrow capability on the exact resource. See [`docs/mcp/402-first-flow.md`](docs/mcp/402-first-flow.md).
+
+## Human Approval Boundary
+
+MCP has no approval or payment-mutation tool. Policy `ALLOW` returns `MCP_HUMAN_APPROVAL_REQUIRED` and a server-generated `/agent-purchases/{evaluation_id}` link. The owning user opens the trusted web UI, reviews authoritative merchant/service/price/policy evidence, approves through the existing WebAuthn component, and completes Razorpay Test Mode Checkout. The agent waits and only reads subsequent state.
+
+## Reference Buyer Agent
+
+The reference CLI in `packages/mcp` interprets a request such as “Get an orbital risk report for NORAD 25544. Spend no more than ₹10. One-time only,” selects a relevant catalog service, and uses only MeterGate tools for commerce facts. The default planner is deterministic and replaceable with an LLM only for intent/service selection. An adversarial catalog prompt that asks for a ₹999 purchase still reaches deterministic policy `DENY_AMOUNT_EXCEEDS_LIMIT` and stops before value release. Setup and resume commands are in [`docs/mcp/reference-buyer.md`](docs/mcp/reference-buyer.md).
 
 ## Operator Control Plane
 
@@ -391,7 +411,7 @@ Remove-Item Env:RUN_CELESTRAK_INTEGRATION
 
 Network/upstream failures and other explicitly retryable merchant errors enter `retryable_failure`; a later exact request resumes the same `ful_…` execution and idempotency key within the configured attempt bound. Invalid merchant responses fail closed into reconciliation-required evidence. A permanent merchant error, stale-execution retry exhaustion, or exhausted retryable failure enters `permanent_failure`, releases no result, and records `compensation_required=true` plus an append-only `COMPENSATION_REQUIRED` event. Fulfillment failure does not rewrite the valid captured payment as unpaid and never returns fake success.
 
-`ORBITINTEL_DEV_FAULT_MODE=retryable|permanent` provides configuration-controlled acceptance testing only when `ORBITINTEL_ENVIRONMENT` is `development` or `test`; production startup rejects it. Milestone 8 consumes the permanent-failure obligation through the compensation boundary below. Subscriptions, MCP, and autonomous-agent orchestration remain outside this milestone.
+`ORBITINTEL_DEV_FAULT_MODE=retryable|permanent` provides configuration-controlled acceptance testing only when `ORBITINTEL_ENVIRONMENT` is `development` or `test`; production startup rejects it. Milestone 8 consumes the permanent-failure obligation through the compensation boundary below. Subscriptions, unattended purchasing, and Live Mode remain outside the supported product.
 
 ## Compensation
 
@@ -508,6 +528,14 @@ uv run pytest -q
 ```powershell
 Set-Location apps/web
 npm run lint
+npm test -- --run
+npm run build
+```
+
+```powershell
+Set-Location packages/mcp
+npm run lint
+npm test
 npm run build
 ```
 

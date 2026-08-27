@@ -13,7 +13,9 @@ from app.api.health import router as health_router
 from app.api.v1.router import router as api_v1_router
 from app.cache.approval_challenges import ChallengeStore, RedisChallengeStore
 from app.cache.auth import AuthStore, RedisAuthStore
-from app.cache.operator import RedisOperatorRateLimiter
+from app.cache.human_presence import HumanPresenceStore, RedisHumanPresenceStore
+from app.cache.mcp import McpRateLimiter, RedisMcpRateLimiter
+from app.cache.operator import OperatorRateLimiter, RedisOperatorRateLimiter
 from app.cache.payment_webhooks import RedisPaymentWebhookQueue, WebhookQueuePublisher
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
@@ -36,6 +38,9 @@ def create_app(
     payment_provider: PaymentProvider | None = None,
     payment_webhook_queue: WebhookQueuePublisher | None = None,
     fulfillment_provider: FulfillmentProvider | None = None,
+    operator_rate_limiter: OperatorRateLimiter | None = None,
+    mcp_rate_limiter: McpRateLimiter | None = None,
+    human_presence_store: HumanPresenceStore | None = None,
 ) -> FastAPI:
     """Build an application with injectable durable and ephemeral infrastructure."""
     effective_settings = settings or get_settings()
@@ -131,8 +136,14 @@ def create_app(
         effective_settings
     )
     application.state.redis_client = redis_client
-    application.state.operator_rate_limiter = (
+    application.state.operator_rate_limiter = operator_rate_limiter or (
         RedisOperatorRateLimiter(redis_client) if redis_client is not None else None
+    )
+    application.state.mcp_rate_limiter = mcp_rate_limiter or (
+        RedisMcpRateLimiter(redis_client) if redis_client is not None else None
+    )
+    application.state.human_presence_store = human_presence_store or (
+        RedisHumanPresenceStore(redis_client) if redis_client is not None else None
     )
 
     application.add_middleware(

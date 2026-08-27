@@ -29,7 +29,10 @@ def test_migrations_upgrade_and_downgrade_with_injected_connection() -> None:
             "entitlements",
             "fulfillment_events",
             "fulfillment_executions",
+            "human_presence_proofs",
             "merchants",
+            "mcp_agent_sessions",
+            "mcp_tool_audit_events",
             "incidents",
             "operator_decisions",
             "operator_actions",
@@ -48,6 +51,48 @@ def test_migrations_upgrade_and_downgrade_with_injected_connection() -> None:
             "service_fulfillment_configs",
             "services",
             "worker_heartbeats",
+        }
+        assert {column["name"] for column in inspector.get_columns("mcp_agent_sessions")} == {
+            "id",
+            "account_id",
+            "token_hash",
+            "scopes",
+            "created_at",
+            "expires_at",
+            "last_used_at",
+            "revoked_at",
+        }
+        assert {column["name"] for column in inspector.get_columns("human_presence_proofs")} == {
+            "id",
+            "account_id",
+            "session_id_hash",
+            "passkey_credential_id",
+            "action_class",
+            "resource_binding",
+            "origin",
+            "challenge_hash",
+            "presence_version",
+            "presence_hash",
+            "issued_at",
+            "expires_at",
+            "consumed_at",
+        }
+        assert "token" not in {
+            column["name"] for column in inspector.get_columns("mcp_agent_sessions")
+        }
+        assert {index["name"] for index in inspector.get_indexes("mcp_agent_sessions")} >= {
+            "ix_mcp_agent_sessions_account_created",
+            "ix_mcp_agent_sessions_expiry",
+        }
+        assert {column["name"] for column in inspector.get_columns("mcp_tool_audit_events")} == {
+            "id",
+            "agent_session_id",
+            "account_id",
+            "tool_name",
+            "correlation_id",
+            "resource_ids",
+            "result_code",
+            "occurred_at",
         }
         account_columns = {column["name"] for column in inspector.get_columns("accounts")}
         assert account_columns == {

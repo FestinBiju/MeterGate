@@ -1,4 +1,3 @@
 # Shared Packages
 
-Cross-application protocol, policy, SDK, and MCP packages will be added here in their respective milestones. The foundation milestone intentionally contains no shared business logic.
-
+`mcp/` contains MeterGate's official-SDK stdio MCP adapter and reference buyer. It is deliberately orchestration-only: all policy, payment, entitlement, capability, fulfillment, compensation, and refund authority stays in the existing API application services.

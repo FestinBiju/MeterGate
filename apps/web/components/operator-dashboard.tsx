@@ -26,6 +26,14 @@ type CaseDetail = {
 type TimelineEvent = { kind: string; event_type: string; reason_code?: string; occurred_at: string; actor_type: string };
 type Review = { action: string; transaction_id: string; payment_id?: string; amount: number; currency: string; fulfillment_id: string; failure_code: string; refund_on_failure: boolean; recommended_action: string; decision_state: string };
 type Confirmation = { label: string; path: string; body?: Record<string, unknown>; review?: Review };
+type Metrics = {
+  demo_mode?: boolean; total_transactions?: number; paid_transactions?: number;
+  test_gmv_minor?: number; refunds_completed?: number; unresolved_incidents?: number;
+  agent_test_gmv_minor?: number; successful_agent_purchases?: number;
+  agent_policy_denials?: number; agent_payment_failures_handled?: number;
+  agent_fulfillment_successes?: number; agent_refund_recoveries?: number;
+  average_agent_access_latency_ms?: number;
+};
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const base = configuredApiBaseEndpoint();
@@ -48,7 +56,7 @@ export function OperatorDashboard() {
   const [items, setItems] = useState<WorkItem[]>([]);
   const [alerts, setAlerts] = useState<WorkItem[]>([]);
   const [health, setHealth] = useState<Health | null>(null);
-  const [metrics, setMetrics] = useState<Record<string, number>>({});
+  const [metrics, setMetrics] = useState<Metrics>({});
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [detail, setDetail] = useState<CaseDetail | null>(null);
   const [timeline, setTimeline] = useState<TimelineEvent[]>([]);
@@ -64,7 +72,7 @@ export function OperatorDashboard() {
     try {
       const [work, alertRows, system, metricRows, txs, auth] = await Promise.all([
         api<WorkItem[]>("/operator/work-items"), api<WorkItem[]>("/operator/alerts"),
-        api<Health>("/operator/system-health"), api<Record<string, number>>("/operator/metrics/summary"),
+        api<Health>("/operator/system-health"), api<Metrics>("/operator/metrics/summary"),
         api<Transaction[]>("/operator/transactions"), api<{ csrf_token: string }>("/auth/session"),
       ]);
       setItems(work); setAlerts(alertRows); setHealth(system); setMetrics(metricRows); setTransactions(txs); setCsrf(auth.csrf_token);
@@ -139,6 +147,7 @@ export function OperatorDashboard() {
     {notice && <section className="my-6 rounded-xl border border-emerald-400/30 bg-emerald-400/10 p-5 text-sm text-emerald-100">{notice}</section>}
     {!loading && !error && <>
       <section className="grid gap-3 py-7 sm:grid-cols-2 lg:grid-cols-5">{[["Transactions", metrics.total_transactions], ["Paid", metrics.paid_transactions], ["Test GMV", money(metrics.test_gmv_minor ?? 0, "INR")], ["Refunded", metrics.refunds_completed], ["Open incidents", metrics.unresolved_incidents]].map(([label, value]) => <article key={label} className="rounded-xl border border-white/10 bg-white/[.035] p-4"><p className="text-xs uppercase tracking-wider text-slate-500">{label}</p><p className="mt-2 text-2xl font-semibold">{value ?? 0}</p></article>)}</section>
+      {metrics.demo_mode && <section className="mb-7"><h2 className="text-xl font-semibold">Hackathon agent metrics</h2><p className="mt-1 text-xs text-slate-500">Derived from MCP audit IDs and authoritative commerce records; no synthetic counters.</p><div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">{[["Agent Test GMV", money(metrics.agent_test_gmv_minor ?? 0, "INR")], ["Successful agent purchases", metrics.successful_agent_purchases], ["Policy denials", metrics.agent_policy_denials], ["Payment failures handled", metrics.agent_payment_failures_handled], ["Fulfillment successes", metrics.agent_fulfillment_successes], ["Refund recoveries", metrics.agent_refund_recoveries], ["Average access latency", `${Math.round(metrics.average_agent_access_latency_ms ?? 0)} ms`]].map(([label, value]) => <article key={label} className="rounded-xl border border-cyan-300/15 p-4"><p className="text-xs uppercase tracking-wider text-slate-500">{label}</p><p className="mt-2 text-xl font-semibold">{value ?? 0}</p></article>)}</div></section>}
       <section className="grid gap-6 lg:grid-cols-[1.2fr_.8fr]"><div><h2 className="text-xl font-semibold">Recovery queue</h2><div className="mt-3 overflow-hidden rounded-xl border border-white/10">{items.length === 0 ? <p className="p-5 text-sm text-slate-400">No unresolved projected work.</p> : items.map(item => <button key={`${item.type}:${item.resource_id}`} onClick={() => item.transaction_id && void openTransaction(item.transaction_id)} disabled={!item.transaction_id} className="grid w-full gap-1 border-t border-white/[.07] px-4 py-3 text-left text-sm first:border-t-0 enabled:hover:bg-white/[.04] sm:grid-cols-[1.5fr_.6fr_1fr]"><strong>{item.type.replaceAll("_", " ")}</strong><span className={item.severity === "critical" ? "text-rose-300" : "text-amber-300"}>{item.severity}</span><code className="truncate text-xs text-cyan-200">{item.resource_id}</code><span className="text-xs text-slate-500 sm:col-span-3">{item.reason_code} · {Math.floor(item.age_seconds / 60)}m</span></button>)}</div></div>
       <div><h2 className="text-xl font-semibold">Alerts</h2><div className="mt-3 space-y-2">{alerts.length === 0 ? <p className="rounded-xl border border-white/10 p-4 text-sm text-slate-400">No active high-severity alerts.</p> : alerts.map(alert => <div key={`${alert.type}:${alert.resource_id}`} className="rounded-lg border border-amber-300/20 bg-amber-300/[.06] p-3 text-sm"><strong>{alert.type.replaceAll("_", " ")}</strong><p className="mt-1 text-xs text-amber-100/60">{alert.reason_code}</p></div>)}</div></div></section>
       <section className="mt-8"><h2 className="text-xl font-semibold">Historical commerce</h2><div className="mt-3 flex gap-3 overflow-x-auto pb-2">{transactions.map(tx => <button key={tx.transaction_id} onClick={() => void openTransaction(tx.transaction_id)} className="min-w-72 rounded-xl border border-white/10 p-4 text-left hover:border-cyan-300/30"><code className="text-xs text-cyan-200">{tx.transaction_id}</code><p className="mt-2 font-medium">{money(tx.amount, tx.currency)} · {tx.payment_state}</p><p className="mt-1 text-xs text-slate-500">{tx.account_id}</p></button>)}</div></section>

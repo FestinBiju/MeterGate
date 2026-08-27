@@ -16,7 +16,11 @@ IdPrefix = Literal[
     "ent_",
     "ful_",
     "fve_",
+    "hpc_",
+    "hpp_",
     "mrc_",
+    "mas_",
+    "mca_",
     "obx_",
     "opr_",
     "opd_",
@@ -48,7 +52,11 @@ COMPENSATION_EVENT_ID_PREFIX: IdPrefix = "cpe_"
 ENTITLEMENT_ID_PREFIX: IdPrefix = "ent_"
 FULFILLMENT_EXECUTION_ID_PREFIX: IdPrefix = "ful_"
 FULFILLMENT_EVENT_ID_PREFIX: IdPrefix = "fve_"
+HUMAN_PRESENCE_CHALLENGE_ID_PREFIX: IdPrefix = "hpc_"
+HUMAN_PRESENCE_PROOF_ID_PREFIX: IdPrefix = "hpp_"
 MERCHANT_ID_PREFIX: IdPrefix = "mrc_"
+MCP_AGENT_SESSION_ID_PREFIX: IdPrefix = "mas_"
+MCP_AUDIT_EVENT_ID_PREFIX: IdPrefix = "mca_"
 COMMERCE_OUTBOX_EVENT_ID_PREFIX: IdPrefix = "obx_"
 OPERATOR_ROLE_ID_PREFIX: IdPrefix = "opr_"
 OPERATOR_DECISION_ID_PREFIX: IdPrefix = "opd_"
@@ -91,7 +99,11 @@ def generate_id(prefix: IdPrefix) -> str:
         ENTITLEMENT_ID_PREFIX,
         FULFILLMENT_EXECUTION_ID_PREFIX,
         FULFILLMENT_EVENT_ID_PREFIX,
+        HUMAN_PRESENCE_CHALLENGE_ID_PREFIX,
+        HUMAN_PRESENCE_PROOF_ID_PREFIX,
         MERCHANT_ID_PREFIX,
+        MCP_AGENT_SESSION_ID_PREFIX,
+        MCP_AUDIT_EVENT_ID_PREFIX,
         COMMERCE_OUTBOX_EVENT_ID_PREFIX,
         OPERATOR_ROLE_ID_PREFIX,
         OPERATOR_DECISION_ID_PREFIX,
@@ -159,8 +171,24 @@ def new_fulfillment_event_id() -> str:
     return generate_id(FULFILLMENT_EVENT_ID_PREFIX)
 
 
+def new_human_presence_challenge_id() -> str:
+    return generate_id(HUMAN_PRESENCE_CHALLENGE_ID_PREFIX)
+
+
+def new_human_presence_proof_id() -> str:
+    return generate_id(HUMAN_PRESENCE_PROOF_ID_PREFIX)
+
+
 def new_merchant_id() -> str:
     return generate_id(MERCHANT_ID_PREFIX)
+
+
+def new_mcp_agent_session_id() -> str:
+    return generate_id(MCP_AGENT_SESSION_ID_PREFIX)
+
+
+def new_mcp_audit_event_id() -> str:
+    return generate_id(MCP_AUDIT_EVENT_ID_PREFIX)
 
 
 def new_commerce_outbox_event_id() -> str:

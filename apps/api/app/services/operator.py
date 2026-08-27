@@ -26,6 +26,7 @@ from app.models import (
     CompensationCase,
     FulfillmentExecution,
     Incident,
+    McpToolAuditEvent,
     Merchant,
     OperatorAction,
     OperatorDecision,
@@ -33,6 +34,7 @@ from app.models import (
     PaymentRefund,
     PaymentTransaction,
     PaymentTransactionEvent,
+    PolicyEvaluation,
     Quote,
     RefundOutboxEvent,
     Service,
@@ -661,6 +663,92 @@ class OperatorService:
         stuck = len(
             [item for item in await self.work_items() if item.type.endswith("outbox_stuck")]
         )
+        evaluation_audits = list(
+            (
+                await self.session.scalars(
+                    select(McpToolAuditEvent).where(
+                        McpToolAuditEvent.tool_name == "evaluate_quote",
+                        McpToolAuditEvent.result_code == "MCP_POLICY_EVALUATED",
+                    )
+                )
+            ).all()
+        )
+        agent_evaluation_ids = {
+            value
+            for event in evaluation_audits
+            if isinstance((value := event.resource_ids.get("evaluation_id")), str)
+        }
+        agent_evaluations = (
+            list(
+                (
+                    await self.session.scalars(
+                        select(PolicyEvaluation).where(
+                            PolicyEvaluation.id.in_(agent_evaluation_ids)
+                        )
+                    )
+                ).all()
+            )
+            if agent_evaluation_ids
+            else []
+        )
+        agent_transactions = (
+            list(
+                (
+                    await self.session.scalars(
+                        select(PaymentTransaction).where(
+                            PaymentTransaction.evaluation_id.in_(agent_evaluation_ids)
+                        )
+                    )
+                ).all()
+            )
+            if agent_evaluation_ids
+            else []
+        )
+        agent_transaction_ids = {transaction.id for transaction in agent_transactions}
+        agent_paid = [
+            transaction
+            for transaction in agent_transactions
+            if PaymentTransactionState(transaction.transaction_state)
+            is PaymentTransactionState.PAID
+        ]
+        agent_executions = (
+            list(
+                (
+                    await self.session.scalars(
+                        select(FulfillmentExecution).where(
+                            FulfillmentExecution.transaction_id.in_(agent_transaction_ids)
+                        )
+                    )
+                ).all()
+            )
+            if agent_transaction_ids
+            else []
+        )
+        completed_latencies = [
+            (execution.completed_at - execution.started_at).total_seconds() * 1000
+            for execution in agent_executions
+            if execution.started_at is not None and execution.completed_at is not None
+        ]
+        agent_payment_failures = (
+            await self.session.scalar(
+                select(func.count(PaymentTransactionEvent.id)).where(
+                    PaymentTransactionEvent.transaction_id.in_(agent_transaction_ids),
+                    PaymentTransactionEvent.event_type == "payment_attempt_failed",
+                )
+            )
+            if agent_transaction_ids
+            else 0
+        ) or 0
+        agent_refund_recoveries = (
+            await self.session.scalar(
+                select(func.count(PaymentRefund.id)).where(
+                    PaymentRefund.transaction_id.in_(agent_transaction_ids),
+                    PaymentRefund.refund_state == PaymentRefundState.REFUNDED,
+                )
+            )
+            if agent_transaction_ids
+            else 0
+        ) or 0
         return {
             "total_transactions": total,
             "paid_transactions": paid,
@@ -678,6 +766,21 @@ class OperatorService:
             "reconciliation_anomalies": anomalies,
             "unresolved_incidents": anomalies,
             "stuck_outbox_count": stuck,
+            "agent_test_gmv_minor": sum(transaction.amount for transaction in agent_paid),
+            "successful_agent_purchases": len(agent_paid),
+            "agent_policy_denials": sum(
+                str(evaluation.decision) == "deny" for evaluation in agent_evaluations
+            ),
+            "agent_payment_failures_handled": int(agent_payment_failures),
+            "agent_fulfillment_successes": sum(
+                FulfillmentExecutionState(execution.execution_state)
+                is FulfillmentExecutionState.SUCCEEDED
+                for execution in agent_executions
+            ),
+            "agent_refund_recoveries": int(agent_refund_recoveries),
+            "average_agent_access_latency_ms": (
+                sum(completed_latencies) / len(completed_latencies) if completed_latencies else 0.0
+            ),
         }
 
     async def metrics(self) -> str:

@@ -8,6 +8,8 @@ from app.api.v1.auth import router as auth_router
 from app.api.v1.catalog import router as catalog_router
 from app.api.v1.compensations import router as compensations_router
 from app.api.v1.entitlements import router as entitlements_router
+from app.api.v1.human_presence import router as human_presence_router
+from app.api.v1.mcp import router as mcp_router
 from app.api.v1.merchants import router as merchants_router
 from app.api.v1.operator import router as operator_router
 from app.api.v1.payments import router as payments_router
@@ -19,6 +21,7 @@ from app.api.v1.services import router as services_router
 
 router = APIRouter(prefix="/api/v1")
 router.include_router(auth_router)
+router.include_router(human_presence_router)
 router.include_router(approval_identities_router)
 router.include_router(approvals_router)
 router.include_router(merchants_router)
@@ -32,3 +35,4 @@ router.include_router(compensations_router)
 router.include_router(entitlements_router)
 router.include_router(resources_router)
 router.include_router(operator_router)
+router.include_router(mcp_router)

@@ -12,37 +12,22 @@ from app.api.v1.dependencies import (
     SettingsDependency,
     _single_header,
 )
-from app.domain.enums import MerchantStatus, ServiceStatus
 from app.domain.exceptions import (
     CapabilityInvalidError,
     FulfillmentPermanentError,
-    QuoteInputIssue,
-    QuoteInputValidationError,
-    ResourceNotFoundError,
     ResourceRequestError,
-    ServiceConfigurationError,
 )
 from app.domain.json_schema import MAX_INSTANCE_TEXT_BYTES
-from app.domain.media_types import normalize_json_content_type
-from app.domain.service_input import (
-    ServiceInputConfigurationError,
-    ServiceInputValueError,
-    validate_normalize_and_hash_service_input,
-)
 from app.providers.fulfillment import FulfillmentProvider, UnavailableFulfillmentProvider
-from app.repositories import MerchantRepository, ServiceRepository
 from app.schemas.entitlements import (
     FulfillmentPendingResponse,
     FulfillmentResultResponse,
     PaymentRequiredResponse,
-    QuoteLink,
-    QuoteRequestDescription,
-    ResourceAccessDescription,
-    ResourceParty,
 )
 from app.services.capabilities import CapabilityTokenService
 from app.services.fulfillments import FulfillmentApplicationService
 from app.services.payments import PaymentApplicationService
+from app.services.resources import payment_required_projection
 
 router = APIRouter(prefix="/resources", tags=["protected resources"])
 
@@ -148,6 +133,22 @@ async def execute_protected_resource(
     )
 
 
+async def _payment_required(
+    session: SessionDependency,
+    *,
+    merchant_slug: str,
+    service_slug: str,
+    input_value: object,
+) -> PaymentRequiredResponse:
+    """Compatibility seam around the shared authoritative 402 projection."""
+    return await payment_required_projection(
+        session,
+        merchant_slug=merchant_slug,
+        service_slug=service_slug,
+        input_value=input_value,
+    )
+
+
 async def _read_bounded_json(request: Request) -> object:
     content_length = _single_header(request, b"content-length")
     if content_length is not None:
@@ -191,52 +192,3 @@ async def _read_bounded_json(request: Request) -> object:
             "Protected resource body is not valid JSON",
             "RESOURCE_REQUEST_BODY_INVALID",
         ) from error
-
-
-async def _payment_required(
-    session: SessionDependency,
-    *,
-    merchant_slug: str,
-    service_slug: str,
-    input_value: object,
-) -> PaymentRequiredResponse:
-    merchant = await MerchantRepository(session).get_by_slug(merchant_slug)
-    if merchant is None or MerchantStatus(merchant.status) is not MerchantStatus.ACTIVE:
-        raise ResourceNotFoundError("Merchant", merchant_slug)
-    service = await ServiceRepository(session).get_by_slug(merchant.id, service_slug)
-    if service is None or ServiceStatus(service.status) is not ServiceStatus.ACTIVE:
-        raise ResourceNotFoundError("Service", service_slug)
-    if normalize_json_content_type(service.output_content_type) is None:
-        raise ServiceConfigurationError(service.id)
-    try:
-        canonical_input = validate_normalize_and_hash_service_input(
-            input_value,
-            service.input_schema,
-        )
-    except ServiceInputValueError as error:
-        raise QuoteInputValidationError(
-            tuple(QuoteInputIssue(path=path, keyword=keyword) for path, keyword in error.violations)
-        ) from error
-    except ServiceInputConfigurationError as error:
-        raise ServiceConfigurationError(service.id) from error
-    party_merchant = ResourceParty(
-        id=merchant.id,
-        slug=merchant.slug,
-        name=merchant.name,
-    )
-    party_service = ResourceParty(
-        id=service.id,
-        slug=service.slug,
-        name=service.name,
-    )
-    return PaymentRequiredResponse(
-        merchant=party_merchant,
-        service=party_service,
-        quote=QuoteLink(
-            request=QuoteRequestDescription(
-                service_id=service.id,
-                input=canonical_input.value,
-            )
-        ),
-        access=ResourceAccessDescription(),
-    )
