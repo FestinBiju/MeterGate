@@ -4,82 +4,21 @@ import { AgentConnections } from "@/components/agent-connections";
 import { ServiceCatalog } from "@/components/service-catalog";
 import { SystemStatus } from "@/components/system-status";
 
-const stack = ["Next.js", "FastAPI", "PostgreSQL", "Redis"];
+const flow = ["402", "Quote", "Policy", "Human approval", "Razorpay", "Entitlement", "Result"];
+const metrics = ["Active services", "Test GMV", "Successful transactions", "Policy denials", "Refunds recovered"];
+
+function Navigation() {
+  return <nav className="site-nav" aria-label="Primary navigation"><div className="site-container site-nav-inner"><a className="site-wordmark" href="#top">MeterGate</a><div className="site-links"><a href="#product">Product</a><a href="#agent-flow">Agent Flow</a><a href="#security">Security</a><a href="#developer">Developer</a><a href="/operator">Operator</a></div><div className="site-nav-actions"><a className="site-nav-action" href="#buyer-account">Sign in</a><a className="site-nav-action primary" href="#live-demo">View Demo</a></div></div></nav>;
+}
 
 export default function Home() {
-  return (
-    <div className="relative min-h-screen overflow-hidden bg-[#080b10] text-slate-100">
-      <div
-        aria-hidden="true"
-        className="pointer-events-none absolute inset-x-0 top-0 h-[32rem] bg-[radial-gradient(circle_at_20%_0%,rgba(56,189,248,0.12),transparent_38%),radial-gradient(circle_at_85%_8%,rgba(45,212,191,0.09),transparent_28%)]"
-      />
-
-      <header className="relative mx-auto flex w-full max-w-6xl items-center justify-between px-6 py-7 lg:px-8">
-        <div className="flex items-center gap-3">
-          <span className="grid size-9 place-items-center rounded-xl border border-cyan-300/20 bg-cyan-300/10 text-sm font-semibold text-cyan-200 shadow-[0_0_32px_rgba(34,211,238,0.08)]">
-            M
-          </span>
-          <span className="text-sm font-semibold tracking-wide text-white">
-            MeterGate
-          </span>
-        </div>
-
-        <div className="flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-slate-300">
-          <span className="size-1.5 rounded-full bg-cyan-300" />
-          Razorpay Test Mode
-        </div>
-      </header>
-
-      <main className="relative mx-auto w-full max-w-6xl px-6 pb-20 pt-16 lg:px-8 lg:pb-28 lg:pt-24">
-        <div className="grid gap-14 lg:grid-cols-[minmax(0,1.05fr)_minmax(25rem,0.95fr)] lg:items-center lg:gap-20">
-          <section>
-            <p className="mb-6 text-xs font-semibold uppercase tracking-[0.24em] text-cyan-300">
-              Authenticated buyer · Trusted payment
-            </p>
-            <h1 className="max-w-2xl text-5xl font-semibold tracking-[-0.045em] text-white sm:text-6xl lg:text-7xl">
-              MeterGate
-            </h1>
-            <p className="mt-7 max-w-xl text-xl leading-8 text-slate-200 sm:text-2xl sm:leading-9">
-              A Razorpay-native agent storefront for paid APIs and digital
-              services
-            </p>
-            <p className="mt-6 max-w-lg text-sm leading-6 text-slate-400 sm:text-base sm:leading-7">
-              Passkey-first accounts bind deterministic buyer policies, explicit
-              human approval, and server-verified Razorpay Test Mode payments to
-              one authenticated owner.
-            </p>
-
-            <ul
-              className="mt-9 flex flex-wrap gap-2"
-              aria-label="Foundation stack"
-            >
-              {stack.map((technology) => (
-                <li
-                  key={technology}
-                  className="rounded-full border border-white/10 bg-white/[0.035] px-3 py-1.5 text-xs text-slate-400"
-                >
-                  {technology}
-                </li>
-              ))}
-            </ul>
-          </section>
-
-          <SystemStatus />
-        </div>
-
-        <AccountSessionProvider>
-          <AccountAuth />
-          <AgentConnections />
-          <ServiceCatalog />
-        </AccountSessionProvider>
-      </main>
-
-      <footer className="relative border-t border-white/[0.06]">
-        <div className="mx-auto flex w-full max-w-6xl flex-col gap-2 px-6 py-6 text-xs text-slate-500 sm:flex-row sm:items-center sm:justify-between lg:px-8">
-          <span>MeterGate trusted payment</span>
-          <span>Razorpay Test Mode · Backend-verified payment state</span>
-        </div>
-      </footer>
-    </div>
-  );
+  return <div id="top" className="minimal-shell"><Navigation/><main>
+    <section className="hero"><div className="site-container"><p className="eyebrow">Agent commerce infrastructure · Razorpay Test Mode</p><h1>Make your API sellable to AI.</h1><p className="hero-copy">MeterGate lets AI agents discover, authorize, pay for, and access digital services through Razorpay — without giving agents unrestricted payment authority.</p><div className="hero-actions"><a className="button primary" href="#live-demo">Explore the live flow</a><a className="button" href="#developer">View architecture</a></div><p className="principle">AI proposes. Deterministic systems authorize. Humans approve.</p><div className="infra-flow" aria-label="MeterGate commerce sequence">{flow.map(step=><div className="flow-step" key={step}>{step}</div>)}</div></div></section>
+    <section id="product" className="content-section"><div className="site-container"><div className="section-head"><h2>Commerce primitives, not payment authority.</h2><p>MeterGate translates a protected API into a machine-readable purchase path while keeping price, policy, approval, payment verification, and value release inside deterministic boundaries.</p></div><div className="three-up"><div className="feature"><h3>Machine-readable commerce</h3><p>Structured 402 responses lead agents to server-priced quotes and explicit next actions.</p></div><div className="feature"><h3>Bounded money authority</h3><p>Immutable policies evaluate amount, currency, merchant, service, and purchase type.</p></div><div className="feature"><h3>Verified value release</h3><p>Captured payment produces a narrow entitlement before protected fulfillment can run.</p></div></div></div></section>
+    <section id="agent-flow" className="content-section"><div className="site-container"><div className="section-head"><h2>AI can act. Authority stays bounded.</h2><p>Deterministic policy, passkey approval, Proof of Human Presence, verified capture, and entitlement-bound access remain separate, observable stages.</p></div><div className="technical-grid"><ul className="technical-list"><li><span>Deterministic policy</span><code>ALLOW / DENY</code></li><li><span>Passkey approval</span><code>userVerification=required</code></li><li><span>Proof of Human Presence</span><code>action-bound · short-lived</code></li><li><span>Payment capture</span><code>backend verified</code></li><li><span>Access</span><code>entitlement-bound</code></li></ul><pre className="code-block" aria-label="Actual 402 contract example"><code>{`POST /api/v1/resources/orbitintel/orbital-risk-report/execute\n\n{"norad_id": 25544}\n\n`}<span className="code-status">402 Payment Required</span>{`\n{\n  "type": "metergate_payment_required",\n  "protocol": "metergate/1",\n  "payment_provider": "razorpay",\n  "access": {"scheme": "Bearer",\n             "maximum_executions": 1}\n}`}</code></pre></div></div></section>
+    <section className="content-section" aria-labelledby="evidence-heading"><div className="site-container"><div className="section-head"><h2 id="evidence-heading">Measured from backend evidence.</h2><p>Public aggregate metrics are not exposed by the current API. Authenticated operators can view real values in the operator console; the landing page does not invent them.</p></div><dl className="metrics-strip">{metrics.map(metric=><div className="metric" key={metric}><dt>{metric}</dt><dd className="empty">Unavailable publicly</dd></div>)}</dl></div></section>
+    <section id="security" className="content-section"><div className="site-container"><div className="section-head"><h2>CAPTCHA tests recognition. MeterGate verifies authority.</h2><p>Visual puzzles are increasingly easy for automated systems to solve. MeterGate instead uses short-lived, action-bound passkey verification for sensitive actions. It requires control of a registered authenticator without claiming to be AI-proof.</p></div></div></section>
+    <section id="developer" className="content-section"><div className="site-container"><div className="section-head"><h2>Built around explicit contracts.</h2><p>Start from HTTP 402, compose quote and policy APIs, pause at human authority, then resume through capability-scoped execution.</p></div><ul className="technical-list"><li><span>402 contract</span><code>POST /api/v1/resources/…/execute</code></li><li><span>Quote API</span><code>POST /api/v1/quotes</code></li><li><span>MCP interface</span><code>10 narrow buyer tools</code></li><li><span>Capability execution</span><code>Authorization: Bearer &lt;capability&gt;</code></li><li><span>Webhook endpoint</span><code>POST /api/v1/webhooks/razorpay</code></li></ul></div></section>
+    <div id="live-demo" className="site-container"><AccountSessionProvider><AccountAuth/><AgentConnections/><ServiceCatalog/></AccountSessionProvider><SystemStatus/></div>
+  </main><footer className="site-footer"><div className="site-container footer-row"><span>MeterGate · agent-readable commerce infrastructure</span><span>Razorpay Test Mode · backend-verified payment state</span></div></footer></div>;
 }

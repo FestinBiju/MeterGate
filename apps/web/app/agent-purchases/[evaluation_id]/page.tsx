@@ -9,7 +9,7 @@ export default async function AgentPurchasePage({
 }) {
   const { evaluation_id: evaluationId } = await params;
   return (
-    <main className="min-h-screen bg-[#080b10] px-6 py-12 text-slate-100">
+    <main className="minimal-shell px-6 py-12">
       <div className="mx-auto max-w-4xl">
         <p className="text-xs font-semibold uppercase tracking-[0.2em] text-cyan-300">Trusted browser boundary</p>
         <h1 className="mt-3 text-4xl font-semibold text-white">Agent purchase handoff</h1>
