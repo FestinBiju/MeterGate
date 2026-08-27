@@ -102,6 +102,10 @@ const dateTimeFormatter = new Intl.DateTimeFormat("en-IN", {
   timeStyle: "medium",
 });
 
+function authorizationStorageKey(evaluationId: string): string {
+  return `metergate:purchase-authorization:v1:${evaluationId}`;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -603,6 +607,7 @@ export function TrustedApproval({
   const [challenge, setChallenge] = useState<ApprovalChallenge | null>(null);
   const [challengeExpired, setChallengeExpired] = useState(false);
   const [authorization, setAuthorization] = useState<Authorization | null>(null);
+  const restoredAuthorizationKey = useRef<string | null>(null);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => {
@@ -638,6 +643,64 @@ export function TrustedApproval({
   const canUsePasskeys = supportChecked && supportFailure === null;
   const session = state.kind === "authenticated" ? state.session : null;
   const accountMatchesPolicy = session?.account.id === policySubjectRef;
+
+  useEffect(() => {
+    if (!session || !accountMatchesPolicy || authorization) {
+      return;
+    }
+
+    const storageKey = authorizationStorageKey(evaluationId);
+    if (restoredAuthorizationKey.current === storageKey) {
+      return;
+    }
+    restoredAuthorizationKey.current = storageKey;
+
+    const authorizationId = window.sessionStorage.getItem(storageKey);
+    if (!authorizationId) {
+      return;
+    }
+
+    let active = true;
+    void requestAuthenticated(
+      `${apiBaseEndpoint}/authorizations/${encodeURIComponent(authorizationId)}`,
+      { method: "GET" },
+    )
+      .then((body) => {
+        const restored = parseAuthorization(body);
+        if (
+          !restored ||
+          restored.id !== authorizationId ||
+          restored.evaluation_id !== evaluationId ||
+          restored.subject_ref !== session.account.id
+        ) {
+          throw new ApprovalRequestFailure(
+            "APPROVAL_RESPONSE_INVALID",
+            "The server returned an unexpected purchase authorization.",
+          );
+        }
+        if (active) {
+          setAuthorization(restored);
+          setApprovalPhase("authorized");
+        }
+      })
+      .catch(() => {
+        window.sessionStorage.removeItem(storageKey);
+        if (active) {
+          setApprovalPhase("idle");
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [
+    accountMatchesPolicy,
+    apiBaseEndpoint,
+    authorization,
+    evaluationId,
+    requestAuthenticated,
+    session,
+  ]);
 
   const prepareReview = async () => {
     if (!session || !accountMatchesPolicy || !canUsePasskeys || approvalBusy) {
@@ -726,6 +789,10 @@ export function TrustedApproval({
       }
 
       setAuthorization(verified);
+      window.sessionStorage.setItem(
+        authorizationStorageKey(evaluationId),
+        verified.id,
+      );
       setChallenge(null);
       setApprovalPhase("authorized");
     } catch (error: unknown) {
