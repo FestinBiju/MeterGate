@@ -30,7 +30,7 @@ The goal is to help merchants become **discoverable, understandable, payable, an
 
 ## Current Milestone
 
-Milestone 11 makes the verified commerce loop deployable and measurable. Powerful MCP buyer sessions now require a one-use, action-bound Proof of Human Presence created by `userVerification=required` WebAuthn rather than a visual CAPTCHA. Staging configuration fails closed on insecure cookies/origins or non-Test Razorpay mode; Docker deployment references, CI, secret scanning, guarded demo preparation, sanitized transaction evidence export, and a machine-produced 60-scenario evaluation harness are included. The visual redesign remains frozen pending its dedicated design skill.
+Milestone 11 makes the verified commerce loop deployable and measurable. Powerful MCP buyer sessions now require a one-use, action-bound Proof of Human Presence created by `userVerification=required` WebAuthn rather than a visual CAPTCHA. Staging configuration fails closed on insecure cookies/origins or non-Test Razorpay mode; Docker deployment references, CI, secret scanning, guarded demo preparation, sanitized transaction evidence export, and a machine-produced 60-scenario evaluation harness are included. The web presentation now follows the repository's TypeUI Minimal design system while preserving the existing commerce, security, and evidence contracts.
 
 ## Agent Interface
 

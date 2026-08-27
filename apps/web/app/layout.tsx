@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { Inconsolata, Inter, Open_Sans } from "next/font/google";
 import type { ReactNode } from "react";
 
 import "./globals.css";
@@ -12,7 +13,12 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: Readonly<{ children: ReactNode }>) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body className={`${bodyFont.variable} ${displayFont.variable} ${monoFont.variable}`}>
+        {children}
+      </body>
     </html>
   );
 }
+const bodyFont = Open_Sans({ subsets: ["latin"], variable: "--font-body" });
+const displayFont = Inter({ subsets: ["latin"], variable: "--font-display" });
+const monoFont = Inconsolata({ subsets: ["latin"], variable: "--font-mono" });

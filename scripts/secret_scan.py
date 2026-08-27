@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PATTERNS = (
     re.compile(rb"rzp_(?:test|live)_[A-Za-z0-9]{8,64}"),
     re.compile(rb"(?:RAZORPAY_KEY_SECRET|RAZORPAY_WEBHOOK_SECRET|ENTITLEMENT_TOKEN_SECRET|ORBITINTEL_SHARED_SECRET)[ \t]*=[ \t]*[A-Za-z0-9_-]{32,256}"),
-    re.compile(rb"mcp_[A-Za-z0-9_-]{43}"),
+    re.compile(rb"(?<![A-Za-z0-9_-])mcp_[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])"),
 )
 
 
@@ -56,14 +56,29 @@ def main() -> int:
     for raw_path in tracked:
         if not raw_path:
             continue
-        path = ROOT / raw_path.decode("utf-8", errors="surrogateescape")
+        display_path = raw_path.decode("utf-8", errors="surrogateescape")
+        path = ROOT / display_path
         try:
-            count += findings(path.read_bytes())
+            file_count = findings(path.read_bytes())
         except OSError:
             continue
+        count += file_count
+        if file_count:
+            print(
+                f"Secret scan candidate location: tracked file {display_path}",
+                file=sys.stderr,
+            )
     # Scan committed patches too, but never print matching lines or values.
     try:
-        count += findings(run("git", "log", "--all", "--format=", "-p", "--no-ext-diff"))
+        history_count = findings(
+            run("git", "log", "--all", "--format=", "-p", "--no-ext-diff")
+        )
+        count += history_count
+        if history_count:
+            print(
+                f"Secret scan candidate location: committed patch history ({history_count})",
+                file=sys.stderr,
+            )
     except subprocess.CalledProcessError:
         pass
     if count:
