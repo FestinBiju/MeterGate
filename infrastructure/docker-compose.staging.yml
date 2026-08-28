@@ -1,0 +1,61 @@
+name: metergate-staging
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?required}
+      POSTGRES_USER: ${POSTGRES_USER:?required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+    volumes: ["staging_postgres:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes: ["staging_redis:/data"]
+  orbitintel:
+    build: ../apps/orbitintel
+    env_file:
+      - path: ../.env.staging
+        required: false
+    depends_on: [redis]
+  api:
+    build: ../apps/api
+    env_file:
+      - path: ../.env.staging
+        required: false
+    ports: ["8000:8000"]
+    depends_on: [postgres, redis, orbitintel]
+  webhook-worker:
+    build: ../apps/api
+    command: ["python", "-m", "app.workers.razorpay_webhooks"]
+    env_file:
+      - path: ../.env.staging
+        required: false
+    depends_on: [postgres, redis]
+  entitlement-worker:
+    build: ../apps/api
+    command: ["python", "-m", "app.workers.entitlements"]
+    env_file:
+      - path: ../.env.staging
+        required: false
+    depends_on: [postgres, redis, orbitintel]
+  refund-worker:
+    build: ../apps/api
+    command: ["python", "-m", "app.workers.refunds"]
+    env_file:
+      - path: ../.env.staging
+        required: false
+    depends_on: [postgres, redis]
+  web:
+    build:
+      context: ../apps/web
+      args: { NEXT_PUBLIC_API_URL: "${PUBLIC_API_URL:?required}" }
+    ports: ["3000:3000"]
+    depends_on: [api]
+volumes:
+  staging_postgres:
+  staging_redis:

@@ -1,0 +1,326 @@
+"""Atomic persistence for the payment transaction aggregate and audit stream."""
+
+from collections.abc import Sequence
+
+from sqlalchemy import inspect as sqlalchemy_inspect
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.domain.enums import (
+    CommerceAggregateType,
+    CommerceOutboxEventType,
+    PaymentTransactionState,
+)
+from app.models import (
+    CommerceOutboxEvent,
+    PaymentAttempt,
+    PaymentTransaction,
+    PaymentTransactionEvent,
+    RazorpayWebhookEvent,
+)
+
+
+class PaymentTransactionRepository:
+    """Lock payment aggregates and commit every revision with append-only evidence."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get(self, transaction_id: str) -> PaymentTransaction | None:
+        return await self._session.get(PaymentTransaction, transaction_id)
+
+    async def get_for_update(self, transaction_id: str) -> PaymentTransaction | None:
+        result = await self._session.scalars(
+            select(PaymentTransaction)
+            .where(PaymentTransaction.id == transaction_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return result.one_or_none()
+
+    async def get_by_authorization_id(
+        self,
+        authorization_id: str,
+    ) -> PaymentTransaction | None:
+        result = await self._session.scalars(
+            select(PaymentTransaction).where(
+                PaymentTransaction.authorization_id == authorization_id
+            )
+        )
+        return result.one_or_none()
+
+    async def get_by_authorization_id_for_update(
+        self,
+        authorization_id: str,
+    ) -> PaymentTransaction | None:
+        result = await self._session.scalars(
+            select(PaymentTransaction)
+            .where(PaymentTransaction.authorization_id == authorization_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return result.one_or_none()
+
+    async def get_by_provider_order_id(
+        self,
+        provider_order_id: str,
+    ) -> PaymentTransaction | None:
+        result = await self._session.scalars(
+            select(PaymentTransaction).where(
+                PaymentTransaction.provider_order_id == provider_order_id
+            )
+        )
+        return result.one_or_none()
+
+    async def get_by_provider_order_id_for_update(
+        self,
+        provider_order_id: str,
+    ) -> PaymentTransaction | None:
+        result = await self._session.scalars(
+            select(PaymentTransaction)
+            .where(PaymentTransaction.provider_order_id == provider_order_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return result.one_or_none()
+
+    async def get_by_provider_receipt(
+        self,
+        provider_receipt: str,
+    ) -> PaymentTransaction | None:
+        result = await self._session.scalars(
+            select(PaymentTransaction).where(
+                PaymentTransaction.provider_receipt == provider_receipt
+            )
+        )
+        return result.one_or_none()
+
+    async def create_with_event(
+        self,
+        transaction: PaymentTransaction,
+        *,
+        event: PaymentTransactionEvent,
+    ) -> PaymentTransaction:
+        """Atomically claim an authorization and create aggregate revision one."""
+        self._require_available_session(transaction, "Payment transaction")
+        self._require_available_session(event, "Payment transaction event")
+        if transaction.revision != 1:
+            raise ValueError("A new payment transaction must start at revision 1")
+        if event.transaction_id != transaction.id or event.transaction_revision != 1:
+            raise ValueError("Initial payment event must describe transaction revision 1")
+        if event.prior_state is not None:
+            raise ValueError("Initial payment event cannot have a prior state")
+        if PaymentTransactionState(event.resulting_state) is not PaymentTransactionState(
+            transaction.transaction_state
+        ):
+            raise ValueError("Initial payment event state does not match the transaction")
+
+        self._session.add(transaction)
+        try:
+            await self._session.flush()
+            self._session.add(event)
+            await self._session.commit()
+        except Exception:
+            await self._session.rollback()
+            raise
+        await self._session.refresh(transaction)
+        await self._session.refresh(event)
+        return transaction
+
+    async def update_with_event(
+        self,
+        transaction: PaymentTransaction,
+        *,
+        event: PaymentTransactionEvent,
+        attempt: PaymentAttempt | None = None,
+        attempts: Sequence[PaymentAttempt] = (),
+        webhook_event: RazorpayWebhookEvent | None = None,
+    ) -> PaymentTransaction:
+        """Commit one aggregate revision and all associated evidence atomically.
+
+        ``transaction`` must have been locked on this session. The caller applies
+        desired lifecycle changes but leaves ``revision`` unchanged; this method
+        owns the single revision increment.
+        """
+        self._require_bound_session(transaction, "Payment transaction")
+        self._require_available_session(event, "Payment transaction event")
+
+        state = sqlalchemy_inspect(transaction)
+        state_history = state.attrs.transaction_state.history
+        prior_state = (
+            state_history.deleted[0]
+            if state_history.has_changes() and state_history.deleted
+            else transaction.transaction_state
+        )
+        next_revision = transaction.revision + 1
+        if event.transaction_id != transaction.id:
+            raise ValueError("Payment event references a different transaction")
+        if event.transaction_revision != next_revision:
+            raise ValueError("Payment event revision does not match the next aggregate revision")
+        if PaymentTransactionState(event.prior_state) is not PaymentTransactionState(prior_state):
+            raise ValueError("Payment event prior state does not match the aggregate")
+        if PaymentTransactionState(event.resulting_state) is not PaymentTransactionState(
+            transaction.transaction_state
+        ):
+            raise ValueError("Payment event resulting state does not match the aggregate")
+
+        first_paid_transition = (
+            PaymentTransactionState(prior_state) is not PaymentTransactionState.PAID
+            and PaymentTransactionState(transaction.transaction_state)
+            is PaymentTransactionState.PAID
+        )
+
+        prerequisite_records: list[object] = [transaction]
+        attempt_records = list(attempts)
+        if attempt is not None:
+            attempt_records.append(attempt)
+        attempt_ids = [payment_attempt.id for payment_attempt in attempt_records]
+        if len(attempt_ids) != len(set(attempt_ids)):
+            raise ValueError("Payment attempt evidence cannot be supplied more than once")
+        for payment_attempt in attempt_records:
+            self._require_available_session(payment_attempt, "Payment attempt")
+            if payment_attempt.transaction_id != transaction.id:
+                raise ValueError("Payment attempt references a different transaction")
+            if payment_attempt.provider_order_id != transaction.provider_order_id:
+                raise ValueError("Payment attempt references a different provider order")
+            prerequisite_records.append(payment_attempt)
+        if (
+            event.payment_attempt_id is not None
+            and attempt_records
+            and event.payment_attempt_id not in attempt_ids
+        ):
+            raise ValueError("Payment event references a different payment attempt")
+        if webhook_event is not None:
+            self._require_available_session(webhook_event, "Razorpay webhook event")
+            if webhook_event.transaction_id != transaction.id:
+                raise ValueError("Webhook evidence references a different transaction")
+            if (
+                event.source_webhook_event_id is not None
+                and event.source_webhook_event_id != webhook_event.id
+            ):
+                raise ValueError("Payment event references different webhook evidence")
+            prerequisite_records.append(webhook_event)
+
+        transaction.revision = next_revision
+        if first_paid_transition:
+            # The paid aggregate revision and its entitlement work become visible
+            # in one commit. The database also carries a deferred guard trigger so
+            # no future code path can persist a first paid transition without this
+            # durable handoff.
+            self._session.add(
+                CommerceOutboxEvent(
+                    event_type=CommerceOutboxEventType.ENTITLEMENT_ISSUANCE_REQUESTED,
+                    aggregate_type=CommerceAggregateType.PAYMENT_TRANSACTION,
+                    aggregate_id=transaction.id,
+                    deduplication_key=f"entitlement:{transaction.id}",
+                    payload_version="1",
+                    payload={
+                        "transaction_id": transaction.id,
+                        "payment_binding_hash": transaction.payment_binding_hash,
+                    },
+                    created_at=event.occurred_at,
+                    available_at=event.occurred_at,
+                    processing_started_at=None,
+                    processed_at=None,
+                    attempt_count=0,
+                    lease_generation=0,
+                    lease_expires_at=None,
+                    last_error_code=None,
+                )
+            )
+        self._session.add_all(prerequisite_records)
+        try:
+            await self._session.flush()
+            self._session.add(event)
+            await self._session.commit()
+        except Exception:
+            await self._session.rollback()
+            raise
+        for record in (*prerequisite_records, event):
+            await self._session.refresh(record)
+        return transaction
+
+    async def update_many_with_events(
+        self,
+        updates: Sequence[tuple[PaymentTransaction, PaymentTransactionEvent]],
+        *,
+        webhook_event: RazorpayWebhookEvent | None = None,
+    ) -> tuple[PaymentTransaction, ...]:
+        """Commit one signed anomaly across every correlated payment aggregate.
+
+        A malformed but authenticated provider event can contain mutually
+        contradictory payment identities.  All locally resolved aggregates must
+        become quarantined atomically, while the immutable provider delivery is
+        still persisted exactly once.
+        """
+        if not updates:
+            raise ValueError("At least one payment transaction update is required")
+        transaction_ids = [transaction.id for transaction, _event in updates]
+        if len(transaction_ids) != len(set(transaction_ids)):
+            raise ValueError("A payment transaction cannot be updated more than once")
+        if webhook_event is not None:
+            self._require_available_session(webhook_event, "Razorpay webhook event")
+            if (
+                webhook_event.transaction_id is not None
+                and webhook_event.transaction_id not in transaction_ids
+            ):
+                raise ValueError("Webhook evidence references a different transaction")
+
+        sourced_events = 0
+        records: list[object] = [] if webhook_event is None else [webhook_event]
+        for transaction, event in updates:
+            self._require_bound_session(transaction, "Payment transaction")
+            self._require_available_session(event, "Payment transaction event")
+            state = sqlalchemy_inspect(transaction)
+            state_history = state.attrs.transaction_state.history
+            prior_state = (
+                state_history.deleted[0]
+                if state_history.has_changes() and state_history.deleted
+                else transaction.transaction_state
+            )
+            next_revision = transaction.revision + 1
+            if event.transaction_id != transaction.id:
+                raise ValueError("Payment event references a different transaction")
+            if event.transaction_revision != next_revision:
+                raise ValueError(
+                    "Payment event revision does not match the next aggregate revision"
+                )
+            if PaymentTransactionState(event.prior_state) is not PaymentTransactionState(
+                prior_state
+            ):
+                raise ValueError("Payment event prior state does not match the aggregate")
+            if PaymentTransactionState(event.resulting_state) is not PaymentTransactionState(
+                transaction.transaction_state
+            ):
+                raise ValueError("Payment event resulting state does not match the aggregate")
+            if event.source_webhook_event_id is not None:
+                if webhook_event is None or event.source_webhook_event_id != webhook_event.id:
+                    raise ValueError("Payment event references different webhook evidence")
+                sourced_events += 1
+            transaction.revision = next_revision
+            records.append(transaction)
+
+        if sourced_events > 1:
+            raise ValueError("One provider webhook can source at most one payment event")
+
+        self._session.add_all(records)
+        try:
+            await self._session.flush()
+            events = [event for _transaction, event in updates]
+            self._session.add_all(events)
+            await self._session.commit()
+        except Exception:
+            await self._session.rollback()
+            raise
+        for record in (*records, *(event for _transaction, event in updates)):
+            await self._session.refresh(record)
+        return tuple(transaction for transaction, _event in updates)
+
+    def _require_available_session(self, record: object, label: str) -> None:
+        bound_session = sqlalchemy_inspect(record).session
+        if bound_session not in {None, self._session.sync_session}:
+            raise ValueError(f"{label} belongs to a different database session")
+
+    def _require_bound_session(self, record: object, label: str) -> None:
+        if sqlalchemy_inspect(record).session is not self._session.sync_session:
+            raise ValueError(f"{label} must be loaded on the repository database session")

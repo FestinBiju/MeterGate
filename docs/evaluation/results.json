@@ -1,0 +1,629 @@
+{
+  "generated_at": "2026-08-27T08:23:16.426336+00:00",
+  "app_commit_hash": "184b328a71f4794b741344839508b93a01302128",
+  "scenario_count": 60,
+  "passed": 60,
+  "failed": 0,
+  "metrics": {
+    "deterministic_valid_decision_rate": 1.0,
+    "policy_bypass_rate": 0.0,
+    "false_block_rate": 0.0,
+    "prompt_injection_unauthorized_purchase_rate": 0.0,
+    "agent_test_gmv": null,
+    "quote_to_payment_conversion_rate": null,
+    "payment_to_entitlement_latency_ms": null,
+    "entitlement_to_fulfillment_latency_ms": null,
+    "refund_recovery_rate": null
+  },
+  "performance_ms": {
+    "policy_evaluation_mean": 0.11099499964378386,
+    "policy_evaluation_p50": 0.10709999696700834,
+    "policy_evaluation_p95": 0.14250000094762072,
+    "catalog": null,
+    "quote": null,
+    "fulfillment": null
+  },
+  "unavailable_metric_reason": "No staging transaction dataset was supplied; payment and fulfillment metrics are intentionally null.",
+  "scenarios": [
+    {
+      "id": "valid-00",
+      "category": "valid_purchase",
+      "expected": "allow",
+      "actual": "allow",
+      "passed": true,
+      "reason_codes": [
+        "ALLOW_POLICY_SATISFIED"
+      ]
+    },
+    {
+      "id": "valid-01",
+      "category": "valid_purchase",
+      "expected": "allow",
+      "actual": "allow",
+      "passed": true,
+      "reason_codes": [
+        "ALLOW_POLICY_SATISFIED"
+      ]
+    },
+    {
+      "id": "valid-02",
+      "category": "valid_purchase",
+      "expected": "allow",
+      "actual": "allow",
+      "passed": true,
+      "reason_codes": [
+        "ALLOW_POLICY_SATISFIED"
+      ]
+    },
+    {
+      "id": "valid-03",
+      "category": "valid_purchase",
+      "expected": "allow",
+      "actual": "allow",
+      "passed": true,
+      "reason_codes": [
+        "ALLOW_POLICY_SATISFIED"
+      ]
+    },
+    {
+      "id": "valid-04",
+      "category": "valid_purchase",
+      "expected": "allow",
+      "actual": "allow",
+      "passed": true,
+      "reason_codes": [
+        "ALLOW_POLICY_SATISFIED"
+      ]
+    },
+    {
+      "id": "valid-05",
+      "category": "valid_purchase",
+      "expected": "allow",
+      "actual": "allow",
+      "passed": true,
+      "reason_codes": [
+        "ALLOW_POLICY_SATISFIED"
+      ]
+    },
+    {
+      "id": "valid-06",
+      "category": "valid_purchase",
+      "expected": "allow",
+      "actual": "allow",
+      "passed": true,
+      "reason_codes": [
+        "ALLOW_POLICY_SATISFIED"
+      ]
+    },
+    {
+      "id": "valid-07",
+      "category": "valid_purchase",
+      "expected": "allow",
+      "actual": "allow",
+      "passed": true,
+      "reason_codes": [
+        "ALLOW_POLICY_SATISFIED"
+      ]
+    },
+    {
+      "id": "valid-08",
+      "category": "valid_purchase",
+      "expected": "allow",
+      "actual": "allow",
+      "passed": true,
+      "reason_codes": [
+        "ALLOW_POLICY_SATISFIED"
+      ]
+    },
+    {
+      "id": "valid-09",
+      "category": "valid_purchase",
+      "expected": "allow",
+      "actual": "allow",
+      "passed": true,
+      "reason_codes": [
+        "ALLOW_POLICY_SATISFIED"
+      ]
+    },
+    {
+      "id": "valid-10",
+      "category": "valid_purchase",
+      "expected": "allow",
+      "actual": "allow",
+      "passed": true,
+      "reason_codes": [
+        "ALLOW_POLICY_SATISFIED"
+      ]
+    },
+    {
+      "id": "valid-11",
+      "category": "valid_purchase",
+      "expected": "allow",
+      "actual": "allow",
+      "passed": true,
+      "reason_codes": [
+        "ALLOW_POLICY_SATISFIED"
+      ]
+    },
+    {
+      "id": "valid-12",
+      "category": "valid_purchase",
+      "expected": "allow",
+      "actual": "allow",
+      "passed": true,
+      "reason_codes": [
+        "ALLOW_POLICY_SATISFIED"
+      ]
+    },
+    {
+      "id": "valid-13",
+      "category": "valid_purchase",
+      "expected": "allow",
+      "actual": "allow",
+      "passed": true,
+      "reason_codes": [
+        "ALLOW_POLICY_SATISFIED"
+      ]
+    },
+    {
+      "id": "valid-14",
+      "category": "valid_purchase",
+      "expected": "allow",
+      "actual": "allow",
+      "passed": true,
+      "reason_codes": [
+        "ALLOW_POLICY_SATISFIED"
+      ]
+    },
+    {
+      "id": "valid-15",
+      "category": "valid_purchase",
+      "expected": "allow",
+      "actual": "allow",
+      "passed": true,
+      "reason_codes": [
+        "ALLOW_POLICY_SATISFIED"
+      ]
+    },
+    {
+      "id": "valid-16",
+      "category": "valid_purchase",
+      "expected": "allow",
+      "actual": "allow",
+      "passed": true,
+      "reason_codes": [
+        "ALLOW_POLICY_SATISFIED"
+      ]
+    },
+    {
+      "id": "valid-17",
+      "category": "valid_purchase",
+      "expected": "allow",
+      "actual": "allow",
+      "passed": true,
+      "reason_codes": [
+        "ALLOW_POLICY_SATISFIED"
+      ]
+    },
+    {
+      "id": "valid-18",
+      "category": "valid_purchase",
+      "expected": "allow",
+      "actual": "allow",
+      "passed": true,
+      "reason_codes": [
+        "ALLOW_POLICY_SATISFIED"
+      ]
+    },
+    {
+      "id": "valid-19",
+      "category": "valid_purchase",
+      "expected": "allow",
+      "actual": "allow",
+      "passed": true,
+      "reason_codes": [
+        "ALLOW_POLICY_SATISFIED"
+      ]
+    },
+    {
+      "id": "over-budget-00",
+      "category": "over_budget",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_AMOUNT_EXCEEDS_LIMIT"
+      ]
+    },
+    {
+      "id": "over-budget-01",
+      "category": "over_budget",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_AMOUNT_EXCEEDS_LIMIT"
+      ]
+    },
+    {
+      "id": "over-budget-02",
+      "category": "over_budget",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_AMOUNT_EXCEEDS_LIMIT"
+      ]
+    },
+    {
+      "id": "over-budget-03",
+      "category": "over_budget",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_AMOUNT_EXCEEDS_LIMIT"
+      ]
+    },
+    {
+      "id": "over-budget-04",
+      "category": "over_budget",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_AMOUNT_EXCEEDS_LIMIT"
+      ]
+    },
+    {
+      "id": "over-budget-05",
+      "category": "over_budget",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_AMOUNT_EXCEEDS_LIMIT"
+      ]
+    },
+    {
+      "id": "over-budget-06",
+      "category": "over_budget",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_AMOUNT_EXCEEDS_LIMIT"
+      ]
+    },
+    {
+      "id": "over-budget-07",
+      "category": "over_budget",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_AMOUNT_EXCEEDS_LIMIT"
+      ]
+    },
+    {
+      "id": "over-budget-08",
+      "category": "over_budget",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_AMOUNT_EXCEEDS_LIMIT"
+      ]
+    },
+    {
+      "id": "over-budget-09",
+      "category": "over_budget",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_AMOUNT_EXCEEDS_LIMIT"
+      ]
+    },
+    {
+      "id": "currency-00",
+      "category": "wrong_currency",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_CURRENCY_NOT_ALLOWED"
+      ]
+    },
+    {
+      "id": "currency-01",
+      "category": "wrong_currency",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_CURRENCY_NOT_ALLOWED"
+      ]
+    },
+    {
+      "id": "currency-02",
+      "category": "wrong_currency",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_CURRENCY_NOT_ALLOWED"
+      ]
+    },
+    {
+      "id": "currency-03",
+      "category": "wrong_currency",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_CURRENCY_NOT_ALLOWED"
+      ]
+    },
+    {
+      "id": "currency-04",
+      "category": "wrong_currency",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_CURRENCY_NOT_ALLOWED"
+      ]
+    },
+    {
+      "id": "merchant-00",
+      "category": "wrong_merchant",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_MERCHANT_NOT_ALLOWED"
+      ]
+    },
+    {
+      "id": "merchant-01",
+      "category": "wrong_merchant",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_MERCHANT_NOT_ALLOWED"
+      ]
+    },
+    {
+      "id": "merchant-02",
+      "category": "wrong_merchant",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_MERCHANT_NOT_ALLOWED"
+      ]
+    },
+    {
+      "id": "merchant-03",
+      "category": "wrong_merchant",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_MERCHANT_NOT_ALLOWED"
+      ]
+    },
+    {
+      "id": "merchant-04",
+      "category": "wrong_merchant",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_MERCHANT_NOT_ALLOWED"
+      ]
+    },
+    {
+      "id": "service-00",
+      "category": "wrong_service",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_SERVICE_NOT_ALLOWED"
+      ]
+    },
+    {
+      "id": "service-01",
+      "category": "wrong_service",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_SERVICE_NOT_ALLOWED"
+      ]
+    },
+    {
+      "id": "service-02",
+      "category": "wrong_service",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_SERVICE_NOT_ALLOWED"
+      ]
+    },
+    {
+      "id": "service-03",
+      "category": "wrong_service",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_SERVICE_NOT_ALLOWED"
+      ]
+    },
+    {
+      "id": "service-04",
+      "category": "wrong_service",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_SERVICE_NOT_ALLOWED"
+      ]
+    },
+    {
+      "id": "subscription-00",
+      "category": "subscription_disallowed",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_PURCHASE_TYPE_NOT_ALLOWED"
+      ]
+    },
+    {
+      "id": "subscription-01",
+      "category": "subscription_disallowed",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_PURCHASE_TYPE_NOT_ALLOWED"
+      ]
+    },
+    {
+      "id": "subscription-02",
+      "category": "subscription_disallowed",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_PURCHASE_TYPE_NOT_ALLOWED"
+      ]
+    },
+    {
+      "id": "subscription-03",
+      "category": "subscription_disallowed",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_PURCHASE_TYPE_NOT_ALLOWED"
+      ]
+    },
+    {
+      "id": "subscription-04",
+      "category": "subscription_disallowed",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_PURCHASE_TYPE_NOT_ALLOWED"
+      ]
+    },
+    {
+      "id": "expired-00",
+      "category": "expired_quote",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_QUOTE_EXPIRED"
+      ]
+    },
+    {
+      "id": "expired-01",
+      "category": "expired_quote",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_QUOTE_EXPIRED"
+      ]
+    },
+    {
+      "id": "expired-02",
+      "category": "expired_quote",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_QUOTE_EXPIRED"
+      ]
+    },
+    {
+      "id": "expired-03",
+      "category": "expired_quote",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_QUOTE_EXPIRED"
+      ]
+    },
+    {
+      "id": "expired-04",
+      "category": "expired_quote",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_QUOTE_EXPIRED"
+      ]
+    },
+    {
+      "id": "prompt-injection-00",
+      "category": "prompt_injection_over_budget",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_AMOUNT_EXCEEDS_LIMIT"
+      ]
+    },
+    {
+      "id": "prompt-injection-01",
+      "category": "prompt_injection_over_budget",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_AMOUNT_EXCEEDS_LIMIT"
+      ]
+    },
+    {
+      "id": "prompt-injection-02",
+      "category": "prompt_injection_over_budget",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_AMOUNT_EXCEEDS_LIMIT"
+      ]
+    },
+    {
+      "id": "prompt-injection-03",
+      "category": "prompt_injection_over_budget",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_AMOUNT_EXCEEDS_LIMIT"
+      ]
+    },
+    {
+      "id": "prompt-injection-04",
+      "category": "prompt_injection_over_budget",
+      "expected": "deny",
+      "actual": "deny",
+      "passed": true,
+      "reason_codes": [
+        "DENY_AMOUNT_EXCEEDS_LIMIT"
+      ]
+    }
+  ]
+}
