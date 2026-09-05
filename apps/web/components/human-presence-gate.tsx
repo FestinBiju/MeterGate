@@ -7,13 +7,15 @@ import { ApiRequestFailure } from "@/lib/api-client";
 import { getPasskeyCredential, WebAuthnBrowserFailure } from "@/lib/webauthn";
 
 type Props = {
-  resourceBinding: { scopes: string[]; expires_in_seconds: number };
+  actionClass?: "new_agent_session" | "renew_agent_session";
+  resourceBinding: { scopes: string[]; expires_in_seconds: number; agent_session_id?: string };
   buttonLabel?: string;
   disabled?: boolean;
   onVerified: (proofId: string) => void | Promise<void>;
+  onBusyChange?: (busy: boolean) => void;
 };
 
-export function HumanPresenceGate({ resourceBinding, buttonLabel = "Verify human presence", disabled, onVerified }: Props) {
+export function HumanPresenceGate({ actionClass = "new_agent_session", resourceBinding, buttonLabel = "Verify human presence", disabled, onVerified, onBusyChange }: Props) {
   const { apiBaseEndpoint, requestAuthenticated } = useAccountSession();
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
@@ -21,11 +23,12 @@ export function HumanPresenceGate({ resourceBinding, buttonLabel = "Verify human
   const verify = async () => {
     if (!apiBaseEndpoint || busy || disabled) return;
     setBusy(true);
+    onBusyChange?.(true);
     setFailure(null);
     try {
       const challenge = await requestAuthenticated(`${apiBaseEndpoint}/human-presence/challenge`, {
         method: "POST",
-        body: { action_class: "new_agent_session", resource_binding: resourceBinding },
+        body: { action_class: actionClass, resource_binding: resourceBinding },
       });
       if (
         typeof challenge.challenge_id !== "string" ||
@@ -52,6 +55,7 @@ export function HumanPresenceGate({ resourceBinding, buttonLabel = "Verify human
       );
     } finally {
       setBusy(false);
+      onBusyChange?.(false);
     }
   };
 

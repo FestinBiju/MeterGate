@@ -51,6 +51,34 @@ function EvidenceCard({ title, value }: { title: string; value: unknown }) {
   return <div className="rounded-lg border border-white/10 bg-black/20 p-3"><dt className="text-[10px] font-semibold uppercase tracking-[.16em] text-slate-500">{title}</dt><dd className="mt-1 break-all text-sm text-slate-200">{value === null || value === undefined ? "—" : String(value)}</dd></div>;
 }
 
+function RecoveryEvidence({ facts, timeline, loading, onRefresh }: { facts: CaseDetail["facts"]; timeline: TimelineEvent[]; loading: boolean; onRefresh: () => void }) {
+  const refundRequested = Boolean(facts.refund) || timeline.some(event => ["refund_outbox_created", "refund_requested", "razorpay_refund_created", "refund_processing", "refund_completed"].includes(event.event_type));
+  const complete = [
+    facts.payment_state === "paid" && facts.provider_payment_status === "captured",
+    facts.fulfillment?.state === "permanent_failure" && facts.fulfillment.compensation_required,
+    facts.compensation?.decision_state === "approved" || facts.compensation?.decision_state === "completed",
+    refundRequested,
+    facts.refund?.state === "refunded" && facts.refund.provider_status === "processed",
+  ];
+  const steps = [
+    ["Payment captured", "Server-verified Razorpay payment remains historical evidence."],
+    ["Fulfillment failed; value withheld", facts.fulfillment?.failure_code ?? "Awaiting merchant outcome."],
+    ["Compensation approved", facts.compensation?.recommended_action ?? "Awaiting deterministic compensation policy."],
+    ["Refund requested", facts.refund?.provider_refund_id ?? "Awaiting the durable refund outbox."],
+    ["Refund processed", facts.refund?.provider_status ?? "Awaiting trusted provider confirmation."],
+  ] as const;
+  const terminal = complete.every(Boolean);
+  return <section aria-labelledby="recovery-proof-heading" className="mt-6 border-y border-white/10 py-5">
+    <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between"><div><p className="text-xs font-semibold uppercase tracking-[.18em] text-cyan-300">Authoritative recovery proof</p><h3 id="recovery-proof-heading" className="mt-2 text-lg font-semibold">Payment → failure → refund</h3><p aria-live="polite" className={`mt-1 text-sm ${terminal ? "text-emerald-300" : "text-amber-300"}`}>{terminal ? "Recovery complete: Razorpay refund processed." : "Recovery in progress from current backend evidence."}</p></div><button disabled={loading} onClick={onRefresh} className="rounded-lg border border-cyan-300/30 px-3 py-2 text-sm text-cyan-200 disabled:cursor-wait disabled:opacity-60">{loading ? "Refreshing evidence…" : "Refresh selected evidence"}</button></div>
+    <ol className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-5" aria-label="Refund recovery evidence">
+      {steps.map(([label, detail], index) => {
+        const status = complete[index] ? "complete" : complete.slice(0, index).every(Boolean) ? "active" : "pending";
+        return <li key={label} className={`rounded-lg border p-3 ${status === "complete" ? "border-emerald-300/25 bg-emerald-300/[.05]" : status === "active" ? "border-amber-300/30 bg-amber-300/[.06]" : "border-white/10"}`}><div className="flex items-center justify-between gap-2"><strong className="text-sm">{label}</strong><span className={`font-mono text-[10px] uppercase ${status === "complete" ? "text-emerald-300" : status === "active" ? "text-amber-300" : "text-slate-500"}`}>{status}</span></div><p className="mt-2 break-words text-xs leading-5 text-slate-500">{detail}</p></li>;
+      })}
+    </ol>
+  </section>;
+}
+
 export function OperatorDashboard() {
   const { apiBaseEndpoint, establishSession, requestAuthenticated } = useAccountSession();
   const [items, setItems] = useState<WorkItem[]>([]);
@@ -65,6 +93,7 @@ export function OperatorDashboard() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [detailLoading, setDetailLoading] = useState(false);
   const [reauthenticating, setReauthenticating] = useState(false);
 
   const load = useCallback(async () => {
@@ -81,7 +110,7 @@ export function OperatorDashboard() {
   }, []);
 
   const openTransaction = useCallback(async (transactionId: string) => {
-    setError(null);
+    setError(null); setDetailLoading(true);
     try {
       const [caseDetail, events] = await Promise.all([
         api<CaseDetail>(`/operator/transactions/${transactionId}/detail`),
@@ -89,6 +118,7 @@ export function OperatorDashboard() {
       ]);
       setDetail(caseDetail); setTimeline(events);
     } catch (value) { setError(value instanceof Error ? value.message : "Case detail could not be loaded"); }
+    finally { setDetailLoading(false); }
   }, []);
 
   useEffect(() => { const timer = window.setTimeout(() => void load(), 0); return () => window.clearTimeout(timer); }, [load]);
@@ -152,6 +182,7 @@ export function OperatorDashboard() {
       <div><h2 className="text-xl font-semibold">Alerts</h2><div className="mt-3 space-y-2">{alerts.length === 0 ? <p className="rounded-xl border border-white/10 p-4 text-sm text-slate-400">No active high-severity alerts.</p> : alerts.map(alert => <div key={`${alert.type}:${alert.resource_id}`} className="rounded-lg border border-amber-300/20 bg-amber-300/[.06] p-3 text-sm"><strong>{alert.type.replaceAll("_", " ")}</strong><p className="mt-1 text-xs text-amber-100/60">{alert.reason_code}</p></div>)}</div></div></section>
       <section className="mt-8"><h2 className="text-xl font-semibold">Historical commerce</h2><div className="mt-3 flex gap-3 overflow-x-auto pb-2">{transactions.map(tx => <button key={tx.transaction_id} onClick={() => void openTransaction(tx.transaction_id)} className="min-w-72 rounded-xl border border-white/10 p-4 text-left hover:border-cyan-300/30"><code className="text-xs text-cyan-200">{tx.transaction_id}</code><p className="mt-2 font-medium">{money(tx.amount, tx.currency)} · {tx.payment_state}</p><p className="mt-1 text-xs text-slate-500">{tx.account_id}</p></button>)}</div></section>
       {detail && facts && <section className="mt-8 rounded-2xl border border-cyan-300/20 bg-cyan-950/[.12] p-4 sm:p-6"><div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between"><div><p className="text-xs uppercase tracking-[.2em] text-cyan-300">Case detail</p><h2 className="mt-2 text-xl font-semibold">{facts.transaction_id}</h2></div><span className="text-sm text-slate-400">{money(facts.amount, facts.currency)} · {facts.payment_state}</span></div>
+        <RecoveryEvidence facts={facts} timeline={timeline} loading={detailLoading} onRefresh={() => void openTransaction(facts.transaction_id)} />
         <div className="mt-6 grid gap-5 lg:grid-cols-3"><div><h3 className="mb-3 text-xs font-semibold uppercase tracking-[.18em] text-emerald-300">Facts</h3><dl className="grid gap-2"><EvidenceCard title="Account" value={facts.account_id}/><EvidenceCard title="Merchant / service" value={`${facts.merchant_name ?? "—"} / ${facts.service_name ?? "—"}`}/><EvidenceCard title="Razorpay order" value={facts.provider_order_id}/><EvidenceCard title="Captured payment" value={facts.provider_payment_id}/><EvidenceCard title="Provider status" value={facts.provider_payment_status}/><EvidenceCard title="Fulfillment" value={facts.fulfillment ? `${facts.fulfillment.id} · ${facts.fulfillment.state} · ${facts.fulfillment.attempt_count} attempts · ${facts.fulfillment.failure_code ?? "no failure"}` : undefined}/><EvidenceCard title="Refund" value={facts.refund ? `${facts.refund.id} · ${facts.refund.state} · ${facts.refund.provider_refund_id ?? "unbound"} · provider ${facts.refund.provider_status ?? "unknown"}` : undefined}/></dl></div>
         <div><h3 className="mb-3 text-xs font-semibold uppercase tracking-[.18em] text-amber-300">Derived state</h3><dl className="grid gap-2"><EvidenceCard title="Quarantined" value={detail.derived_state.quarantined}/><EvidenceCard title="Reconciliation required" value={detail.derived_state.reconciliation_required}/><EvidenceCard title="Open incidents" value={detail.derived_state.open_incident_count}/><EvidenceCard title="Compensation policy" value={facts.compensation?.recommended_action}/><EvidenceCard title="Decision state" value={facts.compensation?.decision_state}/><EvidenceCard title="Refund overlay" value={facts.refund?.reconciliation_required}/></dl></div>
         <div><h3 className="mb-3 text-xs font-semibold uppercase tracking-[.18em] text-violet-300">Operator decision</h3><div className="space-y-2">{detail.operator_decisions.length ? detail.operator_decisions.map(decision => <div key={decision.id} className="rounded-lg border border-violet-300/15 p-3 text-sm"><strong>{decision.action}</strong><p className="mt-1 text-xs text-slate-500">{decision.reason_code}</p></div>) : <p className="text-sm text-slate-500">No operator decision recorded.</p>}</div><div className="mt-4 grid gap-2">{canDecide && <><button onClick={() => void prepareCompensation("approve")} className="rounded-lg bg-emerald-400 px-3 py-2 text-sm font-semibold text-emerald-950">Approve Full Refund</button><button onClick={() => void prepareCompensation("reject")} className="rounded-lg border border-rose-300/30 px-3 py-2 text-sm text-rose-200">Reject Compensation</button></>}{["order_creation_pending", "order_created", "order_creation_uncertain", "payment_pending", "payment_authorized", "reconciliation_required"].includes(facts.payment_state) && <button onClick={() => prepareReconciliation("payment", facts.transaction_id)} className="rounded-lg border border-cyan-300/30 px-3 py-2 text-sm text-cyan-200">Run Payment Reconciliation</button>}{facts.refund?.reconciliation_required && <button onClick={() => prepareReconciliation("refund", facts.refund!.id)} className="rounded-lg border border-cyan-300/30 px-3 py-2 text-sm text-cyan-200">Run Refund Reconciliation</button>}{facts.fulfillment?.state === "reconciliation_required" && <button onClick={() => prepareReconciliation("fulfillment", facts.fulfillment!.id)} className="rounded-lg border border-cyan-300/30 px-3 py-2 text-sm text-cyan-200">Run Fulfillment Reconciliation</button>}</div></div></div>

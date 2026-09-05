@@ -1,0 +1,154 @@
+name: metergate-self-hosted
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env.self-hosted}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env.self-hosted}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.self-hosted}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  orbitintel:
+    image: metergate/orbitintel:${METERGATE_IMAGE_TAG:-self-hosted}
+    build:
+      context: ../../apps/orbitintel
+    platform: ${METERGATE_PLATFORM:-linux/amd64}
+    environment:
+      APP_ENV: ${APP_ENV:?Set APP_ENV in .env.self-hosted}
+      REDIS_URL: ${REDIS_URL:?Set REDIS_URL in .env.self-hosted}
+      ORBITINTEL_ENVIRONMENT: ${ORBITINTEL_ENVIRONMENT:?Set ORBITINTEL_ENVIRONMENT in .env.self-hosted}
+      ORBITINTEL_SHARED_SECRET: ${ORBITINTEL_SHARED_SECRET:?Set ORBITINTEL_SHARED_SECRET in .env.self-hosted}
+      ORBITINTEL_DEV_FAULT_MODE: ${ORBITINTEL_DEV_FAULT_MODE:-none}
+      ORBITINTEL_GP_CACHE_TTL_SECONDS: ${ORBITINTEL_GP_CACHE_TTL_SECONDS:-180}
+      ORBITINTEL_GP_LOCK_TTL_MS: ${ORBITINTEL_GP_LOCK_TTL_MS:-30000}
+      ORBITINTEL_IDEMPOTENCY_TTL_SECONDS: ${ORBITINTEL_IDEMPOTENCY_TTL_SECONDS:-86400}
+      ORBITINTEL_REDIS_CONNECT_TIMEOUT_SECONDS: ${ORBITINTEL_REDIS_CONNECT_TIMEOUT_SECONDS:-2}
+      ORBITINTEL_REDIS_SOCKET_TIMEOUT_SECONDS: ${ORBITINTEL_REDIS_SOCKET_TIMEOUT_SECONDS:-2}
+      ORBITINTEL_REDIS_HEALTH_CHECK_INTERVAL_SECONDS: ${ORBITINTEL_REDIS_HEALTH_CHECK_INTERVAL_SECONDS:-30}
+      ORBITINTEL_IDEMPOTENCY_LOCK_TTL_SECONDS: ${ORBITINTEL_IDEMPOTENCY_LOCK_TTL_SECONDS:-60}
+      ORBITINTEL_RESULT_MAX_BYTES: ${ORBITINTEL_RESULT_MAX_BYTES:-262144}
+      ORBITINTEL_REQUEST_MAX_BYTES: ${ORBITINTEL_REQUEST_MAX_BYTES:-262144}
+      CELESTRAK_CONNECT_TIMEOUT_SECONDS: ${CELESTRAK_CONNECT_TIMEOUT_SECONDS:-2}
+      CELESTRAK_READ_TIMEOUT_SECONDS: ${CELESTRAK_READ_TIMEOUT_SECONDS:-5}
+      CELESTRAK_MAX_RESPONSE_BYTES: ${CELESTRAK_MAX_RESPONSE_BYTES:-65536}
+      CELESTRAK_MAX_ATTEMPTS: ${CELESTRAK_MAX_ATTEMPTS:-3}
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  api:
+    image: metergate/api:${METERGATE_IMAGE_TAG:-self-hosted}
+    build:
+      context: ../../apps/api
+    platform: ${METERGATE_PLATFORM:-linux/amd64}
+    env_file: ${METERGATE_RUNTIME_ENV_FILE:-.env.self-hosted}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      orbitintel:
+        condition: service_started
+    restart: unless-stopped
+
+  webhook-worker:
+    image: metergate/api:${METERGATE_IMAGE_TAG:-self-hosted}
+    command: ["python", "-m", "app.workers.razorpay_webhooks"]
+    env_file: ${METERGATE_RUNTIME_ENV_FILE:-.env.self-hosted}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  entitlement-worker:
+    image: metergate/api:${METERGATE_IMAGE_TAG:-self-hosted}
+    command: ["python", "-m", "app.workers.entitlements"]
+    env_file: ${METERGATE_RUNTIME_ENV_FILE:-.env.self-hosted}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      orbitintel:
+        condition: service_started
+    restart: unless-stopped
+
+  refund-worker:
+    image: metergate/api:${METERGATE_IMAGE_TAG:-self-hosted}
+    command: ["python", "-m", "app.workers.refunds"]
+    env_file: ${METERGATE_RUNTIME_ENV_FILE:-.env.self-hosted}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  web:
+    image: metergate/web:${METERGATE_IMAGE_TAG:-self-hosted}
+    build:
+      context: ../../apps/web
+      args:
+        NEXT_PUBLIC_API_URL: ${PUBLIC_ORIGIN:?Set PUBLIC_ORIGIN before building the web image}
+    platform: ${METERGATE_PLATFORM:-linux/amd64}
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      api:
+        condition: service_started
+      web:
+        condition: service_started
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: ["tunnel", "--no-autoupdate", "run", "--token", "${CLOUDFLARE_TUNNEL_TOKEN:?Set CLOUDFLARE_TUNNEL_TOKEN in .env.self-hosted}"]
+    depends_on:
+      caddy:
+        condition: service_started
+    restart: unless-stopped
+
+  bootstrap:
+    image: metergate/api:${METERGATE_IMAGE_TAG:-self-hosted}
+    command: ["sh", "-c", "alembic upgrade head && python -m app.scripts.seed_dev && python -m app.scripts.backfill_entitlement_outbox"]
+    env_file: ${METERGATE_RUNTIME_ENV_FILE:-.env.self-hosted}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    profiles: ["bootstrap"]
+    restart: "no"
+
+volumes:
+  postgres_data:
+  redis_data:

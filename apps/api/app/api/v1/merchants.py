@@ -1,14 +1,19 @@
 """Thin merchant management routes."""
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Depends, status
 
-from app.api.v1.dependencies import MerchantApplicationDependency
+from app.api.v1.dependencies import MerchantApplicationDependency, require_catalog_admin
 from app.schemas.merchants import MerchantCreate, MerchantPatch, MerchantResponse
 
 router = APIRouter(prefix="/merchants", tags=["merchants"])
 
 
-@router.post("", response_model=MerchantResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=MerchantResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_catalog_admin)],
+)
 async def create_merchant(
     payload: MerchantCreate,
     application_service: MerchantApplicationDependency,
@@ -34,7 +39,11 @@ async def get_merchant(
     return MerchantResponse.model_validate(merchant)
 
 
-@router.patch("/{merchant_id}", response_model=MerchantResponse)
+@router.patch(
+    "/{merchant_id}",
+    response_model=MerchantResponse,
+    dependencies=[Depends(require_catalog_admin)],
+)
 async def update_merchant(
     merchant_id: str,
     payload: MerchantPatch,

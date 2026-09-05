@@ -1,6 +1,10 @@
 # MCP security model
 
-The bridge credential is a separate short-lived bearer audience bound to exactly one active account. Its allowed scopes are enumerated buyer orchestration capabilities; `operator.*`, `admin.*`, passkey management, payment mutation, and refund authority cannot be stored. It is non-refreshable, maximum one hour, revocable by its owner, and invalid when expired, revoked, malformed, scope-corrupt, or when the account or approval identity is disabled.
+The bridge credential is a separate bearer audience bound to exactly one active account. Its allowed scopes are enumerated buyer orchestration capabilities; `operator.*`, `admin.*`, passkey management, payment mutation, and refund authority cannot be stored. Each access grant is bounded to a maximum of one hour (or a smaller configured limit). The token is invalid when its grant expires, is revoked, is malformed or scope-corrupt, or when the account or approval identity is disabled.
+
+The owner can renew the access grant while preserving the configured token hash through cookie-authenticated `POST /mcp/sessions/{id}/renew`. This route is not an MCP tool: the bearer token alone cannot renew itself. Origin/CSRF validation and a fresh one-use `renew_agent_session` passkey proof bind the owner, browser session, exact agent-session ID, unchanged scopes, and lifetime. The grant and proof consumption commit atomically, with append-only renewal evidence. Renewal starts a bounded window from the current time; repeated requests cannot reuse a consumed proof. Row locks refresh existing ORM state so a concurrent revocation cannot be concealed by stale metadata.
+
+Revocation is permanent and available for expired connections too. Never renew a key suspected of exposure; revoke it and pair a replacement. A new conversation can reuse the saved client registration while its grant is active.
 
 The normal HttpOnly browser session and CSRF secret never enter MCP. Browser session creation/revocation still uses the existing Origin, CSRF, account-ownership, and recent-authentication rules. The bridge bearer is accepted only on `/api/v1/mcp/tools/*`; it does not fake browser CSRF or authenticate other application routes.
 
@@ -13,4 +17,3 @@ Catalog and merchant results are data, never instructions. The reference adversa
 Capability execution is not reimplemented. The existing gateway verifies token signature, expiry, audience, merchant, service, quote, exact input hash, entitlement, current paid evidence, execution lease, and compensation quarantine. A valid but previously issued capability therefore cannot release value after refund or compensation evidence appears. Stored success is replayed without another merchant call.
 
 No hidden chain of thought is stored. Only observable tool calls, deterministic checks/reason codes, and commerce evidence are auditable.
-

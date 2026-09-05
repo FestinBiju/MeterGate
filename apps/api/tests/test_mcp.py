@@ -289,7 +289,9 @@ def test_mcp_surface_has_no_approval_payment_refund_or_operator_mutations(make_c
     schema = client.get("/openapi.json").json()
     mcp_paths = sorted(path for path in schema["paths"] if path.startswith("/api/v1/mcp"))
 
-    assert len(mcp_paths) == 12
+    assert len(mcp_paths) == 13
+    assert len([path for path in mcp_paths if "/tools/" in path]) == 10
+    assert "/api/v1/mcp/sessions/{agent_session_id}/renew" in mcp_paths
     forbidden_terms = ("approve", "passkey", "razorpay", "refund", "operator", "admin")
     assert all(not any(term in path for term in forbidden_terms) for path in mcp_paths)
     assert all(not scope.startswith(("operator.", "admin.")) for scope in ALL_MCP_SCOPES)

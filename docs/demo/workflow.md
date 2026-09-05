@@ -1,5 +1,7 @@
 # Demonstration Workflow
 
+The exact five-minute recording sequence, prompts, measured stats, protocol positioning, and failure-recovery acceptance checklist are in [`judge-readiness.md`](./judge-readiness.md).
+
 Stable request: “Get an orbital risk report for NORAD 25544. Spend no more than ₹10. One-time only.” The reference buyer discovers OrbitIntel’s ₹5 report, requests an immutable quote, creates the bounded policy, and stops at human approval. The human uses the trusted browser and passkey; Razorpay Test Checkout follows. The backend verifies captured state, issues the exact entitlement, and the agent retries with the one-use capability. OrbitIntel retrieves current CelesTrak data; no report is hardcoded.
 
 For PoHP, create an MCP session. MeterGate shows “Human verification required,” invokes Windows Hello/passkey user verification, issues an action-bound proof, and consumes it into that exact scope/lifetime. No image puzzle appears.

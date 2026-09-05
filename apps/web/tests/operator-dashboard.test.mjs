@@ -35,3 +35,19 @@ test("dashboard renders timeline, alerts, workers, and no credential material", 
   for (const forbidden of ["webhook_secret", "key_secret", "session_id", "raw_payload"])
     assert.doesNotMatch(source, new RegExp(forbidden, "i"));
 });
+
+test("dashboard shows an evidence-backed recovery ladder with explicit refresh state", () => {
+  for (const label of [
+    "Payment captured",
+    "Fulfillment failed; value withheld",
+    "Compensation approved",
+    "Refund requested",
+    "Refund processed",
+    "Refresh selected evidence",
+    "Refreshing evidence",
+    "Recovery complete: Razorpay refund processed",
+  ]) assert.match(source, new RegExp(label));
+  assert.match(source, /facts\.refund\?\.state === "refunded" && facts\.refund\.provider_status === "processed"/);
+  assert.match(source, /aria-live="polite"/);
+  assert.doesNotMatch(source, /setInterval/);
+});

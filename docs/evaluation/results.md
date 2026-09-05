@@ -1,7 +1,8 @@
 # Milestone 11 Evaluation Results
 
-Generated: `2026-08-27T08:23:16.426336+00:00`
-Commit: `184b328a71f4794b741344839508b93a01302128`
+Generated: `2026-08-28T05:30:16.473294+00:00`
+Commit: `d34f6c3c834513d8fa8e890e729fc7f72609dcfa`
+Working tree dirty: `yes`
 
 Scenarios: **60** — 60 passed, 0 failed.
 
@@ -21,4 +22,4 @@ Payment/fulfillment metrics remain unavailable until a staging evidence dataset 
 
 ## Performance
 
-Policy evaluation mean: **0.111 ms**; p95: **0.143 ms**.
+Policy evaluation mean: **0.110 ms**; p95: **0.117 ms**.

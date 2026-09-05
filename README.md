@@ -2,6 +2,22 @@
 
 **A Razorpay-native agent storefront for paid APIs and digital services.**
 
+## Presentation entry points
+
+- **Guided demo:** open the homepage and choose successful delivery, budget rejection, or operator-prepared recovery. Each card has a copyable MCP prompt.
+- **Delivered value:** the buyer receives a readable OrbitIntel report with source epoch, units, limitations, and expandable raw JSON.
+- **Purchase receipt:** download a JSON snapshot from authenticated transaction, authorization, and policy evidence. It is explicitly Test Mode evidence, not a tax invoice or signed attestation.
+- **Evidence:** `/evidence` separates recorded policy results from historical provider acceptance. Current private commerce metrics remain in `/operator`.
+- [Five-minute presentation and recording checklist](docs/demo/presentation.md)
+- [Submission copy and architecture slide](docs/demo/submission-copy.md)
+- [Current readiness and live acceptance evidence](docs/demo/readiness-2026-09-05.md)
+- [Merchant integration guide](docs/merchant-integration.md)
+- [Execution checklist](docs/demo/execution-plan.md)
+
+For a local production frontend build, set `NEXT_PUBLIC_API_URL=http://localhost:8000` in the build process before `npm run build` from `apps/web`. The root `.env` alone does not configure the Next.js build. Use the same `localhost` origin configured for passkeys throughout the demo.
+
+With the local stack running, use `uv run python -m app.scripts.presentation_preflight` from `apps/api`. It checks readiness, the catalog, 402 behavior, anonymous catalog-write rejection, and worker heartbeats without printing credentials. It deliberately does not claim live checkout, webhook delivery, or refund acceptance. Add `--require-refunds` for the configured failure demonstration.
+
 ## Track
 Razorpay Buildathon — **Track 01: AI Growth & Agentic Commerce**
 
@@ -28,13 +44,23 @@ An AI buyer can:
 
 The goal is to help merchants become **discoverable, understandable, payable, and fulfillable by AI agents** without giving those agents unrestricted payment or service access.
 
+## Buildathon Proof
+
+MeterGate deliberately targets the second half of Track 01: making a merchant safely transactable by an AI buyer end to end. That trust and control layer is the revenue-growth precondition for exposing paid merchant APIs to agent traffic.
+
+The seeded agent-readable catalog contains three real service choices at ₹2, ₹5, and ₹9. Codex can interpret a fuzzy request, compare those choices, and propose a service; immutable quotes and deterministic policy remain authoritative. The generated evaluation currently records 60/60 passing scenarios, 0% policy bypass, 0% false blocking, and 0.117 ms policy-evaluation p95. A separate physical acceptance run completed one real Razorpay Test Mode refund from permanent fulfillment failure to provider status `processed`; this is honestly reported as one accepted run, not a population-level recovery claim.
+
+MeterGate provides standards-aligned primitives without claiming protocol conformance: its quote/policy/authorization evidence resembles AP2 mandates, its agent-readable catalog and checkout lifecycle overlap ACP, and its resource-first `402 Payment Required` flow is x402-inspired while deliberately using Razorpay and entitlement capabilities instead of blockchain settlement. See the [five-minute judge demonstration](docs/demo/judge-readiness.md) for exact prompts, evidence, protocol links, and the on-camera failure sequence.
+
 ## Current Milestone
 
 Milestone 11 makes the verified commerce loop deployable and measurable. Powerful MCP buyer sessions now require a one-use, action-bound Proof of Human Presence created by `userVerification=required` WebAuthn rather than a visual CAPTCHA. Staging configuration fails closed on insecure cookies/origins or non-Test Razorpay mode; Docker deployment references, CI, secret scanning, guarded demo preparation, sanitized transaction evidence export, and a machine-produced 60-scenario evaluation harness are included. The web presentation now follows the repository's TypeUI Minimal design system while preserving the existing commerce, security, and evidence contracts.
 
 ## Agent Interface
 
-`packages/mcp` provides a local stdio server built with the official Model Context Protocol TypeScript SDK. The web application's **Agent Connections** section creates short-lived account-scoped credentials, displays each secret once, stores only its SHA-256 hash, and supports immediate revocation. The credential is separate from the browser's HttpOnly session cookie and CSRF secret, expires within a configured maximum, and never carries operator or passkey authority.
+`packages/mcp` provides a local stdio server built with the official Model Context Protocol TypeScript SDK. In **Agent Connections**, configure a client once and reuse it across conversations. Access grants last 15 minutes, 30 minutes, or one hour within the server limit. When access expires, choose **Renew access** and verify with your passkey; the existing MCP key and configuration work again. Renewal preserves scopes, binds the proof to the exact connection, and records audit evidence. The agent cannot renew itself. Revocation is permanent, including for expired connections.
+
+MeterGate displays each new secret once and stores only its SHA-256 hash. The credential is separate from the browser's HttpOnly cookie and CSRF secret and never carries operator or passkey authority. A lost or exposed key must be replaced. See [one-time setup and renewal](docs/mcp/client-setup.md).
 
 ## MCP Tools
 
@@ -120,7 +146,7 @@ The API liveness endpoint is `http://localhost:8000/health`. The readiness endpo
 
 `uv run python -m app.scripts.seed_dev` idempotently creates the synthetic OrbitIntel merchant and its three demonstration services. It uses no live satellite or payment data and can be run repeatedly without creating duplicates.
 
-Merchant and service management routes remain local development/admin surfaces. Milestone 6A does not add merchant authentication and does not bind buyer accounts to merchant administration.
+Merchant and service POST/PATCH routes require an active `admin` assignment, recent passkey authentication, an allowed Origin, and a valid CSRF token. Routine operators and buyer/MCP sessions cannot change catalog terms. Public catalog/merchant/service reads remain available. Trusted local seed scripts provision the reference merchant; self-service merchant ownership and onboarding are not implemented.
 
 ## Authenticated Buyer Boundary
 

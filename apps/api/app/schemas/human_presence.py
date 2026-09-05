@@ -3,8 +3,9 @@
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import Field, JsonValue, StringConstraints
+from pydantic import Field, JsonValue, StringConstraints, model_validator
 
+from app.domain.human_presence import HumanPresenceAction, normalize_resource_binding
 from app.schemas.approvals import BrowserCredential
 from app.schemas.common import APIModel
 
@@ -17,13 +18,18 @@ HumanPresenceProofId = Annotated[
 
 
 class HumanPresenceChallengeCreate(APIModel):
-    action_class: Literal["new_agent_session"]
-    resource_binding: Annotated[dict[str, JsonValue], Field(min_length=2, max_length=2)]
+    action_class: HumanPresenceAction
+    resource_binding: Annotated[dict[str, JsonValue], Field(min_length=2, max_length=3)]
+
+    @model_validator(mode="after")
+    def validate_action_binding(self) -> "HumanPresenceChallengeCreate":
+        normalize_resource_binding(self.action_class, dict(self.resource_binding))
+        return self
 
 
 class HumanPresenceChallengeResponse(APIModel):
     challenge_id: HumanPresenceChallengeId
-    action_class: Literal["new_agent_session"]
+    action_class: HumanPresenceAction
     resource_binding: dict[str, JsonValue]
     public_key: dict[str, JsonValue]
     expires_at: datetime
@@ -36,7 +42,7 @@ class HumanPresenceVerify(APIModel):
 
 class HumanPresenceProofResponse(APIModel):
     id: HumanPresenceProofId
-    action_class: Literal["new_agent_session"]
+    action_class: HumanPresenceAction
     resource_binding: dict[str, JsonValue]
     issued_at: datetime
     expires_at: datetime

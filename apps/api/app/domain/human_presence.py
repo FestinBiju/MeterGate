@@ -1,12 +1,13 @@
 """Versioned integrity and deterministic risk rules for human-presence proofs."""
 
+import re
 from datetime import datetime
 from typing import Any, Literal
 
 from app.domain.hashing import canonical_utc_datetime, sha256_json
 
 HUMAN_PRESENCE_VERSION = "1"
-HumanPresenceAction = Literal["new_agent_session"]
+HumanPresenceAction = Literal["new_agent_session", "renew_agent_session"]
 _MCP_BUYER_SCOPES = frozenset(
     {
         "mcp:catalog.read",
@@ -25,10 +26,13 @@ def normalize_resource_binding(
     resource_binding: dict[str, Any],
 ) -> dict[str, Any]:
     """Reject client-invented scope and normalize the supported action binding."""
-    if action_class != "new_agent_session" or set(resource_binding) != {
-        "scopes",
-        "expires_in_seconds",
-    }:
+    expected_keys = {"scopes", "expires_in_seconds"}
+    if action_class == "renew_agent_session":
+        expected_keys.add("agent_session_id")
+    if (
+        action_class not in {"new_agent_session", "renew_agent_session"}
+        or set(resource_binding) != expected_keys
+    ):
         raise ValueError("Human-presence action or resource binding is not supported")
     scopes = resource_binding["scopes"]
     ttl = resource_binding["expires_in_seconds"]
@@ -44,7 +48,16 @@ def normalize_resource_binding(
         or not 60 <= ttl <= 86_400
     ):
         raise ValueError("Human-presence resource binding is invalid")
-    return {"scopes": sorted(scopes), "expires_in_seconds": ttl}
+    normalized = {"scopes": sorted(scopes), "expires_in_seconds": ttl}
+    if action_class == "renew_agent_session":
+        session_id = resource_binding["agent_session_id"]
+        if (
+            not isinstance(session_id, str)
+            or re.fullmatch(r"mas_[0-7][0-9A-HJKMNP-TV-Z]{25}", session_id) is None
+        ):
+            raise ValueError("Human-presence agent session binding is invalid")
+        normalized["agent_session_id"] = session_id
+    return normalized
 
 
 def resource_binding_hash(action_class: HumanPresenceAction, binding: dict[str, Any]) -> str:
@@ -89,4 +102,4 @@ def calculate_presence_hash(
 
 def requires_human_presence(action_class: HumanPresenceAction) -> bool:
     """Deterministic, deliberately small Milestone 11 risk gate."""
-    return action_class == "new_agent_session"
+    return action_class in {"new_agent_session", "renew_agent_session"}

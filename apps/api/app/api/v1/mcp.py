@@ -26,6 +26,7 @@ from app.schemas.mcp import (
     McpAgentSessionCreated,
     McpAgentSessionId,
     McpAgentSessionList,
+    McpAgentSessionRenew,
     McpAgentSessionResponse,
     McpCapabilityInput,
     McpEmptyInput,
@@ -102,6 +103,34 @@ async def revoke_agent_session(
     revoked = await service.revoke(agent_session_id, account_id=current.account.id)
     _no_store(response)
     return revoked
+
+
+@router.post("/sessions/{agent_session_id}/renew", response_model=McpAgentSessionResponse)
+async def renew_agent_session(
+    agent_session_id: McpAgentSessionId,
+    payload: McpAgentSessionRenew,
+    response: Response,
+    service: McpAgentSessionServiceDependency,
+    current: AuthenticatedMutationDependency,
+    origin: AllowedOriginDependency,
+    human_presence: HumanPresenceServiceDependency,
+) -> McpAgentSessionResponse:
+    record = await service.get_renewable(agent_session_id, account_id=current.account.id)
+    await human_presence.require_and_consume(
+        payload.human_presence_proof_id,
+        account_id=current.account.id,
+        session_id=current.state.session_id,
+        origin=origin,
+        action_class="renew_agent_session",
+        resource_binding={
+            "agent_session_id": record.id,
+            "scopes": list(record.scopes),
+            "expires_in_seconds": payload.expires_in_seconds,
+        },
+    )
+    renewed = await service.renew(record, payload)
+    _no_store(response)
+    return renewed
 
 
 @router.post("/tools/list-services")

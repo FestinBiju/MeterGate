@@ -16,6 +16,7 @@ from app.cache.approval_challenges import (
     ChallengeStateInvalidError,
 )
 from app.domain.canonical_json import canonical_json_bytes
+from app.domain.human_presence import HumanPresenceAction
 
 
 class HumanPresenceChallengeState(BaseModel):
@@ -26,7 +27,7 @@ class HumanPresenceChallengeState(BaseModel):
     challenge: Annotated[str, Field(min_length=43, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")]
     account_id: Annotated[str, Field(pattern=r"^acct_[0-7][0-9A-HJKMNP-TV-Z]{25}$")]
     session_id_hash: Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
-    action_class: Literal["new_agent_session"]
+    action_class: HumanPresenceAction
     resource_binding: dict[str, JsonValue]
     resource_binding_hash: Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
     origin: Annotated[str, Field(min_length=1, max_length=500)]

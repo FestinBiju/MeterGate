@@ -1,5 +1,7 @@
 "use client";
 
+import { PurchaseReceipt } from "@/components/purchase-receipt";
+
 import Script from "next/script";
 import { useCallback, useEffect, useRef, useState } from "react";
 
@@ -1628,6 +1630,7 @@ export function StandardCheckout({
           refundSummary={transaction.refund_summary}
         />
       ) : null}
+      {!paymentVerified && transaction ? <PurchaseReceipt apiBaseEndpoint={apiBaseEndpoint} transactionId={transaction.transaction_id} /> : null}
     </section>
   );
 }

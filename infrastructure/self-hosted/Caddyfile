@@ -1,0 +1,14 @@
+{
+  auto_https off
+}
+
+:80 {
+  @api path /api/* /docs* /openapi.json /redoc*
+  handle @api {
+    reverse_proxy api:8000
+  }
+
+  handle {
+    reverse_proxy web:3000
+  }
+}

@@ -1,0 +1,107 @@
+{
+  "scope": "Browser-driven live policy denial; not a connected MCP agent run",
+  "generated_at": "2026-09-05T04:33:48.711029+00:00",
+  "evaluation_id": "pye_01M1QXESQDA95VV3HY40NVDPTC",
+  "quote_id": "qte_01M1QXC1FSSA3Q3Q9VC6N2FVTN",
+  "policy_id": "pol_01M1QXE5W0RD7H1KBJ8BF12YJJ",
+  "decision": "deny",
+  "evaluated_at": "2026-09-05T04:33:02.700992+00:00",
+  "checks": [
+    {
+      "rule": "POLICY_INTEGRITY",
+      "result": "pass",
+      "details": {},
+      "reason_code": "PASS_POLICY_INTEGRITY_VERIFIED"
+    },
+    {
+      "rule": "QUOTE_INTEGRITY",
+      "result": "pass",
+      "details": {},
+      "reason_code": "PASS_QUOTE_INTEGRITY_VERIFIED"
+    },
+    {
+      "rule": "POLICY_FRESHNESS",
+      "result": "pass",
+      "details": {
+        "expires_at": "2026-09-05T04:47:42.368137Z",
+        "evaluated_at": "2026-09-05T04:33:02.700992Z"
+      },
+      "reason_code": "PASS_POLICY_ACTIVE"
+    },
+    {
+      "rule": "QUOTE_FRESHNESS",
+      "result": "pass",
+      "details": {
+        "expires_at": "2026-09-05T04:36:32.345618Z",
+        "evaluated_at": "2026-09-05T04:33:02.700992Z"
+      },
+      "reason_code": "PASS_QUOTE_ACTIVE"
+    },
+    {
+      "rule": "MAXIMUM_AMOUNT",
+      "result": "fail",
+      "details": {
+        "actual": 900,
+        "maximum": 500
+      },
+      "reason_code": "DENY_AMOUNT_EXCEEDS_LIMIT"
+    },
+    {
+      "rule": "CURRENCY",
+      "result": "pass",
+      "details": {
+        "actual": "INR",
+        "allowed": [
+          "INR"
+        ]
+      },
+      "reason_code": "PASS_CURRENCY_ALLOWED"
+    },
+    {
+      "rule": "MERCHANT",
+      "result": "pass",
+      "details": {
+        "actual": "mrc_01M0WD974EGYGNB0ZHE9J7F9SB",
+        "allowed": [
+          "mrc_01M0WD974EGYGNB0ZHE9J7F9SB"
+        ]
+      },
+      "reason_code": "PASS_MERCHANT_ALLOWED"
+    },
+    {
+      "rule": "SERVICE",
+      "result": "pass",
+      "details": {
+        "actual": "svc_01M0WD975WM3D82G00XAH32TY3",
+        "allowed": [
+          "svc_01M0WD975WM3D82G00XAH32TY3"
+        ]
+      },
+      "reason_code": "PASS_SERVICE_ALLOWED"
+    },
+    {
+      "rule": "SERVICE_TYPE",
+      "result": "pass",
+      "details": {
+        "actual": "report",
+        "allowed": [
+          "report"
+        ]
+      },
+      "reason_code": "PASS_SERVICE_TYPE_ALLOWED"
+    },
+    {
+      "rule": "PURCHASE_TYPE",
+      "result": "pass",
+      "details": {
+        "actual": "one_time",
+        "allowed": [
+          "one_time"
+        ]
+      },
+      "reason_code": "PASS_PURCHASE_TYPE_ALLOWED"
+    }
+  ],
+  "linked_authorization_count": 0,
+  "linked_payment_transaction_count": 0
+}

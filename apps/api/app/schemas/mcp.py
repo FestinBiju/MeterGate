@@ -67,6 +67,11 @@ class McpAgentSessionCreate(APIModel):
         return sorted(value, key=order.__getitem__)
 
 
+class McpAgentSessionRenew(APIModel):
+    expires_in_seconds: Annotated[StrictInt, Field(ge=60, le=3_600)]
+    human_presence_proof_id: HumanPresenceProofId
+
+
 class McpAgentSessionResponse(APIModel):
     id: McpAgentSessionId
     account_id: str

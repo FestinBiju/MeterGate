@@ -269,6 +269,7 @@ class HumanPresenceService:
             select(HumanPresenceProof)
             .where(HumanPresenceProof.id == proof_id, HumanPresenceProof.account_id == account_id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         now = datetime.now(UTC)
         if proof is None:

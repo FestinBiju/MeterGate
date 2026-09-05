@@ -65,7 +65,14 @@ export const quoteInput = z
   .strict();
 export const policyInput = z
   .object({
-    maximum_amount: z.number().int().safe().nonnegative(),
+    maximum_amount: z
+      .number()
+      .int()
+      .safe()
+      .nonnegative()
+      .describe(
+        "Maximum spend in the currency's integer minor unit. INR uses paise: ₹10.00 is 1000, and 500 is ₹5.00.",
+      ),
     allowed_currencies: z.array(z.string().regex(/^[A-Z]{3}$/)).min(1).max(100).optional(),
     allowed_merchant_ids: z.array(id("mrc")).min(1).max(100).optional(),
     allowed_service_ids: z.array(id("svc")).min(1).max(100).optional(),

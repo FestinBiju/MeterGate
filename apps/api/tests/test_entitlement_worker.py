@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
 from alembic import command
+from app.api.v1.dependencies import require_catalog_admin
 from app.application import create_app
 from app.core.config import Settings
 from app.domain.approval_hashing import AUTHORIZATION_VERSION, calculate_authorization_hash
@@ -186,6 +187,8 @@ def worker_client(worker_database: IsolatedDatabase) -> Iterator[TestClient]:
             database=worker_database.database,
         )
     ) as client:
+        # Fixture administration only; buyer and payment authority remains enforced.
+        client.app.dependency_overrides[require_catalog_admin] = lambda: None
         yield client
 
 
