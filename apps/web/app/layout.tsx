@@ -4,6 +4,10 @@ import type { ReactNode } from "react";
 
 import "./globals.css";
 
+const bodyFont = Open_Sans({ subsets: ["latin"], variable: "--font-body" });
+const displayFont = Inter({ subsets: ["latin"], variable: "--font-display" });
+const monoFont = Inconsolata({ subsets: ["latin"], variable: "--font-mono" });
+
 export const metadata: Metadata = {
   title: "MeterGate | Agent commerce infrastructure",
   description:
