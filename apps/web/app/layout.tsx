@@ -23,6 +23,3 @@ export default function RootLayout({ children }: Readonly<{ children: ReactNode 
     </html>
   );
 }
-const bodyFont = Open_Sans({ subsets: ["latin"], variable: "--font-body" });
-const displayFont = Inter({ subsets: ["latin"], variable: "--font-display" });
-const monoFont = Inconsolata({ subsets: ["latin"], variable: "--font-mono" });
