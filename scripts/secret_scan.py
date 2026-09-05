@@ -37,7 +37,7 @@ def synthetic(value: bytes) -> bool:
         )
         or len(set(candidate)) < 8
         or bool(
-        re.search(rb"(?:rzp_(?:test|live)_)?[0-9]{8,64}$", value)
+            re.search(rb"(?:rzp_(?:test|live)_)?[0-9]{8,64}$", value)
         )
     )
 
