@@ -173,6 +173,7 @@ async def export(transaction_id: str, output: Path) -> None:
                         "amount": refund.amount,
                         "currency": refund.currency,
                         "provider_status": refund.provider_status,
+                        "provider_refund_id": refund.provider_refund_id,
                     }
                     for refund in refunds
                 ],

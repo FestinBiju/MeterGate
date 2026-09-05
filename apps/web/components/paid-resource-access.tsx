@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useAccountSession } from "@/components/account-session";
+import { OrbitReport } from "@/components/orbit-report";
+import { PurchaseReceipt } from "@/components/purchase-receipt";
 import {
   ApiRequestFailure,
   requestProtectedResourceJson,
@@ -1237,15 +1239,21 @@ export function PaidResourceAccess({
               <dd className="mt-1 break-all font-mono text-slate-400">{execution.result_hash}</dd>
             </div>
           </dl>
-          <pre className="mt-3 max-h-[32rem] overflow-auto rounded-lg bg-black/35 p-3 text-[10px] leading-4 text-emerald-50/85">
-            {prettyJson(execution.result)}
-          </pre>
+          <OrbitReport result={execution.result} />
+          <details className="raw-evidence">
+            <summary>Inspect raw result JSON</summary>
+            <pre>{prettyJson(execution.result)}</pre>
+          </details>
           <div className="mt-3 rounded-lg border border-white/[0.07] bg-black/20 px-3 py-2.5 text-[10px] leading-4 text-slate-400">
             <strong className="text-slate-200">Data source: CelesTrak GP data.</strong>{" "}
             OrbitIntel outputs are deterministic informational heuristics from a current orbital snapshot. They are not conjunction screening, a collision warning, or an operational tracking service.
           </div>
         </div>
       ) : null}
+      <PurchaseReceipt apiBaseEndpoint={apiBaseEndpoint} transactionId={transactionId}
+        resultEvidence={!accessQuarantined && execution && entitlement && execution.entitlement_id === entitlement.entitlement_id
+          ? { transaction_id: entitlement.transaction_id, result_hash: execution.result_hash, completed_at: execution.completed_at }
+          : null} />
     </section>
   );
 }

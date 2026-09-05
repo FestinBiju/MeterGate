@@ -2,7 +2,7 @@ from collections.abc import Callable
 
 from fastapi.testclient import TestClient
 
-from app.api.v1.dependencies import get_merchant_application_service
+from app.api.v1.dependencies import get_merchant_application_service, require_catalog_admin
 from app.domain.exceptions import ResourceNotFoundError, SlugConflictError
 
 
@@ -15,6 +15,12 @@ class FailingMerchantApplicationService:
 
     async def get(self, _: str) -> None:
         raise self._error
+
+
+def as_admin(client: TestClient) -> TestClient:
+    # These tests isolate schema/domain errors. Authorization has separate HTTP tests.
+    client.app.dependency_overrides[require_catalog_admin] = lambda: None
+    return client
 
 
 def test_v1_openapi_exposes_exact_management_and_catalog_routes(
@@ -43,7 +49,7 @@ def test_v1_openapi_exposes_exact_management_and_catalog_routes(
 def test_domain_requests_reject_extra_fields_before_mutation(
     make_client: Callable[..., TestClient],
 ) -> None:
-    response = make_client().post(
+    response = as_admin(make_client()).post(
         "/api/v1/merchants",
         json={
             "slug": "orbitintel",
@@ -60,7 +66,7 @@ def test_domain_requests_reject_extra_fields_before_mutation(
 def test_service_request_rejects_non_object_schema(
     make_client: Callable[..., TestClient],
 ) -> None:
-    response = make_client().post(
+    response = as_admin(make_client()).post(
         "/api/v1/merchants/mrc_example/services",
         json={
             "slug": "orbital-risk-report",
@@ -85,7 +91,7 @@ def test_service_request_rejects_non_object_schema(
 def test_patch_request_rejects_empty_and_explicit_null_documents(
     make_client: Callable[..., TestClient],
 ) -> None:
-    client = make_client()
+    client = as_admin(make_client())
 
     empty_response = client.patch("/api/v1/services/svc_example", json={})
     null_response = client.patch(
@@ -130,7 +136,7 @@ def test_domain_exceptions_map_to_safe_http_errors(
     assert not_found.status_code == 404
     assert not_found.json() == {"detail": "Merchant 'mrc_missing' was not found"}
 
-    conflict_client = make_client()
+    conflict_client = as_admin(make_client())
     conflict_client.app.dependency_overrides[get_merchant_application_service] = lambda: (
         FailingMerchantApplicationService(SlugConflictError("Merchant", "orbitintel"))
     )

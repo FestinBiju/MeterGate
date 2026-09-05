@@ -18,6 +18,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from alembic import command
+from app.api.v1.dependencies import require_catalog_admin
 from app.application import create_app
 from app.cache.payment_webhooks import VerifiedWebhookPayload
 from app.core.config import Settings
@@ -216,6 +217,8 @@ def refund_client(refund_database: IsolatedDatabase) -> Iterator[TestClient]:
             database=refund_database.database,
         )
     ) as client:
+        # Fixture administration only; buyer and payment authority remains enforced.
+        client.app.dependency_overrides[require_catalog_admin] = lambda: None
         yield client
 
 

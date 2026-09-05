@@ -1,8 +1,8 @@
 """Thin service management routes."""
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Depends, status
 
-from app.api.v1.dependencies import ServiceApplicationDependency
+from app.api.v1.dependencies import ServiceApplicationDependency, require_catalog_admin
 from app.schemas.services import ServiceCreate, ServicePatch, ServiceResponse
 
 router = APIRouter(tags=["services"])
@@ -12,6 +12,7 @@ router = APIRouter(tags=["services"])
     "/merchants/{merchant_id}/services",
     response_model=ServiceResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_catalog_admin)],
 )
 async def create_service(
     merchant_id: str,
@@ -43,7 +44,11 @@ async def get_service(
     return ServiceResponse.model_validate(service)
 
 
-@router.patch("/services/{service_id}", response_model=ServiceResponse)
+@router.patch(
+    "/services/{service_id}",
+    response_model=ServiceResponse,
+    dependencies=[Depends(require_catalog_admin)],
+)
 async def update_service(
     service_id: str,
     payload: ServicePatch,

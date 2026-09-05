@@ -48,6 +48,7 @@ from app.schemas.mcp import (
     ALL_MCP_SCOPES,
     McpAgentSessionCreate,
     McpAgentSessionCreated,
+    McpAgentSessionRenew,
     McpAgentSessionResponse,
     McpEvaluationResult,
     McpPurchaseStatusResponse,
@@ -148,6 +149,7 @@ class McpAgentSessionService:
                 McpAgentSession.account_id == account_id,
             )
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if record is None:
             raise McpSessionNotFoundError(
@@ -174,6 +176,7 @@ class McpAgentSessionService:
             select(McpAgentSession)
             .where(McpAgentSession.token_hash == sha256_bytes(token.encode("utf-8")))
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if record is None:
             raise McpSessionUnauthorizedError(
@@ -188,7 +191,9 @@ class McpAgentSessionService:
             )
         if self._utc(record.expires_at) <= now:
             raise McpSessionUnauthorizedError(
-                "The MeterGate agent session expired",
+                "Agent access expired. Renew this connection with your passkey at "
+                f"{self._settings.mcp_frontend_base_url.rstrip('/')}/"
+                f"#agent-session-{record.id}. Keep the existing MCP token and configuration.",
                 "MCP_SESSION_EXPIRED",
             )
         account = await self._session.get(Account, record.account_id)
@@ -218,6 +223,60 @@ class McpAgentSessionService:
             account=account,
             approval_subject_ref=identity.subject_ref,
         )
+
+    async def get_renewable(self, session_id: str, *, account_id: str) -> McpAgentSession:
+        """Lock owner-bound metadata; a revoked credential can never be renewed."""
+        record = await self._session.scalar(
+            select(McpAgentSession)
+            .where(McpAgentSession.id == session_id, McpAgentSession.account_id == account_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if record is None or record.account_id != account_id:
+            raise McpSessionNotFoundError(
+                "The agent session was not found", "MCP_SESSION_NOT_FOUND"
+            )
+        if record.revoked_at is not None:
+            raise McpSessionConflictError(
+                "Revoked connections cannot be renewed. Configure a new connection instead.",
+                "MCP_SESSION_REVOKED",
+            )
+        self._validated_scopes(record.scopes)
+        return record
+
+    async def renew(
+        self, record: McpAgentSession, payload: McpAgentSessionRenew
+    ) -> McpAgentSessionResponse:
+        """Commit the grant and consumed passkey proof together, preserving the token hash."""
+        if payload.expires_in_seconds > self._settings.mcp_agent_session_max_ttl_seconds:
+            raise McpSessionConflictError(
+                "The requested agent session lifetime exceeds the configured maximum",
+                "MCP_SESSION_TTL_EXCEEDED",
+            )
+        if record.revoked_at is not None:
+            raise McpSessionConflictError(
+                "Revoked connections cannot be renewed", "MCP_SESSION_REVOKED"
+            )
+        now = datetime.now(UTC)
+        previous_expiry = self._utc(record.expires_at)
+        record.expires_at = now + timedelta(seconds=payload.expires_in_seconds)
+        self._session.add(
+            McpToolAuditEvent(
+                agent_session_id=record.id,
+                account_id=record.account_id,
+                tool_name="renew_agent_session",
+                correlation_id=payload.human_presence_proof_id,
+                resource_ids={
+                    "human_presence_proof_id": payload.human_presence_proof_id,
+                    "previous_expires_at": previous_expiry.isoformat(),
+                    "expires_at": record.expires_at.isoformat(),
+                },
+                result_code="MCP_SESSION_RENEWED",
+                occurred_at=now,
+            )
+        )
+        await self._session.commit()
+        return self._response(record)
 
     @staticmethod
     def _validated_scopes(value: object) -> frozenset[McpScope]:

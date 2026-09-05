@@ -1,0 +1,171 @@
+{
+  "export_version": "1",
+  "generated_at": "2026-09-05T04:30:39.213409+00:00",
+  "transaction": {
+    "id": "txn_01M1QWZ4Z460JDFZCWSM0T6KYE",
+    "account_id": "acct_01M1QWQ13ZM2772NCW8V6KD6SH",
+    "authorization_id": "aut_01M1QWZ2DJAHABQGK9PG5DWHVK",
+    "evaluation_id": "pye_01M1QWYP9MR94MRRGSRS7N6VBX",
+    "policy_id": "pol_01M1QWYGWAVJPFNJ13HDZS6K7Y",
+    "policy_hash": "sha256:2b7566861e2fa1a394b8f0f48cb2b3aa14c3fd13d923baab6ef4c89ff7a006cc",
+    "quote_id": "qte_01M1QWXRVYS86W5GEZJG9BVJ9T",
+    "quote_hash": "sha256:0b83970e0627a4bcd8396010f2fa48e4134a89cce1d0a261b3acc1e4b3322698",
+    "merchant_id": "mrc_01M0WD974EGYGNB0ZHE9J7F9SB",
+    "service_id": "svc_01M0WD975HWRE672TKXPYRCPJC",
+    "amount": 500,
+    "currency": "INR",
+    "purchase_type": "one_time",
+    "payment_state": "paid",
+    "provider_order_status": "paid",
+    "payment_binding_hash": "sha256:37cf044a4bb74f2aacd2cbaa8cd9ccf654aeccc72fc163edd7cb237d5bddbfea"
+  },
+  "audit_completeness": {
+    "quote": true,
+    "policy": true,
+    "evaluation": true,
+    "human_approval": true,
+    "payment_transaction": true,
+    "provider_payment": true,
+    "entitlement": true,
+    "fulfillment": true,
+    "compensation_or_refund": false
+  },
+  "payment_events": [
+    {
+      "id": "pte_01M1QWZ4Z460JDFZCWSM0T6KYF",
+      "type": "payment_transaction_created",
+      "reason_code": "PAYMENT_TRANSACTION_CREATED",
+      "prior_state": null,
+      "resulting_state": "order_creation_pending",
+      "occurred_at": "2026-09-05T04:24:29.917212+00:00"
+    },
+    {
+      "id": "pte_01M1QWZ504D6ETD0WJ9A3AMQF6",
+      "type": "razorpay_order_creation_started",
+      "reason_code": "PAYMENT_ORDER_CREATION_STARTED",
+      "prior_state": "order_creation_pending",
+      "resulting_state": "order_creation_pending",
+      "occurred_at": "2026-09-05T04:24:29.956753+00:00"
+    },
+    {
+      "id": "pte_01M1QWZ5KVM5507P43XY70EFFJ",
+      "type": "razorpay_order_created",
+      "reason_code": "PAYMENT_ORDER_CREATED",
+      "prior_state": "order_creation_pending",
+      "resulting_state": "order_created",
+      "occurred_at": "2026-09-05T04:24:30.587647+00:00"
+    },
+    {
+      "id": "pte_01M1QX0DYKYM3F1AMV23M1T4E5",
+      "type": "checkout_signature_verified",
+      "reason_code": "PAYMENT_CHECKOUT_SIGNATURE_VERIFIED",
+      "prior_state": "order_created",
+      "resulting_state": "order_created",
+      "occurred_at": "2026-09-05T04:25:11.891135+00:00"
+    },
+    {
+      "id": "pte_01M1QX0EQVXRKNY1A1DEESH3W8",
+      "type": "payment_captured",
+      "reason_code": "PAYMENT_CAPTURED",
+      "prior_state": "order_created",
+      "resulting_state": "paid",
+      "occurred_at": "2026-09-05T04:25:12.692880+00:00"
+    },
+    {
+      "id": "pte_01M1QX0H79XNR6VH4TN3A08F72",
+      "type": "payment_reconciled",
+      "reason_code": "PAYMENT_RECONCILED",
+      "prior_state": "paid",
+      "resulting_state": "paid",
+      "occurred_at": "2026-09-05T04:25:15.233178+00:00"
+    },
+    {
+      "id": "pte_01M1QX0H8A1EGSFH1JAY9BD359",
+      "type": "payment_reverified",
+      "reason_code": "PAYMENT_REVERIFIED_FOR_VALUE_RELEASE",
+      "prior_state": "paid",
+      "resulting_state": "paid",
+      "occurred_at": "2026-09-05T04:25:15.274124+00:00"
+    },
+    {
+      "id": "pte_01M1QX0RST6SAN19JY02AXK9ZN",
+      "type": "payment_reconciled",
+      "reason_code": "PAYMENT_RECONCILED",
+      "prior_state": "paid",
+      "resulting_state": "paid",
+      "occurred_at": "2026-09-05T04:25:22.998542+00:00"
+    },
+    {
+      "id": "pte_01M1QX0RTP0Z3MY80PZ3S2F2TH",
+      "type": "payment_reverified",
+      "reason_code": "PAYMENT_REVERIFIED_FOR_VALUE_RELEASE",
+      "prior_state": "paid",
+      "resulting_state": "paid",
+      "occurred_at": "2026-09-05T04:25:23.030930+00:00"
+    }
+  ],
+  "entitlement": {
+    "id": "ent_01M1QX0H8X701FE3KRN59NB03D",
+    "entitlement_hash": "sha256:ff248ce93b9def17f9da617c01499fe4187a4c54d24ba3a1634b972b82108a10",
+    "expires_at": "2026-09-05T04:35:15.293313+00:00"
+  },
+  "fulfillment": {
+    "id": "ful_01M1QX0QZZGFBTAYNT8PQW63V9",
+    "state": "succeeded",
+    "result_hash": "sha256:802d2381ff91d455a17a444bfc161b053b1c59a14019cde3be27e82535f7b7c6",
+    "failure_code": null
+  },
+  "fulfillment_events": [
+    {
+      "id": "fve_01M1QX0H8X701FE3KRN59NB03E",
+      "type": "payment_reverified",
+      "reason_code": "PAYMENT_REVERIFIED_FOR_VALUE_RELEASE",
+      "occurred_at": "2026-09-05T04:25:15.274124+00:00"
+    },
+    {
+      "id": "fve_01M1QX0H8X701FE3KRN59NB03F",
+      "type": "entitlement_issued",
+      "reason_code": "ENTITLEMENT_ISSUED",
+      "occurred_at": "2026-09-05T04:25:15.293313+00:00"
+    },
+    {
+      "id": "fve_01M1QX0PKMZHSRX2RV94M4DN5R",
+      "type": "capability_issued",
+      "reason_code": "CAPABILITY_ISSUED",
+      "occurred_at": "2026-09-05T04:25:20.748441+00:00"
+    },
+    {
+      "id": "fve_01M1QX0QZZGFBTAYNT8PQW63VA",
+      "type": "fulfillment_claimed",
+      "reason_code": "FULFILLMENT_CLAIMED",
+      "occurred_at": "2026-09-05T04:25:22.175231+00:00"
+    },
+    {
+      "id": "fve_01M1QX0R0KAJ988WB57D8SYQDX",
+      "type": "fulfillment_started",
+      "reason_code": "FULFILLMENT_STARTED",
+      "occurred_at": "2026-09-05T04:25:22.195430+00:00"
+    },
+    {
+      "id": "fve_01M1QX0RVH8YN4PMSE614B4M0K",
+      "type": "merchant_request_sent",
+      "reason_code": "MERCHANT_REQUEST_SENT",
+      "occurred_at": "2026-09-05T04:25:23.057388+00:00"
+    },
+    {
+      "id": "fve_01M1QX0T0V7019WW9ER1MP3E7R",
+      "type": "merchant_response_received",
+      "reason_code": "MERCHANT_RESULT_RECEIVED",
+      "occurred_at": "2026-09-05T04:25:24.251204+00:00"
+    },
+    {
+      "id": "fve_01M1QX0T0V7019WW9ER1MP3E7S",
+      "type": "fulfillment_succeeded",
+      "reason_code": "FULFILLMENT_SUCCEEDED",
+      "occurred_at": "2026-09-05T04:25:24.251265+00:00"
+    }
+  ],
+  "compensation": null,
+  "refunds": [],
+  "compensation_events": []
+}

@@ -13,7 +13,13 @@ const handoff = await readFile(
 
 test("agent sessions are explicit, short-lived, shown once, and revocable", () => {
   assert.match(connections, /Create Agent Session/);
-  assert.match(connections, /expires_in_seconds: 900/);
+  assert.match(connections, /expires_in_seconds: lifetime/);
+  assert.match(connections, /value=\{900\}/);
+  assert.match(connections, /value=\{1800\}/);
+  assert.match(connections, /value=\{3600\}/);
+  assert.match(connections, /Renew access with passkey/);
+  assert.match(connections, /actionClass="renew_agent_session"/);
+  assert.match(connections, /agent_session_id: pendingAction.session.id/);
   assert.match(connections, /Copy this credential now/);
   assert.match(connections, /Dismiss secret/);
   assert.match(connections, /Revoke Agent Session/);
@@ -41,7 +47,17 @@ test("agent handoff reads authoritative evidence and reuses trusted approval UI"
   assert.match(handoff, /policy-evaluations/);
   assert.match(handoff, /TrustedApproval/);
   assert.match(handoff, /Server price/);
-  assert.match(handoff, /handoff\.decision !== "allow"/);
+  assert.match(handoff, /const allowed = handoff\.decision === "allow"/);
+  for (const evidence of [
+    "Agent proposal",
+    "Normalized input",
+    "Immutable quote",
+    "Deterministic checks",
+    "Buyer maximum",
+    "Policy evaluation checks",
+    "Human authority",
+    "No approval or payment path was created",
+  ]) assert.match(handoff, new RegExp(evidence));
   for (const forbidden of ["approve_purchase", "create_razorpay_order", "/refunds", "/operator"])
     assert.doesNotMatch(handoff, new RegExp(forbidden));
 });

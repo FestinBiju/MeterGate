@@ -210,11 +210,22 @@ def main() -> None:
         commit = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=ROOT, check=True, text=True, capture_output=True
         ).stdout.strip()
+        working_tree_dirty = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain", "--untracked-files=all"],
+                cwd=ROOT,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+        )
     except subprocess.CalledProcessError:
         commit = "unknown"
+        working_tree_dirty = True
     report: dict[str, Any] = {
         "generated_at": datetime.now(UTC).isoformat(),
         "app_commit_hash": commit,
+        "working_tree_dirty": working_tree_dirty,
         "scenario_count": len(scenarios),
         "passed": sum(row["passed"] for row in scenarios),
         "failed": sum(not row["passed"] for row in scenarios),
@@ -245,11 +256,16 @@ def main() -> None:
     }
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     (RESULTS_DIR / "results.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    # Publish the same non-sensitive snapshot inside the web Docker build context.
+    (ROOT / "apps" / "web" / "lib" / "policy-evidence.json").write_text(
+        json.dumps(report, indent=2) + "\n", encoding="utf-8"
+    )
     lines = [
         "# Milestone 11 Evaluation Results",
         "",
         f"Generated: `{report['generated_at']}`",
         f"Commit: `{commit}`",
+        f"Working tree dirty: `{'yes' if working_tree_dirty else 'no'}`",
         "",
         f"Scenarios: **{len(scenarios)}** — {report['passed']} passed, {report['failed']} failed.",
         "",

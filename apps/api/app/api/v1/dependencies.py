@@ -622,6 +622,16 @@ async def require_recent_operator(
 RecentOperatorDependency = Annotated[OperatorContext, Depends(require_recent_operator)]
 
 
+async def require_catalog_admin(operator: RecentOperatorDependency) -> OperatorContext:
+    """Catalog terms are administration, not buyer or routine operator authority."""
+    if operator.role != "admin":
+        raise AuthenticationForbiddenError(
+            "An active administrator role is required to change catalog terms",
+            "CATALOG_ADMIN_REQUIRED",
+        )
+    return operator
+
+
 MerchantApplicationDependency = Annotated[
     MerchantApplicationService,
     Depends(get_merchant_application_service),

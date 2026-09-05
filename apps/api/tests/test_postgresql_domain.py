@@ -22,6 +22,7 @@ from sqlalchemy.schema import CreateSchema, DropSchema
 from alembic import command
 from app.api.v1.dependencies import (
     require_authenticated_mutation,
+    require_catalog_admin,
     require_current_account,
 )
 from app.application import create_app
@@ -274,6 +275,8 @@ def domain_client(isolated_database: IsolatedDatabase) -> Iterator[TestClient]:
             database=isolated_database.database,
         )
     ) as client:
+        # Isolate persistence contracts; test_catalog_admin covers the HTTP authority boundary.
+        client.app.dependency_overrides[require_catalog_admin] = lambda: None
         yield client
 
 
@@ -387,13 +390,28 @@ def service_payload(
     }
 
 
+@contextmanager
+def catalog_setup_authority(client: TestClient) -> Iterator[None]:
+    """Provision fixtures as an administrator without bypassing buyer/payment checks."""
+    previous = client.app.dependency_overrides.get(require_catalog_admin, _MISSING_OVERRIDE)
+    client.app.dependency_overrides[require_catalog_admin] = lambda: None
+    try:
+        yield
+    finally:
+        if previous is _MISSING_OVERRIDE:
+            client.app.dependency_overrides.pop(require_catalog_admin, None)
+        else:
+            client.app.dependency_overrides[require_catalog_admin] = previous
+
+
 def create_merchant(
     client: TestClient,
     slug: str,
     *,
     status: str = "active",
 ) -> dict[str, Any]:
-    response = client.post("/api/v1/merchants", json=merchant_payload(slug, status=status))
+    with catalog_setup_authority(client):
+        response = client.post("/api/v1/merchants", json=merchant_payload(slug, status=status))
     assert response.status_code == 201, response.text
     return response.json()
 
@@ -407,15 +425,16 @@ def create_service(
     base_price: int = 500,
     input_schema: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    response = client.post(
-        f"/api/v1/merchants/{merchant_id}/services",
-        json=service_payload(
-            slug,
-            status=status,
-            base_price=base_price,
-            input_schema=input_schema,
-        ),
-    )
+    with catalog_setup_authority(client):
+        response = client.post(
+            f"/api/v1/merchants/{merchant_id}/services",
+            json=service_payload(
+                slug,
+                status=status,
+                base_price=base_price,
+                input_schema=input_schema,
+            ),
+        )
     assert response.status_code == 201, response.text
     return response.json()
 
