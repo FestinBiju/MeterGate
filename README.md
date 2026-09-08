@@ -2,24 +2,6 @@
 
 **A Razorpay-native agent storefront for paid APIs and digital services.**
 
-## Presentation entry points
-
-- **Guided demo:** open the homepage and choose successful delivery, budget rejection, or operator-prepared recovery. Each card has a copyable MCP prompt.
-- **Delivered value:** the buyer receives a readable OrbitIntel report with source epoch, units, limitations, and expandable raw JSON.
-- **Purchase receipt:** download a JSON snapshot from authenticated transaction, authorization, and policy evidence. It is explicitly Test Mode evidence, not a tax invoice or signed attestation.
-- **Evidence:** `/evidence` separates recorded policy results from historical provider acceptance. Current private commerce metrics remain in `/operator`.
-- [Five-minute presentation and recording checklist](docs/demo/presentation.md)
-- [Submission copy and architecture slide](docs/demo/submission-copy.md)
-- [Current readiness and live acceptance evidence](docs/demo/readiness-2026-09-05.md)
-- [Merchant integration guide](docs/merchant-integration.md)
-- [Execution checklist](docs/demo/execution-plan.md)
-
-For a local production frontend build, set `NEXT_PUBLIC_API_URL=http://localhost:8000` in the build process before `npm run build` from `apps/web`. The root `.env` alone does not configure the Next.js build. Use the same `localhost` origin configured for passkeys throughout the demo.
-
-With the local stack running, use `uv run python -m app.scripts.presentation_preflight` from `apps/api`. It checks readiness, the catalog, 402 behavior, anonymous catalog-write rejection, and worker heartbeats without printing credentials. It deliberately does not claim live checkout, webhook delivery, or refund acceptance. Add `--require-refunds` for the configured failure demonstration.
-
-## Track
-Razorpay Buildathon — **Track 01: AI Growth & Agentic Commerce**
 
 ## Problem Statement
 Independent Indian digital-service merchants generally lack a simple, self-serve way to make their APIs, datasets, reports, or other digital services transactable by AI buyers end to end.
@@ -43,18 +25,6 @@ An AI buyer can:
 8. Generate an auditable transaction and fulfillment trail.
 
 The goal is to help merchants become **discoverable, understandable, payable, and fulfillable by AI agents** without giving those agents unrestricted payment or service access.
-
-## Buildathon Proof
-
-MeterGate deliberately targets the second half of Track 01: making a merchant safely transactable by an AI buyer end to end. That trust and control layer is the revenue-growth precondition for exposing paid merchant APIs to agent traffic.
-
-The seeded agent-readable catalog contains three real service choices at ₹2, ₹5, and ₹9. Codex can interpret a fuzzy request, compare those choices, and propose a service; immutable quotes and deterministic policy remain authoritative. The generated evaluation currently records 60/60 passing scenarios, 0% policy bypass, 0% false blocking, and 0.117 ms policy-evaluation p95. A separate physical acceptance run completed one real Razorpay Test Mode refund from permanent fulfillment failure to provider status `processed`; this is honestly reported as one accepted run, not a population-level recovery claim.
-
-MeterGate provides standards-aligned primitives without claiming protocol conformance: its quote/policy/authorization evidence resembles AP2 mandates, its agent-readable catalog and checkout lifecycle overlap ACP, and its resource-first `402 Payment Required` flow is x402-inspired while deliberately using Razorpay and entitlement capabilities instead of blockchain settlement. See the [five-minute judge demonstration](docs/demo/judge-readiness.md) for exact prompts, evidence, protocol links, and the on-camera failure sequence.
-
-## Current Milestone
-
-Milestone 11 makes the verified commerce loop deployable and measurable. Powerful MCP buyer sessions now require a one-use, action-bound Proof of Human Presence created by `userVerification=required` WebAuthn rather than a visual CAPTCHA. Staging configuration fails closed on insecure cookies/origins or non-Test Razorpay mode; Docker deployment references, CI, secret scanning, guarded demo preparation, sanitized transaction evidence export, and a machine-produced 60-scenario evaluation harness are included. The web presentation now follows the repository's TypeUI Minimal design system while preserving the existing commerce, security, and evidence contracts.
 
 ## Agent Interface
 
@@ -315,27 +285,6 @@ zrok share public localhost:8000
 
 In the Razorpay Dashboard's **Test Mode**, configure the resulting HTTPS URL plus `/api/v1/webhooks/razorpay`, use the same dedicated secret as `RAZORPAY_WEBHOOK_SECRET`, and subscribe to the exact eight events listed under **Refund Webhooks**. Start PostgreSQL, Redis, the webhook worker, refund worker, API, and frontend before exercising compensation. A deployed HTTPS staging API can be used instead; do not use a tunnel hostname currently blocked by Razorpay.
 
-### Manual Milestone 6B Windows Hello payment acceptance
-
-Physical authenticator acceptance cannot be replaced by an automated fake. On a Windows development machine with Chrome or Edge and Windows Hello configured:
-
-1. Run `docker compose up -d --wait` from the repository root.
-2. Configure Razorpay Test Mode credentials and the Test Mode webhook as described above. In `apps/api`, run `uv sync --frozen --dev`, `uv run alembic upgrade head`, `uv run python -m app.scripts.seed_dev`, `uv run python -m app.workers.razorpay_webhooks`, and—in another terminal—`uv run fastapi dev app/main.py`.
-3. In `apps/web`, set `$env:NEXT_PUBLIC_API_URL = "http://localhost:8000"`, run `npm install`, then `npm run dev`.
-4. Open `http://localhost:3000` exactly (the default WebAuthn RP is `localhost`).
-5. Choose **Create Account**, enter a display name, register the first passkey, and complete Windows Hello. Confirm the page shows the active `acct_…` account, its display name, and authentication method **Passkey**.
-6. Sign out, confirm the buyer-authority controls show **Sign in to continue**, then choose **Sign in with Passkey** and complete Windows Hello.
-7. Request the ₹5.00 INR OrbitIntel quote, create a policy capped at 1000 paise (₹10.00), and evaluate it to `allow`. Confirm the policy subject shown by the server is the signed-in Account ID; the UI must not ask for `dev-user-001` or another subject.
-8. Prepare the trusted review, confirm the server-derived terms and review hash, choose **Approve with Passkey**, and complete Windows Hello again.
-9. Confirm the UI shows `AUTHORIZED`, an `aut_…` ID, the exact ₹5.00 terms, an expiry and authorization hash, and **TEST MODE — NO REAL MONEY WILL BE CHARGED**.
-10. Choose **Pay ₹5.00 with Razorpay**, confirm genuine Razorpay Standard Checkout opens with the same server-derived terms, and complete one successful Test Mode payment. Confirm the browser remains in verifying/pending state until the API observes capture, then shows **VERIFIED PAYMENT CAPTURED** with durable `txn_…`, `order_…`, and `pay_…` identifiers.
-11. Repeat with a failed Test Mode attempt and confirm it is retained as a failed attempt without marking the transaction paid or preventing a later attempt on the same Order.
-12. With `FULFILLMENT_ENABLED=false`, confirm the Dashboard deliveries or API reconciliation converge on the same `paid` result and that no entitlement, report, merchant API call, protected-resource unlock, or refund occurs.
-13. Sign out and request `GET /api/v1/authorizations/<aut_id>` and `GET /api/v1/payment-transactions/<txn_id>` without the session cookie; confirm `401 AUTH_SESSION_REQUIRED`.
-14. Sign back in with the same passkey and retrieve both records through the credentialed frontend flow; confirm they succeed.
-15. Use automated ownership tests to confirm a second account receives `403 AUTH_RESOURCE_OWNERSHIP_MISMATCH` for the first account's policy, evaluation, identity, challenge, authorization, or payment transaction.
-
-Windows Hello is a physical acceptance step and cannot be claimed from automated WebAuthn stubs. Record the actual browser and authenticator result when performing this checklist.
 
 ## Paid Entitlements
 
